@@ -1,0 +1,57 @@
+# macOS metadata
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Original Android APK / OBB / cache and any re-zipped copy of it (DMCA prevention:
+# do not redistribute Gameloft's copyrighted package on GitHub)
+*.apk
+*.zip
+Dungeon-Hunter-2-HD-v1-0-2.apk
+Dungeon-Hunter-2-HD-v1-0-2.zip
+Dungeon-Hunter-2-HD-v1-0-2-cache.zip
+
+# Raw extracted APK contents (classes.dex, res/, original lib/*.so, assets/) —
+# regenerable at any time with `unzip Dungeon-Hunter-2-HD-v1-0-2.apk -d Dungeon-Hunter-2-HD-v1-0-2`
+/Dungeon-Hunter-2-HD-v1-0-2/
+
+# Installed-app data dump (savegames, checkpoints, videos, proprietary .bdae/.bar assets)
+com.gameloft.android.GAND.GloftD2SS/
+
+# jadx (Java) and Ghidra/angr (.so pseudo-C) decompilation output — derived directly from
+# Gameloft's copyrighted binaries, regenerable via porting_tools/decompile_all.sh, never commit
+/decompiled/
+
+# Proprietary game assets once staged for the Vita build (packaged separately per player, not in repo)
+/ux0_data/
+lib/**/*.so
+
+# Build artifacts (repo root only — porting_tools/build/ holds our own scripts, not build output)
+/build/
+/build_physical/
+/CMakeCache.txt
+/CMakeFiles/
+/Makefile
+/cmake_install.cmake
+*.elf
+*.vpk
+*.suprx
+/VPKs Backup/
+
+# Real-hardware / emulator debugging artifacts (crash dumps, per-run logs pulled via FTP)
+/logs/
+log_*.txt
+log.txt
+*.psp2dmp
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# Private working notes (may reference details derived from the original binary) —
+# not for GitHub, local status tracking only
+/ESTADO_ACTUAL.md

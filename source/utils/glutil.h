@@ -1,36 +1,27 @@
-/*
- * Copyright (C) 2021      Andy Nguyen
- * Copyright (C) 2021      Rinnegatamante
- * Copyright (C) 2022-2023 Volodymyr Atamanenko
- *
- * This software may be modified and distributed under the terms
- * of the MIT license. See the LICENSE file for details.
- */
-
-/**
- * @file  glutil.h
- * @brief OpenGL API initializer, related functions.
- */
-
 #ifndef SOLOADER_GLUTIL_H
 #define SOLOADER_GLUTIL_H
-
-#include <vitaGL.h>
+#include <psp2/types.h>
+#include <EGL/egl.h>
+#include <GLES/gl.h>
+#include <GLES/glext.h>
+#include <GLES2/gl2.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 void gl_init();
-
 void gl_preload();
-
 void gl_swap();
 
+// Thin wrappers around the real glCompileShader/glLinkProgram that also check
+// GL_COMPILE_STATUS/GL_LINK_STATUS and log the info log on failure -- wired
+// into dynlib.c's import table in place of the raw GL entry points so we get
+// a definitive yes/no on whether the engine's real GLSL (see shaders.pak)
+// actually compiles against the real PVR_PSP2 GLSL ES compiler, instead of
+// guessing from a flat/wrong-colored screen.
 void glCompileShader_soloader(GLuint shader);
-
-void glShaderSource_soloader(GLuint shader, GLsizei count,
-                             const GLchar **string, const GLint *_length);
+void glLinkProgram_soloader(GLuint program);
 
 #ifdef __cplusplus
 };

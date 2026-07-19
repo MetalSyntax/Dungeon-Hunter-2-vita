@@ -59,6 +59,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "sounddefs.h"
+
 /*
  * GLResLoader: asset bridge
  *
@@ -173,19 +175,25 @@ void GLMediaPlayer_unloadSoundBig(jmethodID id, va_list args) { (void) args; }
 void GLMediaPlayer_loadSound(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
-    l_info("[Java] GLMediaPlayer.loadSound(%d, %d) (no-op, audio not implemented yet)", sndId, instance);
+    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
+        l_info("[Java] GLMediaPlayer.loadSound(%d: %s, instance: %d) (no-op, audio not implemented yet)", sndId, Sounddefs[sndId], instance);
+    }
 }
 
 void GLMediaPlayer_loadSoundBig(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
-    l_info("[Java] GLMediaPlayer.loadSoundBig(%d) (no-op, audio not implemented yet)", sndId);
+    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
+        l_info("[Java] GLMediaPlayer.loadSoundBig(%d: %s) (no-op, audio not implemented yet)", sndId, Sounddefs[sndId]);
+    }
 }
 
 void GLMediaPlayer_playSound(jmethodID id, va_list args) {
     int sndId = va_arg(args, jint);
     int instance = va_arg(args, jint);
     float vol = (float) va_arg(args, double);
-    l_info("[Java] GLMediaPlayer.playSound(%d, %d, %f) (no-op, audio not implemented yet)", sndId, instance, vol);
+    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
+        l_info("[Java] GLMediaPlayer.playSound(%d: %s, instance: %d, vol: %f) (no-op, audio not implemented yet)", sndId, Sounddefs[sndId], instance, vol);
+    }
 }
 
 void GLMediaPlayer_playSoundBig(jmethodID id, va_list args) {
@@ -193,8 +201,10 @@ void GLMediaPlayer_playSoundBig(jmethodID id, va_list args) {
     float vol = (float) va_arg(args, double);
     int loop = va_arg(args, jint);
     int fadeIn = va_arg(args, jint);
-    l_info("[Java] GLMediaPlayer.playSoundBig(%d, %f, %d, %d) (no-op, audio not implemented yet)",
-           sndId, vol, loop, fadeIn);
+    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
+        l_info("[Java] GLMediaPlayer.playSoundBig(%d: %s, vol: %f, loop: %d, fade: %d) (no-op, audio not implemented yet)",
+               sndId, Sounddefs[sndId], vol, loop, fadeIn);
+    }
 }
 
 void GLMediaPlayer_pauseSound(jmethodID id, va_list args) { (void) args; }
@@ -216,9 +226,9 @@ void GLMediaPlayer_initSoundPoolArray(jmethodID id, va_list args) { (void) args;
 jint GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
     const char *name = (const char *) va_arg(args, jstring);
     (void) va_arg(args, jint);
-    l_warn("[Java] GLMediaPlayer.loadMovie(%s): movies not implemented yet, reporting failure",
+    l_warn("[Java] GLMediaPlayer.loadMovie(%s): movies not implemented yet, returning 0 to force skip",
            name ? name : "(null)");
-    return 0; // Java: 1 = success, 0 = failure -- see GLMediaPlayer.java's loadMovie()
+    return 0; // 0 = failure, forces the game to skip the video directly rather than waiting
 }
 
 jint GLMediaPlayer_getWidth(jmethodID id, va_list args) {
@@ -394,6 +404,48 @@ jint DungeonHunter2_VZIsMobileNetworkReady(jmethodID id, va_list args) {
 void DungeonHunter2_VZRestoreNetworkState(jmethodID id, va_list args) { (void) args; }
 
 /*
+ * Misc / Obfuscated methods missing in logs
+ */
+jobject Misc_DummyByteArray(jmethodID id, va_list args) {
+    (void) args;
+    JavaDynArray *jda = jda_alloc(1, FIELD_TYPE_BYTE);
+    if (jda) {
+        ((char*)jda->array)[0] = 0;
+    }
+    return (jobject) jda;
+}
+
+jint Misc_IsWifiEnable(jmethodID id, va_list args) {
+    (void) args;
+    return 0; // no wifi
+}
+
+void Misc_DummyVoidInt(jmethodID id, va_list args) {
+    (void) va_arg(args, jint);
+}
+
+jobject Misc_DummyAudioTrack(jmethodID id, va_list args) {
+    (void) args;
+    return (jobject) 0x12345678; // Dummy object
+}
+
+jint Misc_GetMinBufferSize(jmethodID id, va_list args) {
+    (void) args;
+    return 16384;
+}
+
+jint Misc_AudioTrackWrite(jmethodID id, va_list args) {
+    (void) args;
+    (void) va_arg(args, jobject);
+    (void) va_arg(args, jint);
+    return va_arg(args, jint); // sizeInBytes
+}
+
+void Misc_DummyVoid(jmethodID id, va_list args) {
+    (void) args;
+}
+
+/*
  * JNI Methods
  */
 
@@ -466,6 +518,23 @@ enum {
     M_VZInitMobileNetwork,
     M_VZIsMobileNetworkReady,
     M_VZRestoreNetworkState,
+
+    M_IsWifiEnable,
+    M_getHostName,
+    M_method_a,
+    M_method_b,
+    M_method_c,
+    M_method_d,
+    M_method_e,
+    M_method_f,
+
+    M_AudioTrack_init,
+    M_AudioTrack_getMinBufferSize,
+    M_AudioTrack_write,
+    M_AudioTrack_play,
+    M_AudioTrack_pause,
+    M_AudioTrack_stop,
+    M_AudioTrack_release,
 };
 
 NameToMethodID nameToMethodId[] = {
@@ -537,6 +606,21 @@ NameToMethodID nameToMethodId[] = {
         { M_VZInitMobileNetwork,      "VZInitMobileNetwork",     METHOD_TYPE_VOID },
         { M_VZIsMobileNetworkReady,   "VZIsMobileNetworkReady",  METHOD_TYPE_INT },
         { M_VZRestoreNetworkState,    "VZRestoreNetworkState",   METHOD_TYPE_VOID },
+        { M_IsWifiEnable,             "IsWifiEnable",            METHOD_TYPE_INT },
+        { M_getHostName,              "getHostName",             METHOD_TYPE_OBJECT },
+        { M_method_a,                 "a",                       METHOD_TYPE_OBJECT },
+        { M_method_b,                 "b",                       METHOD_TYPE_OBJECT },
+        { M_method_c,                 "c",                       METHOD_TYPE_OBJECT },
+        { M_method_d,                 "d",                       METHOD_TYPE_OBJECT },
+        { M_method_e,                 "e",                       METHOD_TYPE_VOID },
+        { M_method_f,                 "f",                       METHOD_TYPE_OBJECT },
+        { M_AudioTrack_init,          "android/media/AudioTrack/<init>", METHOD_TYPE_OBJECT },
+        { M_AudioTrack_getMinBufferSize, "getMinBufferSize",     METHOD_TYPE_INT },
+        { M_AudioTrack_write,         "write",                   METHOD_TYPE_INT },
+        { M_AudioTrack_play,          "play",                    METHOD_TYPE_VOID },
+        { M_AudioTrack_pause,         "pause",                   METHOD_TYPE_VOID },
+        { M_AudioTrack_stop,          "stop",                    METHOD_TYPE_VOID },
+        { M_AudioTrack_release,       "release",                 METHOD_TYPE_VOID },
 };
 
 MethodsBoolean methodsBoolean[] = {};
@@ -565,6 +649,9 @@ MethodsInt methodsInt[] = {
         { M_VZIsInProgress,         DungeonHunter2_VZIsInProgress },
         { M_VZIsErrorOcurred,       DungeonHunter2_VZIsErrorOcurred },
         { M_VZIsMobileNetworkReady, DungeonHunter2_VZIsMobileNetworkReady },
+        { M_IsWifiEnable,           Misc_IsWifiEnable },
+        { M_AudioTrack_getMinBufferSize, Misc_GetMinBufferSize },
+        { M_AudioTrack_write,       Misc_AudioTrackWrite },
 };
 
 MethodsLong methodsLong[] = {};
@@ -577,6 +664,13 @@ MethodsObject methodsObject[] = {
         { M_VZGetGamePrice,      DungeonHunter2_VZGetGamePrice },
         { M_VZGetGameName,       DungeonHunter2_VZGetGameName },
         { M_VZGetLastServerMsg,  DungeonHunter2_VZGetLastServerMsg },
+        { M_getHostName,         Misc_DummyByteArray },
+        { M_method_a,            Misc_DummyByteArray },
+        { M_method_b,            Misc_DummyByteArray },
+        { M_method_c,            Misc_DummyByteArray },
+        { M_method_d,            Misc_DummyByteArray },
+        { M_method_f,            Misc_DummyByteArray },
+        { M_AudioTrack_init,     Misc_DummyAudioTrack },
 };
 
 MethodsShort methodsShort[] = {};
@@ -621,6 +715,11 @@ MethodsVoid methodsVoid[] = {
         { M_VZRequestPurchaseGame,  DungeonHunter2_VZRequestPurchaseGame },
         { M_VZInitMobileNetwork,    DungeonHunter2_VZInitMobileNetwork },
         { M_VZRestoreNetworkState,  DungeonHunter2_VZRestoreNetworkState },
+        { M_method_e,               Misc_DummyVoidInt },
+        { M_AudioTrack_play,        Misc_DummyVoid },
+        { M_AudioTrack_pause,       Misc_DummyVoid },
+        { M_AudioTrack_stop,        Misc_DummyVoid },
+        { M_AudioTrack_release,     Misc_DummyVoid },
 };
 
 /*

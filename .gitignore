@@ -55,3 +55,6 @@ log.txt
 # Private working notes (may reference details derived from the original binary) —
 # not for GitHub, local status tracking only
 /ESTADO_ACTUAL.md
+crash_dump/
+glsl_dump/
+assets

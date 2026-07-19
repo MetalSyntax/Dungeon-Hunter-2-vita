@@ -1,250 +1,116 @@
-/*
- * Copyright (C) 2021      Andy Nguyen
- * Copyright (C) 2021      Rinnegatamante
- * Copyright (C) 2022-2023 Volodymyr Atamanenko
- *
- * This software may be modified and distributed under the terms
- * of the MIT license. See the LICENSE file for details.
- */
-
 #include "utils/glutil.h"
-
-#include "utils/utils.h"
-#include "utils/dialog.h"
 #include "utils/logger.h"
-
-#include <stdio.h>
-#include <malloc.h>
-#include <string.h>
+#include "utils/dialog.h"
 #include <psp2/kernel/sysmem.h>
-#include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
+#include <stddef.h>
+#include <string.h>
+#include <gpu_es4/psp2_pvr_hint.h>
 
-// Helpers for our handling of shaders
-GLboolean skip_next_compile = GL_FALSE;
-char next_shader_fname[256];
-void load_shader(GLuint shader, const char * string, size_t length);
+static EGLDisplay display;
+static EGLSurface surface;
+static EGLContext context;
 
 void gl_preload() {
-    if (!file_exists("ur0:/data/libshacccg.suprx")
-        && !file_exists("ur0:/data/external/libshacccg.suprx")) {
-        fatal_error("Error: libshacccg.suprx is not installed. "
-                    "Google \"ShaRKBR33D\" for quick installation.");
-    }
-
-#ifdef USE_GLSL_SHADERS
-    vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
-#endif
+    // Nothing required for PVR_PSP2
 }
 
 void gl_init() {
-    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_4X);
+    PVRSRV_PSP2_APPHINT hint;
+    memset(&hint, 0, sizeof(hint));
+    unsigned int rc = PVRSRVInitializeAppHint(&hint);
+    l_success("PVRSRVInitializeAppHint -> %u", rc);
+    if (!rc) {
+        l_error("PVRSRVInitializeAppHint failed");
+        sceKernelExitProcess(0);
+    }
+
+    // PVRSRVInitializeAppHint() only fills the numeric/boolean defaults. The
+    // window-system and GLES driver paths are app-specific and are left empty,
+    // so we MUST set them here: libIMGEGL dlopen()s these three modules to back
+    // the EGL display. If szWindowSystem is empty, eglGetDisplay() returns
+    // EGL_NO_DISPLAY while eglGetError() still reports EGL_SUCCESS (0x3000) --
+    // the exact failure seen in logs 047-050 after this block was reduced to a
+    // bare memset. Paths mirror the sceKernelLoadStartModule() calls in main.c.
+    strncpy(hint.szWindowSystem, "app0:module/libpvrPSP2_WSEGL.suprx", sizeof(hint.szWindowSystem) - 1);
+    strncpy(hint.szGLES1, "app0:module/libGLESv1_CM.suprx", sizeof(hint.szGLES1) - 1);
+    strncpy(hint.szGLES2, "app0:module/libGLESv2.suprx", sizeof(hint.szGLES2) - 1);
+
+    rc = PVRSRVCreateVirtualAppHint(&hint);
+    l_success("PVRSRVCreateVirtualAppHint -> %u (WS=%s)", rc, hint.szWindowSystem);
+    if (!rc) {
+        l_error("PVRSRVCreateVirtualAppHint failed");
+        sceKernelExitProcess(0);
+    }
+
+    display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    l_success("eglGetDisplay -> %p (err 0x%x)", (void *)display, eglGetError());
+    if (display == EGL_NO_DISPLAY) {
+        l_error("eglGetDisplay failed with error 0x%x", eglGetError());
+        sceKernelExitProcess(0);
+    }
+
+    if (eglInitialize(display, NULL, NULL) != EGL_TRUE) { l_error("eglInitialize failed"); sceKernelExitProcess(0); }
+
+    EGLConfig config;
+    EGLint num_config;
+    EGLint attrib_list[] = {
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_STENCIL_SIZE, 0,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+
+    if (eglChooseConfig(display, attrib_list, &config, 1, &num_config) != EGL_TRUE || num_config == 0) {
+        l_error("eglChooseConfig failed with error 0x%x", eglGetError());
+        sceKernelExitProcess(0);
+    }
+
+    EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
+    if (context == EGL_NO_CONTEXT) { l_error("eglCreateContext failed with error 0x%x", eglGetError()); sceKernelExitProcess(0); }
+
+    surface = eglCreateWindowSurface(display, config, (EGLNativeWindowType)0, NULL);
+    if (surface == EGL_NO_SURFACE) { l_error("eglCreateWindowSurface failed with error 0x%x", eglGetError()); sceKernelExitProcess(0); }
+
+    if (eglMakeCurrent(display, surface, surface, context) != EGL_TRUE) {
+        l_error("eglMakeCurrent failed with error 0x%x", eglGetError());
+        sceKernelExitProcess(0);
+    }
+    
+    l_success("PVR_PSP2 EGL context created.");
 }
 
 void gl_swap() {
-    vglSwapBuffers(GL_FALSE);
-}
-
-void glShaderSource_soloader(GLuint shader, GLsizei count,
-                             const GLchar **string, const GLint *_length) {
-#ifdef DEBUG_OPENGL
-    sceClibPrintf("[gl_dbg] glShaderSource<%p>(shader: %i, count: %i, string: %p, length: %p)\n", __builtin_return_address(0), shader, count, string, _length);
-#endif
-    if (!string) {
-        l_error("<%p> Shader source string is NULL, count: %i",
-                   __builtin_return_address(0), count);
-        skip_next_compile = GL_TRUE;
-        return;
-    } else if (!*string) {
-        l_error("<%p> Shader source *string is NULL, count: %i",
-                   __builtin_return_address(0), count);
-        skip_next_compile = GL_TRUE;
-        return;
-    }
-
-    size_t total_length = 0;
-
-    for (int i = 0; i < count; ++i) {
-        if (!_length) {
-            total_length += strlen(string[i]);
-        } else {
-            total_length += _length[i];
-        }
-    }
-
-    char * str = malloc(total_length+1);
-    size_t l = 0;
-
-    for (int i = 0; i < count; ++i) {
-        if (!_length) {
-            memcpy(str + l, string[i], strlen(string[i]));
-            l += strlen(string[i]);
-        } else {
-            memcpy(str + l, string[i], _length[i]);
-            l += _length[i];
-        }
-    }
-    str[total_length] = '\0';
-
-    load_shader(shader, str, total_length);
-
-    free(str);
+    eglSwapBuffers(display, surface);
 }
 
 void glCompileShader_soloader(GLuint shader) {
-#ifdef DEBUG_OPENGL
-    sceClibPrintf("[gl_dbg] glCompileShader<%p>(shader: %i)\n", __builtin_return_address(0), shader);
-#endif
+    glCompileShader(shader);
 
-#ifndef USE_GXP_SHADERS
-    if (!skip_next_compile) {
-        glCompileShader(shader);
-#ifdef DUMP_COMPILED_SHADERS
-        void *bin = vglMalloc(32 * 1024);
-        GLsizei len;
-        vglGetShaderBinary(shader, 32 * 1024, &len, bin);
-        file_save(next_shader_fname, bin, len);
-        vglFree(bin);
-#endif
+    GLint status = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+    if (status == GL_FALSE) {
+        GLchar log[1024];
+        GLsizei len = 0;
+        glGetShaderInfoLog(shader, sizeof(log), &len, log);
+        l_error("glCompileShader(%u) FAILED: %s", shader, log);
     }
-    skip_next_compile = GL_FALSE;
-#endif
 }
 
-#if defined(USE_GLSL_SHADERS) && defined(DUMP_COMPILED_SHADERS)
-void load_shader(GLuint shader, const char * string, size_t length) {
-    char* sha_name = str_sha1sum(string, length);
+void glLinkProgram_soloader(GLuint program) {
+    glLinkProgram(program);
 
-    char gxp_path[256];
-    snprintf(gxp_path, sizeof(gxp_path), DATA_PATH"gxp/%s.gxp", sha_name);
-
-    if (file_exists(gxp_path)) {
-        uint8_t *buffer;
-        size_t size;
-
-        file_load(gxp_path, &buffer, &size);
-
-        glShaderBinary(1, &shader, 0, buffer, (int32_t) size);
-
-        free(buffer);
-        skip_next_compile = GL_TRUE;
-    } else {
-        glShaderSource(shader, 1, &string, &length);
-        strcpy(next_shader_fname, gxp_path);
+    GLint status = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &status);
+    if (status == GL_FALSE) {
+        GLchar log[1024];
+        GLsizei len = 0;
+        glGetProgramInfoLog(program, sizeof(log), &len, log);
+        l_error("glLinkProgram(%u) FAILED: %s", program, log);
     }
-
-    free(sha_name);
 }
-#elif defined(USE_GLSL_SHADERS)
-void load_shader(GLuint shader, const char * string, size_t length) {
-    glShaderSource(shader, 1, &string, &length);
-}
-#elif defined(USE_CG_SHADERS) && defined(DUMP_COMPILED_SHADERS)
-void load_shader(GLuint shader, const char * string, size_t length) {
-    char* sha_name = str_sha1sum(string, length);
-
-    char gxp_path[256];
-    char cg_path[256];
-    snprintf(gxp_path, sizeof(gxp_path), DATA_PATH"gxp/%s.gxp", sha_name);
-    snprintf(cg_path, sizeof(cg_path), DATA_PATH"cg/%s.cg", sha_name);
-
-    if (file_exists(gxp_path)) {
-        uint8_t *buffer;
-        size_t size;
-
-        file_load(gxp_path, &buffer, &size);
-
-        glShaderBinary(1, &shader, 0, buffer, (int32_t) size);
-
-        free(buffer);
-        skip_next_compile = GL_TRUE;
-    } else if (file_exists(cg_path)) {
-        char *buffer;
-        size_t size;
-
-        file_load(cg_path, (uint8_t **) &buffer, &size);
-
-        glShaderSource(shader, 1, &string, &size);
-        strcpy(next_shader_fname, gxp_path);
-
-        free(buffer);
-        skip_next_compile = GL_FALSE;
-    } else {
-        l_warn("Encountered an untranslated shader %s, saving GLSL "
-               "and using a dummy shader.", sha_name);
-
-        char glsl_path[256];
-        snprintf(glsl_path, sizeof(glsl_path), DATA_PATH"glsl/%s.glsl", sha_name);
-        file_mkpath(glsl_path, 0777);
-        file_save(glsl_path, (const uint8_t *) string, length);
-
-        if (strstr(string, "gl_FragColor")) {
-            const char *dummy_shader = "float4 main() { return float4(1.0,1.0,1.0,1.0); }";
-            int32_t dummy_shader_len = (int32_t) strlen(dummy_shader);
-            glShaderSource(shader, 1, &dummy_shader, &dummy_shader_len);
-        } else {
-            const char *dummy_shader = "void main(float4 out gl_Position : POSITION ) { gl_Position = float4(1.0,1.0,1.0,1.0); }";
-            int32_t dummy_shader_len = (int32_t) strlen(dummy_shader);
-            glShaderSource(shader, 1, &dummy_shader, &dummy_shader_len);
-        }
-
-        skip_next_compile = GL_FALSE;
-    }
-
-    free(sha_name);
-}
-#elif defined(USE_CG_SHADERS) || defined(USE_GXP_SHADERS)
-void load_shader(GLuint shader, const char * string, size_t length) {
-    char* sha_name = str_sha1sum(string, length);
-
-    char path[256];
-#ifdef USE_CG_SHADERS
-    snprintf(path, sizeof(path), DATA_PATH"cg/%s.cg", sha_name);
-#else
-    snprintf(path, sizeof(path), DATA_PATH"gxp/%s.gxp", sha_name);
-#endif
-
-    if (file_exists(path)) {
-#ifdef USE_CG_SHADERS
-        char *buffer;
-        size_t size;
-
-        file_load(path, (uint8_t **) &buffer, &size);
-
-        glShaderSource(shader, 1, &string, &size);
-
-        free(buffer);
-#else
-        uint8_t *buffer;
-        size_t size;
-
-        file_load(path, &buffer, &size);
-
-        glShaderBinary(1, &shader, 0, buffer, (int32_t) size);
-
-        free(buffer);
-#endif
-    } else {
-        l_warn("Encountered an untranslated shader %s, saving GLSL "
-               "and using a dummy shader.", sha_name);
-
-        char glsl_path[256];
-        snprintf(glsl_path, sizeof(glsl_path), DATA_PATH"glsl/%s.glsl", sha_name);
-        file_mkpath(glsl_path, 0777);
-        file_save(glsl_path, (const uint8_t *) string, length);
-
-        if (strstr(string, "gl_FragColor")) {
-            const char *dummy_shader = "float4 main() { return float4(1.0,1.0,1.0,1.0); }";
-            int32_t dummy_shader_len = (int32_t) strlen(dummy_shader);
-            glShaderSource(shader, 1, &dummy_shader, &dummy_shader_len);
-        } else {
-            const char *dummy_shader = "void main(float4 out gl_Position : POSITION ) { gl_Position = float4(1.0,1.0,1.0,1.0); }";
-            int32_t dummy_shader_len = (int32_t) strlen(dummy_shader);
-            glShaderSource(shader, 1, &dummy_shader, &dummy_shader_len);
-        }
-    }
-
-    free(sha_name);
-}
-#else
-#error "Define one of (USE_GLSL_SHADERS, USE_CG_SHADERS, USE_GXP_SHADERS)"
-#endif

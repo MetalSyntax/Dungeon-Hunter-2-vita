@@ -35,6 +35,13 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
         return fopen_soloader("app0:/cpuinfo", mode);
     } else if (strcmp(filename, "/proc/meminfo") == 0) {
         return fopen_soloader("app0:/meminfo", mode);
+    } else if (strcmp(filename, "/system/fonts/droidsans.ttf") == 0 ||
+               strcmp(filename, "#/system/fonts/droidsans.ttf") == 0) {
+        // DH2's engine (FreeType, likely via the embedded GameSWF/Flash UI layer --
+        // see gameswf_effects.bdae) asks for the real Android system font, which
+        // obviously isn't present on Vita. Redirect to a bundled substitute rather
+        // than let every text/UI element that needs a glyph silently fail to draw.
+        return fopen_soloader("app0:DejaVuSans.ttf", mode);
     }
 
 #ifdef USE_SCELIBC_IO

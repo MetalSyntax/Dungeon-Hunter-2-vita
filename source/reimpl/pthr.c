@@ -12,12 +12,36 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <reent.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
 #include <stdatomic.h>
 
 #include "utils/utils.h"
 #include "utils/logger.h"
+
+// __sinit initializes the current reent's stdio/state; pairs with pthread_init
+// as the documented vitasdk fix for "C++ exceptions + threads" (vita-toolchain
+// issue #103). Needed because vitaGL's GLSL translator path throws C++
+// exceptions internally, and without this the very first throw crashes inside
+// __cxa_allocate_exception (a concurrence_lock_error on the emergency-pool
+// mutex) instead of unwinding.
+extern void __sinit(struct _reent *);
+
+// pthread-embedded (VitaSDK's pthread implementation) needs its internal
+// thread-pool state set up via pthread_init() before any pthread_create()
+// call, or every single one fails with EAGAIN regardless of how few
+// threads are actually running -- it isn't called automatically by the
+// linker's --whole-archive trick, and nothing in this project ever called
+// it (confirmed: the game's own background update thread failed to spawn
+// on literally its first attempt, logged repeatedly as "Not Created").
+// Constructor priority 101 matches the documented vitasdk workaround,
+// running this before other global constructors and well before main().
+__attribute__((constructor(101)))
+static void pthread_setup(void) {
+    pthread_init();
+    __sinit(_REENT);
+}
 
 #define PTHR_MAX_OBJECTS 1024
 
@@ -170,18 +194,71 @@ PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_
 int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr, void *(*start)(void *), void *param) {
     int ret;
 
-    if (!attr) {
-        pthread_attr_t a;
-        pthread_attr_init(&a);
-        pthread_attr_setstacksize(&a, 512 * 1024);
-        ret = pthread_create(thread, &a, start, param);
-        pthread_attr_destroy(&a);
-    } else{
+    // Honor the game's requested stack size when it bothers to set one;
+    // otherwise use a generous default. (The engine's savegame workers pass
+    // attr == NULL, so they land on the default.)
+    size_t stacksize = 512 * 1024;
+
+    if (attr) {
         _attr_t_static_init((pthread_attr_t_bionic *) attr);
-        pthread_attr_setstacksize(attr->real_ptr, 512 * 1024);
-        ret = pthread_create(thread, attr->real_ptr, start, param);
+        if (attr->real_ptr) {
+            size_t s = 0;
+            if (pthread_attr_getstacksize(attr->real_ptr, &s) == 0 && s >= 16 * 1024) {
+                stacksize = s;
+            }
+        }
     }
 
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, stacksize);
+
+    // Force DETACHED regardless of what the game asked for. This engine
+    // spawns one fire-and-forget worker per savegame job (Savegame::UpdateJobs,
+    // ~190 of them while writing the initial save) via updateJob_thread::Start(),
+    // which overwrites the stored handle each call and NEVER pthread_join()s
+    // the previous one. Left joinable, every finished worker stays a zombie
+    // holding a kernel thread slot; after ~120 the kernel returns EAGAIN
+    // ("Not Created" spam, hung save flush, black screen). Detached threads
+    // self-reap on exit, so only the few actually running at once cost a slot.
+    // Any later pthread_join() on these is a harmless no-op (see below).
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+
+    // Safety net in case we still momentarily run out of thread slots: give
+    // already-finished detached workers a chance to reap, then retry. Never
+    // run the start routine synchronously -- Savegame::UpdateJobs() has an
+    // inQueue reentrancy guard and is driven by a `while (UpdateJobs())` flush
+    // loop, so running it inline on the caller just spins without draining.
+    for (int attempt = 0; ; ++attempt) {
+        ret = pthread_create(thread, &a, start, param);
+        if (ret != EAGAIN || attempt >= 20) {
+            break;
+        }
+        sceKernelDelayThread(2 * 1000); // 2 ms
+    }
+
+    pthread_attr_destroy(&a);
+
+    if (ret != 0) {
+        l_error("pthread_create failed: %d (start=%p, param=%p)", ret, start, param);
+    }
+
+    return ret;
+}
+
+int pthread_join_soloader(pthread_t thread, void **value_ptr)
+{
+    // We create every thread detached (see pthread_create_soloader), so a real
+    // join would fail with EINVAL. This engine only ever fire-and-forgets its
+    // workers, so treat join as a successful no-op instead of surfacing an
+    // error the game doesn't expect.
+    int ret = pthread_join(thread, value_ptr);
+    if (ret != 0) {
+        if (value_ptr) {
+            *value_ptr = NULL;
+        }
+        return 0;
+    }
     return ret;
 }
 
@@ -242,10 +319,7 @@ int pthread_mutex_unlock_soloader(pthread_mutex_t_bionic *mutex)
     return pthread_mutex_unlock(mutex->real_ptr);
 }
 
-int pthread_join_soloader(pthread_t thread, void **value_ptr)
-{
-    return pthread_join(thread, value_ptr);
-}
+
 
 int pthread_condattr_init_soloader(pthread_condattr_t *attr)
 {
@@ -362,6 +436,7 @@ int pthread_getschedparam_soloader(pthread_t thread, int *policy,
 
 int pthread_detach_soloader(pthread_t thread)
 {
+    if (thread == (pthread_t)0xDEADBEEF) return 0;
     return pthread_detach(thread);
 }
 

@@ -24,20 +24,28 @@
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/ctrl.h>
+#include <psp2/rtc.h>
+#include <psp2/kernel/modulemgr.h>
 #include <psp2/touch.h>
 
 #include <falso_jni/FalsoJNI.h>
 #include <so_util/so_util.h>
+#include <unistd.h>
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "utils/dialog.h"
+#include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/processmgr.h>
 
-int _newlib_heap_size_user = 256 * 1024 * 1024;
+int _newlib_heap_size_user = 256 * 1024 * 1024; // 256 MB
 
 #ifdef USE_SCELIBC_IO
-int sceLibcHeapSize = 4 * 1024 * 1024;
+int sceLibcHeapSize = 32 * 1024 * 1024;
 #endif
+
+
 
 so_module so_mod;
 
@@ -58,40 +66,45 @@ void game_log(const char *fmt, ...) {
 #define SCREEN_H 544
 
 // DungeonHunter2.java: static native void nativeSetPhone(int width, int height);
-static void (* nativeSetPhone)(int w, int h);
+static void (* nativeSetPhone)(JNIEnv *env, jobject clazz, int w, int h);
+static void (* nativeGetInfo)(JNIEnv *env, jobject clazz, jstring s1, jstring s2, jstring s3, jstring s4);
 // GameRenderer.java: public native void nativeGameRenderer(); (instance, ctor)
-static void (* nativeGameRenderer)(void);
+static void (* nativeGameRenderer)(JNIEnv *env, jobject clazz);
 // GameRenderer.java: public static native void nativeConfig(); (ctor, after nativeGameRenderer)
-static void (* nativeConfig)(void);
+static void (* nativeConfig)(JNIEnv *env, jobject clazz);
 // GameRenderer.java: public native void nativeGetJNIEnv(); (instance, onSurfaceCreated)
-static void (* nativeGetJNIEnv)(void);
+static void (* nativeGetJNIEnv)(JNIEnv *env, jobject clazz);
 // DungeonHunter2.java: public static native void nativeInit(int isDemo);
-static void (* nativeInit)(int is_demo);
+static void (* nativeInit)(JNIEnv *env, jobject clazz, int is_demo);
 // GameRenderer.java: public static native void nativeInit(int always1); -- SAME
 // Java method name as DungeonHunter2.nativeInit but a DIFFERENT JNI symbol
 // (different class), always called with a hardcoded 1 in GameRenderer.onSurfaceCreated().
-static void (* nativeRendererInit)(int always1);
+static void (* nativeRendererInit)(JNIEnv *env, jobject clazz, int always1);
+static void (* nativeGLMediaPlayerInit)(JNIEnv *env, jobject clazz);
+static void (* nativeGLResLoaderInit)(JNIEnv *env, jobject clazz, jint i);
+static void (* nativeMusicplayerInit)(JNIEnv *env, jobject clazz);
+static void (* nativeGLUtilsDeviceInit)(JNIEnv *env, jobject clazz);
 // GameRenderer.java: public native void nativeOnSurfaceChanged(int w, int h);
-static void (* nativeOnSurfaceChanged)(int w, int h);
+static void (* nativeOnSurfaceChanged)(JNIEnv *env, jobject clazz, int w, int h);
 // GameRenderer.java: public static native void nativeRender();
 // NOTE: nativeOnDrawFrame is also exported by the .so but GameRenderer.onDrawFrame()
 // never calls it -- only nativeRender(). Do not implement/call nativeOnDrawFrame.
-static void (* nativeRender)(void);
+static void (* nativeRender)(JNIEnv *env, jobject clazz);
 // DungeonHunter2.java: public static native void nativeKeyDown(int keyCode);
-static void (* nativeKeyDown)(int keycode);
+static void (* nativeKeyDown)(JNIEnv *env, jobject clazz, int keycode);
 // DungeonHunter2.java: public static native void nativeKeyUp(int keyCode);
-static void (* nativeKeyUp)(int keycode);
+static void (* nativeKeyUp)(JNIEnv *env, jobject clazz, int keycode);
 // GameGLSurfaceView.java: public static native void nativeOnTouch(int type, int x, int y, long pointerId, int, int);
 // type: 1=down, 2=move, 0=up (see GameGLSurfaceView.onTouchEvent). The last
 // two int params are always passed as literal 0 by the original Java in every
 // call site -- unused by this build, kept for ABI compatibility.
-static void (* nativeOnTouch)(int type, int x, int y, long long pointer_id, int unused1, int unused2);
+static void (* nativeOnTouch)(JNIEnv *env, jobject clazz, int type, int x, int y, long long pointer_id, int unused1, int unused2);
 // DungeonHunter2.java: public static native void nativePause(int always1);
-static void (* nativePause)(int always1);
+static void (* nativePause)(JNIEnv *env, jobject clazz, int always1);
 // DungeonHunter2.java: public static native void nativeResume(int always1);
-static void (* nativeResume)(int always1);
+static void (* nativeResume)(JNIEnv *env, jobject clazz, int always1);
 // DungeonHunter2.java: public static native int nativeCanInterrupt();
-static int (* nativeCanInterrupt)(void);
+static int (* nativeCanInterrupt)(JNIEnv *env, jobject clazz);
 
 // Android KeyEvent codes -- confirmed from DungeonHunter2.onKeyDown/onKeyUp:
 // the Java forwards the RAW keyCode int to nativeKeyDown/Up (no translation),
@@ -128,15 +141,28 @@ static void *so_sym_or_warn(const char *name) {
 }
 
 int main() {
+    // Explicitly initialize pthread to avoid EAGAIN (error 11) on pthread_create.
+    // The linker sometimes strips the constructor in pthr.c.
+    extern void pthread_init(void);
+    pthread_init();
+
+    // Set the current working directory so relative fopens (e.g., effects.bdae) succeed
+    chdir(DATA_PATH "assets/");
+
     soloader_init_all();
 
     l_success("Resolving Dungeon Hunter 2 native entry points...");
     nativeSetPhone         = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeSetPhone");
     nativeGameRenderer     = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameRenderer_nativeGameRenderer");
+    nativeGetInfo          = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeGetInfo");
     nativeConfig           = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameRenderer_nativeConfig");
     nativeGetJNIEnv        = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameRenderer_nativeGetJNIEnv");
     nativeInit             = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeInit");
     nativeRendererInit     = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameRenderer_nativeInit");
+    nativeGLMediaPlayerInit = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GLMediaPlayer_nativeInit");
+    nativeGLResLoaderInit   = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GLResLoader_nativeInit");
+    nativeMusicplayerInit   = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_Musicplayer_nativeInitplayer");
+    nativeGLUtilsDeviceInit = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GLUtils_Device_nativeInit");
     nativeOnSurfaceChanged = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameRenderer_nativeOnSurfaceChanged");
     nativeRender           = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameRenderer_nativeRender");
     nativeKeyDown          = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeKeyDown");
@@ -153,8 +179,43 @@ int main() {
     l_success("Calling JNI_OnLoad...");
     JNI_OnLoad(&jvm);
 
+    // sceKernelLoadStartModule returns a SceUID (>=0) on success or a negative
+    // SCE error (esp. 0x8002D082 "already loaded" is OK, 0x8002D080 "not found"
+    // means the .suprx is missing on-device -- the fast-deploy paths push only
+    // eboot.bin, so the modules must come from a full VPK install).
+    //
+    // Only preload libgpu_es4_ext.suprx and libIMGEGL.suprx here, from app0:
+    // root -- this matches GrapheneCt/PVR_PSP2's own reference test
+    // (unittests/gles1test1/gles1test1.c), which declares exactly these two
+    // as its SCE_USER_MODULE_LIST and nothing else. libIMGEGL loads
+    // libpvrPSP2_WSEGL/libGLESv1_CM/libGLESv2 ITSELF, lazily, the first time
+    // eglGetDisplay/eglInitialize needs them, using the paths already baked
+    // into PVRSRVInitializeAppHint's defaults ("app0:module/lib*.suprx" --
+    // see pvr_apphint.c in that repo) which glutil.c's AppHint setup mirrors.
+    // Preloading those 3 ourselves (as an earlier version of this code did)
+    // made libIMGEGL's own internal (re-)load of the same named module fail
+    // -- its loader (PVRSRVLoadLibrary/LoadNamedWSModule) has no "already
+    // loaded is fine" fallback, any failure there is fatal, and eglGetDisplay
+    // surfaces it as EGL_NO_DISPLAY with the misleading EGL_SUCCESS (0x3000)
+    // code. Confirmed on real hardware (log_054.txt, 2026-07-18): all 5
+    // manual LoadStartModule calls succeeded and PVRSRVCreateVirtualAppHint
+    // succeeded, yet eglGetDisplay still failed -- this double-load is the
+    // remaining suspect now that the module/ vs modules/ naming is settled.
+    static const char *pvr_modules[] = {
+        "app0:libgpu_es4_ext.suprx",
+        "app0:libIMGEGL.suprx",
+    };
+    for (int i = 0; i < (int)(sizeof(pvr_modules) / sizeof(pvr_modules[0])); ++i) {
+        int ret = sceKernelLoadStartModule(pvr_modules[i], 0, NULL, 0, NULL, NULL);
+        if (ret < 0) {
+            l_error("LoadStartModule(%s) FAILED: 0x%08X", pvr_modules[i], ret);
+        } else {
+            l_success("LoadStartModule(%s) -> uid 0x%08X", pvr_modules[i], ret);
+        }
+    }
+
     gl_init();
-    l_success("vitaGL initialized.");
+    l_success("PVR_PSP2 initialized.");
 
     // Real Android sequence (DungeonHunter2.onCreate): nativeSetPhone is
     // called with the ACTUAL screen pixel dimensions before the
@@ -165,24 +226,35 @@ int main() {
     // this same 960x544 space (Phase 3 TODO: confirm on first real run --
     // if the UI/hit-testing looks wrong, this is the first assumption to
     // revisit).
-    if (nativeSetPhone) nativeSetPhone(SCREEN_W, SCREEN_H);
+    if (nativeGetInfo) {
+        // nativeGetInfo(String path, String lang, String device, String manufacturer)
+        nativeGetInfo(&jni, NULL, (jstring)DATA_PATH, (jstring)"EN", (jstring)"PSVita", (jstring)"Sony");
+    }
+
+    if (nativeSetPhone) nativeSetPhone(&jni, NULL, SCREEN_W, SCREEN_H);
 
     // GameRenderer(Context) ctor: nativeGameRenderer() then nativeConfig(), in that order.
-    if (nativeGameRenderer) nativeGameRenderer();
-    if (nativeConfig) nativeConfig();
+    if (nativeGameRenderer) nativeGameRenderer(&jni, NULL);
+    if (nativeConfig) nativeConfig(&jni, NULL);
 
     // GameRenderer.onSurfaceCreated(): nativeGetJNIEnv(), then
     // DungeonHunter2.nativeInit(isDemo), then GameRenderer.nativeInit(1).
     // isDemo() reads a SharedPreferences flag that gates the purchased/full
     // version -- this port always requests the full game (argument 0), since
     // there is no purchase flow to unlock it via.
-    if (nativeGetJNIEnv) nativeGetJNIEnv();
-    if (nativeInit) nativeInit(0);
-    if (nativeRendererInit) nativeRendererInit(1);
+    if (nativeGetJNIEnv) nativeGetJNIEnv(&jni, NULL);
+    // JNI initialization sequence for all modules to cache method IDs
+    if (nativeGLMediaPlayerInit) nativeGLMediaPlayerInit(&jni, NULL);
+    if (nativeGLResLoaderInit) nativeGLResLoaderInit(&jni, NULL, 0);
+    if (nativeMusicplayerInit) nativeMusicplayerInit(&jni, NULL);
+    if (nativeGLUtilsDeviceInit) nativeGLUtilsDeviceInit(&jni, NULL);
+
+    if (nativeInit) nativeInit(&jni, NULL, 0); // DungeonHunter2.nativeInit
+    if (nativeRendererInit) nativeRendererInit(&jni, NULL, 1);
 
     // GameRenderer.onSurfaceChanged(): called once after onSurfaceCreated
     // with the real surface size, and again on any resize (never, for us).
-    if (nativeOnSurfaceChanged) nativeOnSurfaceChanged(SCREEN_W, SCREEN_H);
+    if (nativeOnSurfaceChanged) nativeOnSurfaceChanged(&jni, NULL, SCREEN_W, SCREEN_H);
 
     l_success("Starting main loop...");
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
@@ -219,30 +291,47 @@ int main() {
             int x = touch.report[0].x * SCREEN_W / 1920;
             int y = touch.report[0].y * SCREEN_H / 1088;
             if (!last_touch) {
-                if (nativeOnTouch) nativeOnTouch(1, x, y, 0, 0, 0);
+                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, x, y, 0, 0, 0);
                 last_touch = 1;
             } else if (x != last_tx || y != last_ty) {
-                if (nativeOnTouch) nativeOnTouch(2, x, y, 0, 0, 0);
+                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 2, x, y, 0, 0, 0);
             }
             last_tx = x; last_ty = y;
         } else if (last_touch) {
-            if (nativeOnTouch) nativeOnTouch(0, last_tx, last_ty, 0, 0, 0);
+            if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, last_tx, last_ty, 0, 0, 0);
             last_touch = 0;
         }
 
-        if (pending_key_down != -1 && nativeKeyDown) { nativeKeyDown(pending_key_down); pending_key_down = -1; }
-        if (pending_key_up != -1 && nativeKeyUp) { nativeKeyUp(pending_key_up); pending_key_up = -1; }
+        if (pending_key_down != -1 && nativeKeyDown) { nativeKeyDown(&jni, NULL, pending_key_down); pending_key_down = -1; }
+        if (pending_key_up != -1 && nativeKeyUp) { nativeKeyUp(&jni, NULL, pending_key_up); pending_key_up = -1; }
 
-        if (nativeRender) nativeRender();
+        if (nativeRender) nativeRender(&jni, NULL);
+
+        // Diagnostic: the game reaches its main loop and runs its update/menu
+        // logic, but nothing draws (black screen). Log any accumulated GL error
+        // roughly once per second so we can tell a broken GL pipeline apart
+        // from a "runs fine but produces nothing visible" content problem,
+        // without flooding the log every frame.
+        {
+            static int diag_frame = 0;
+            if ((diag_frame++ % 60) == 0) {
+                GLenum err = glGetError();
+                if (err != GL_NO_ERROR) {
+                    l_warn("[gl_diag] frame %d: glGetError() = 0x%04x", diag_frame, err);
+                } else {
+                    l_info("[gl_diag] frame %d: GL pipeline clean (no error)", diag_frame);
+                }
+            }
+        }
 
         gl_swap();
     }
 
     if (nativePause && nativeCanInterrupt) {
-        while (nativeCanInterrupt() == 0) {
+        while (nativeCanInterrupt(&jni, NULL) == 0) {
             sceKernelDelayThread(10 * 1000);
         }
-        nativePause(1);
+        nativePause(&jni, NULL, 1);
     }
 
     sceKernelExitDeleteThread(0);

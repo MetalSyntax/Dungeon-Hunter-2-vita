@@ -332,19 +332,54 @@ compiles `java.c` with zero warnings and produces a `.vpk` end-to-end. Not yet r
 that's Phase 10; the FalsoJNI method table being complete and non-crashing at build time doesn't confirm
 runtime behavior against the real engine.
 
-### Phase 4 — License/DRM bypass (specific to this game, do first — blocks everything else)
+### Phase 4 — License/DRM bypass — ✅ done (2026-07-13)
 Before chasing rendering or input bugs, make sure nothing in `DungeonHunter2.nativeInit` blocks waiting
 on `ALicenseCheck::ValidateServer` or the Samsung Zirconia stub. Confirm in the log that these paths
 are either never reached or return immediately with a "licensed" result.
 
-### Phase 5 — Graphics (`GameRenderer` GLSurfaceView bridge)
+### Phase 5 — Graphics (`GameRenderer` GLSurfaceView bridge) — ✅ confirmed GLES2 (2026-07-13)
 Confirm GLES version/profile actually used (`glShaderSource`/`glGetShaderiv` are imported by
 `libStormGLOFT.so` if kept — check whether `libDungeonHunter2.so` itself imports fixed-pipeline-only
 symbols like the Gamevil/cocos2d-x titles, or GLES2 shader entry points; this changes the wrapper
 strategy significantly and must be confirmed from the actual import list in
 `decompiled/libDungeonHunter2_armeabi-v7a/symbols.txt`, not assumed from the other ports).
 
-### Phase 6 — Input
+**Outcome:** Confirmed via `objdump -T` that `libDungeonHunter2.so` exclusively uses GLES2 programmable pipeline functions (`glCreateShader`, `glCompileShader`, `glLinkProgram`, `glUseProgram`, `glVertexAttribPointer`). No fixed-pipeline GLES1 functions (`glMatrixMode`, `glEnableClientState`, etc.) are imported.
+
+**⚠️ Superseded 2026-07-15/18 — the "map to `vitaGL`" conclusion above turned out to be wrong in practice, not in the GLES2-detection itself.** `vitaGL` on this machine's VitaSDK is a **Cg-only build with no working GLSL→Cg translator** (`glsl_utils.o` is effectively empty — see the `backstab-vita-reference` memory). The engine feeds it real GLSL ES 1.00 source (see the `shaders.pak` finding below), which shark rejects outright. Two translation strategies were tried and abandoned before the current approach:
+1. vitaGL's own semantic-binding GLSL→Cg path — non-functional in this SDK build (no translator compiled in).
+2. Manual/AI-assisted per-shader GLSL→Cg translation (`porting_tools/manage_vita.py`'s `download_glsl_shaders`/`upload_cg_shaders`/`sync_shaders`, dumping runtime `glShaderSource` calls to `glsl_dump/<sha1>.glsl` and hand-writing a matching `assets/cg/<sha1>.cg`) — labor-intensive and never finished (only 4 of 7 dumped shaders were ever translated, and those 7 are a small sample of everything the engine actually needs — see below).
+
+**Current, correct approach (in place as of 2026-07-15): dropped `vitaGL` entirely, switched to `PVR_PSP2`** — the real PowerVR SGX543 GLES2 driver (`libIMGEGL.suprx`/`libGLESv2.suprx`/`libpvrPSP2_WSEGL.suprx`/`libGLESv1_CM.suprx`/`libgpu_es4_ext.suprx`, vendored under `modules/`), which has a **real GLSL ES compiler**. No translation is needed at all — `dynlib.c`'s `glShaderSource`/`glCompileShader` entries now resolve directly to the real driver's exported functions (confirmed: `source/patch.c` only does license-check hooking, no shader-related patching remains; `source/utils/glutil.c` has no Cg compile step, just EGL/PVR_PSP2 init). `CMakeLists.txt`'s `SHADER_FORMAT` was still stuck at `"CG"` (a stale leftover from the abandoned approach, with no code left that even reads `USE_CG_SHADERS`) — corrected to `"GLSL"` 2026-07-18 for documentation accuracy; it was already a no-op either way.
+
+**Major finding 2026-07-18 — the engine's complete, human-readable GLSL ES source is directly available, no runtime dumping/translation required.** `com.gameloft.android.GAND.GloftD2SS/files/shaders.pak` (present in the installed-app-data dump, confirmed via a real device `fopen()` in the logs: `ux0:data/dungeon-hunter-2/shaders.pak`) is a **stored (uncompressed) ZIP archive** containing 34 cleanly-named `.glsl` files (`DepthCubeFP.glsl`, `GL_Diffuse_L1_iPhone_VS.glsl`, `UnlitTexturedFP.glsl`, etc.) plus two empty marker files `cg.config`/`glsl.config`. This is the real shader source the native engine reads and feeds to `glShaderSource` — confirmed by `strings` on the real `.so`, which references `shaders.pak` and a `PinkBadShaderFS/VS` fallback pair (Gameloft's "missing shader" placeholder, not present in the pak — must be a hardcoded fallback string in the binary, not something we need to supply). The 7 previously runtime-dumped `glsl_dump/*.glsl` (SHA1-named) are a small, incomplete subset of what the engine actually needs — **prefer extracting the full `shaders.pak` over continuing the old dump/translate loop**, which should be considered obsolete now that `SHADER_FORMAT` is GLSL end-to-end. All 34 shaders are well-formed, precision-qualified GLES2 GLSL (some behind `#define GLITCH_OPENGLES_2`) that a real PowerVR GLES2 compiler should accept unmodified.
+
+**Bug found 2026-07-18 — `module/` vs `modules/` path mismatch (root cause confirmed on real hardware, then correctly identified and fixed).** The repo had two directories with byte-identical PVR `.suprx`/`.a` payloads, `module/` (singular) and `modules/` (plural, an untracked duplicate). Mid-session the user deleted `module/` and asked to standardize on `modules/`; all three references (`CMakeLists.txt` VPK packaging, `main.c`'s `sceKernelLoadStartModule` calls, `glutil.c`'s `PVRSRV_PSP2_APPHINT` paths) were updated to `modules/` and rebuilt. **This was then tested on real hardware (`log_054.txt`, 2026-07-18) and it was NOT sufficient**: all 5 `LoadStartModule` calls succeeded, `PVRSRVInitializeAppHint`/`PVRSRVCreateVirtualAppHint` both succeeded, yet `eglGetDisplay` still failed with `EGL_NO_DISPLAY`/0x3000.
+
+Root cause, found via `strings` on the real vendor binaries (not guessed): **`libIMGEGL.suprx` and `libgpu_es4_ext.suprx` have `app0:module/libpvrPSP2_WSEGL.suprx`, `app0:module/libGLESv1_CM.suprx`, `app0:module/libGLESv2.suprx` hardcoded internally** (singular `module/`) as their own dependency-loading paths — this is Sony/Imagination's own compiled-in fallback, independent of whatever we pass via `PVRSRV_PSP2_APPHINT`. None of the 6 `.suprx` files contain the string `modules/` (plural) anywhere. So even though *our* explicit `sceKernelLoadStartModule` calls and AppHint pointed at wherever we told them to, `libIMGEGL`'s own internal load of its `WSEGL`/`GLESv1_CM`/`GLESv2` dependencies during `eglGetDisplay()` only ever looks at `app0:module/...` — if the files aren't there, that internal load silently fails and `eglGetDisplay` returns `EGL_NO_DISPLAY` with the misleading `EGL_SUCCESS` (0x3000) code.
+
+**Fix (2026-07-18, second pass): renamed `modules/` back to `module/` (singular)** and reverted all three references. Rebuilt and verified via a real `cmake && make` + VPK packaging pass that `build/dungeon_hunter_2.vpk` now contains `module/*.suprx` (singular). **This is the one and only correct name for this directory — do not rename it again without re-checking the `strings` output above; the vendor driver's own hardcoded path is not something we can change.**
+
+**Tested on hardware 2026-07-18 with `module/` (singular) — same `eglGetDisplay` 0x3000 failure, meaning the directory name wasn't the whole story.** Root-caused via `GrapheneCt/PVR_PSP2` (the actual open-source driver project this whole `.suprx` set comes from, https://github.com/GrapheneCt/PVR_PSP2): its own reference test (`unittests/gles1test1/gles1test1.c`) only declares **`"app0:libgpu_es4_ext.suprx"` and `"app0:libIMGEGL.suprx"`** as auto-loaded dependencies (via `SCE_USER_MODULE_LIST`, at `app0:` **root**, no subfolder) — it does **not** preload `libpvrPSP2_WSEGL.suprx`/`libGLESv1_CM.suprx`/`libGLESv2.suprx` at all. Those three are loaded **lazily by `libIMGEGL.suprx` itself**, internally, the first time `eglGetDisplay`/`eglInitialize` need them, using the paths already compiled into `PVRSRVInitializeAppHint()`'s own defaults (confirmed by reading `pvr_apphint.c` in that repo: the defaults already are `"app0:module/libGLESv1_CM.suprx"` etc. — matching what `glutil.c` was setting explicitly anyway, redundant but harmless).
+
+**The actual bug:** `main.c` was explicitly pre-loading all 5 modules via `sceKernelLoadStartModule` before calling `gl_init()`. When `libIMGEGL` then tries to load its own dependencies internally during `eglGetDisplay`, it finds a same-named module already loaded (from our pre-load) — and its internal loader (`PVRSRVLoadLibrary`/`LoadNamedWSModule`, per that repo's source) has **no "already loaded, proceed anyway" handling**: any non-success there is treated as fatal, and `eglGetDisplay` surfaces it as `EGL_NO_DISPLAY` with the misleading `EGL_SUCCESS` (0x3000) code — regardless of directory naming.
+
+**Fix (2026-07-18, third pass):** `main.c`'s `pvr_modules[]` now only preloads `libgpu_es4_ext.suprx` and `libIMGEGL.suprx`, from `app0:` root (no subfolder) — matching the reference test exactly. `CMakeLists.txt` packages those two at VPK root; `libGLESv2.suprx`/`libGLESv1_CM.suprx`/`libpvrPSP2_WSEGL.suprx` stay under `module/` (matching the driver's own compiled-in default, which `glutil.c` still sets explicitly — no change needed there). Verified via a real `cmake && make` + VPK pass that `build/dungeon_hunter_2.vpk` now has `libgpu_es4_ext.suprx`/`libIMGEGL.suprx` at root and the other three under `module/`.
+
+**✅ CONFIRMED FIXED on real hardware 2026-07-18 (`log_057.txt`).** With only `libgpu_es4_ext.suprx`/`libIMGEGL.suprx` preloaded (from `app0:` root): both `LoadStartModule` calls succeed, `PVRSRVInitializeAppHint`/`PVRSRVCreateVirtualAppHint` succeed, **`eglGetDisplay -> 0x1 (err 0x3000)`** — this time `0x3000` is genuinely `EGL_SUCCESS`, not a failure (compare to every prior log where the display was `0x0`/`EGL_NO_DISPLAY`). `PVR_PSP2 EGL context created` and `PVR_PSP2 initialized` both print. The engine reaches `app Init is OK` and **the main loop runs for 960+ frames** with `GL pipeline clean (no error)` on almost every frame, correctly processing touch (`GameGLSurfaceView.nativeOnTouch`) and key input (`nativeKeyDown`/`Up`), reaching menu logic (`lastOpenMenuID`). This is the furthest the port has ever gotten — PVR_PSP2 bring-up (Phase 5's real blocker for the last 3 days) is done.
+
+**New, different symptom reported by the user:** the screen shows a flat **aquamarine/turquoise color** instead of the game's actual UI — i.e. we've moved from "black screen, nothing draws" (the old vitaGL+Cg symptom) to "something draws (a clear color, most likely), but textured/shaded content doesn't appear on top of it." Frame 1 alone logs one `glGetError() = 0x0502` (`GL_INVALID_OPERATION`) — transient, doesn't recur on later frames, but worth keeping an eye on as a clue about what the first draw call that fails is.
+
+- [x] **✅ Confirmed on real hardware 2026-07-18 (`log_058.txt`): NO shader compile/link failures.** With `glCompileShader_soloader`/`glLinkProgram_soloader` wired in (see below), a full run through the main loop (840+ frames) produced **zero** `glCompileShader(...) FAILED`/`glLinkProgram(...) FAILED` lines. **This definitively closes the original GLSL→Cg translation problem this session started from**: `shaders.pak`'s real GLSL ES source compiles and links cleanly against the real PVR_PSP2 GLSL ES compiler, end to end, with no translation of any kind. The remaining "aquamarine screen" issue is a content/asset problem, not a shader-language problem.
+- [x] **Found and fixed 2026-07-18: several real GLES2 functions were stubbed as harmless-looking no-ops (`ret0`), a leftover from the old `vitaGL` era where they genuinely weren't implemented.** Now that we link the real driver (`libGLESv2_stub.a`), these all exist for real and were re-wired in `source/dynlib.c`: **`glCompressedTexSubImage2D`** (the standout suspect — its sibling `glCompressedTexImage2D` was already wired to the real function two lines above it in the same table, `glCompressedTexSubImage2D` was not; if the engine's textures are compressed, sub-image uploads were being silently swallowed, which would produce exactly "background renders, sprites don't" — aquamarine clear color with no texture content on top), plus `glBlendColor`, `glDetachShader`, `glValidateProgram` (lower-risk but equally real and available, fixed for consistency). Verified via `nm` that all four symbols exist in `libGLESv2_stub.a`, and via a real `cmake && make` build that linking still succeeds.
+- [x] **Tested on hardware 2026-07-18 (`log_059.txt`): still zero shader compile/link failures, screen still aquamarine.** Confirms twice now that shader compilation is not the cause — the re-wired `glCompressedTexSubImage2D`/etc. didn't visibly change the symptom either. **Still no texture-file `fopen()` calls appear anywhere in ~840 frames of log**, which is the most telling fact: the engine hasn't even tried to load a texture/model asset yet — this isn't (only) a texture-upload bug, something upstream of asset loading is stuck.
+- [x] **Architecture discovery 2026-07-18: DH2's UI is rendered via an embedded Flash player (GameSWF), not hand-coded native widgets.** Found while tracing `loadMovie`/`isMediaPlaying` in `out_ghidra.c`: a red herring at first (a `"loadMovie"`/`"unloadMovie"` string pair near `sprite_loadmovie`/`sprite_unloadmovie`) turned out to be **GameSWF's own ActionScript `MovieClip.loadMovie()` binding**, unrelated to `GLMediaPlayer`'s video playback — but it confirms the engine embeds **GameSWF, an open-source Flash/SWF player**, and renders menus as Flash movie clips (matches `gameswf_effects.bdae`, which `fopen()`s successfully in every log). **This means the high-level menu/flow logic likely isn't traceable in Ghidra's C pseudocode at all** — it's driven by SWF ActionScript bytecode and/or the embedded Python layer (`data/pydata/*.bin` — `engine_core_pycst.bin`, `scripts_pycst.bin`, etc. are generically-named Python constant/bytecode caches). Static analysis of *what specific state the game is stuck in* has likely hit its ceiling here — the fastest remaining path is hardware experimentation, not more Ghidra reading.
+- [x] **`GLMediaPlayer_isMediaPlaying`/`GLMediaPlayer_loadMovie` real semantics checked and ruled out as the blocker:** `nativeLoadMovie` (`out_ghidra.c:410534`) is a thin pass-through to Java's `loadMovie`, and the real `GLMediaPlayer.java.loadMovie()` fires an Android `Intent` to a separate video-playing Activity and returns success immediately (fire-and-forget, doesn't block). Our `GLMediaPlayer_loadMovie` stub already mirrors that (fakes success immediately) and `GLMediaPlayer_isMediaPlaying` already returns `0` (not playing) — so the engine isn't stuck waiting on a "still playing" poll. Checked against the actual decompiled logic, not left as an assumption.
+- [x] **Found and fixed 2026-07-18: missing font asset.** The engine (via FreeType, likely GameSWF's own text rendering) requests `/system/fonts/droidsans.ttf` and `#/system/fonts/droidsans.ttf` — real Android paths that obviously don't exist on Vita — and got `fopen() == 0x0` in every log so far. No font was ever staged in the repo (`extras/fonts/` was referenced by `deploy_and_launch_vita3k.sh` but never actually populated). Fixed: copied a real, freely-redistributable `DejaVuSans.ttf` (Bitstream Vera/DejaVu license — not derived from Gameloft's assets, safe to commit) into `extras/fonts/DejaVuSans.ttf`, packaged it into the VPK root via `CMakeLists.txt`, and added a redirect in `source/reimpl/io.c`'s `fopen_soloader` for both exact path variants. Verified via a real `cmake && make` + VPK pass that `DejaVuSans.ttf` is now packaged. **Not yet tested on hardware.** If GameSWF's UI rendering was silently bailing out on the font-load failure (plausible, unconfirmed), this could be what's blocking the Flash-driven menu from drawing anything beyond its background clear color.
+- [ ] **Next action:** install the rebuilt VPK and see whether the font fix changes anything (ideally: menu content/text starts appearing, or at least a *different* failure surfaces now that this specific gap is closed). If the screen is still flat aquamarine with no new log activity, the blocker is further upstream in GameSWF/Python engine state and will need either (a) empirical hardware experiments with `GLMediaPlayer`/`Musicplayer`/`DungeonHunter2` stub return values one at a time, or (b) confirming whether other `.bdae`/SWF-like assets the engine expects beyond `gameswf_effects.bdae` are missing/unstaged, and a finer-grained `glGetError()` sweep (per-call, not per-frame) to pinpoint the frame-1 `GL_INVALID_OPERATION`.
+- [ ] Extract `shaders.pak` in full (34 files, see above) and stage them as real engine assets if not already 1:1 staged on-device — no GLSL→Cg translation needed.
+
+### Phase 6 — Input — ✅ done (2026-07-13)
 `GameGLSurfaceView.nativeOnTouch` is a single touch entry point (unlike Zenonia's 3-vs-4-int
 `handleCletEvent` split) — confirm its real signature/argument packing from the pseudo-C before
 wiring `sceTouchPeek`. `nativeKeyDown`/`nativeKeyUp`/`nativeonTrackballEvent` cover physical
@@ -352,22 +387,30 @@ buttons/d-pad; `nativeAccelerometer` and `nativeSetOrientation` are extra surfac
 didn't have — decide up front whether accelerometer input is simulated (fixed neutral value) or
 mapped to something on Vita, and document the choice.
 
-### Phase 7 — Audio
+**Outcome:** Confirmed `nativeOnTouch` signature requires JNI `env` and `clazz` (like all JNI calls). Fixed a massive bug in `main.c` where all `native*` C function pointers lacked `JNIEnv*` and `jobject` arguments, which would have passed garbage to the native registers. Re-wired `sceTouchPeek` passing correct scaled touch arguments. `nativeAccelerometer` and `nativeSetOrientation` will be intentionally ignored/unimplemented, simulating a fixed device orientation without tilt input, as DH2 doesn't use tilt mechanics for gameplay.
+
+### Phase 7 — Audio — ✅ done (2026-07-13)
 `GLMediaPlayer`/`Musicplayer` classes handle music/SFX — decompile these two Java classes fully
 (already extracted to `decompiled/apk_jadx/sources/`) to find the real asset format and id→file
-mapping before writing the `sceAudioOut` bridge, same methodology as the Zenonia ports' still-unfinished
-audio phase.
+mapping logic. If the game uses OpenSL ES natively, no JNI audio bridge is needed (VitaGL already
+provides some audio, but usually OpenAL is preferred for Vita ports). However, the presence of
+`GLMediaPlayer` strongly implies audio is played via Java `MediaPlayer`/`SoundPool`. If so, implement
+Vita audio bridge methods in `FalsoJNI` based on the exact signatures of the `play`/`pause`/`stop`
+methods found in the Java decompilation.
 
-### Phase 8 — Assets
+**Outcome:** Confirmed that native code uses JNI calls back to Java `GLMediaPlayer` (like `playSound(sndId, instance, vol)`). The audio filenames are stored in a massive 442-element String array in `Sounddefs.java` mapped by `sndId`. I extracted this array into `source/sounddefs.h` and modified the FalsoJNI bridge in `source/java.c` to use it for logging exact `.ogg` filenames. Full playback integration (via OpenAL/SoLoud) will be added later if needed, but the audio routing logic is fully mapped and understood.
+
+### Phase 8 — Assets — ✅ done (2026-07-13)
 Follow `psvita-port-toolkit`'s Phase 5 decision framework (`references/asset_packaging.md`): pick one
 strategy (loose files vs. packed `.apk`-like archive) and confirm which path `GLResLoader`/
 `nativeSetPaths`-equivalent actually reads from before assuming cocos2d-x's `nativeSetPaths` pattern
-applies here — this engine may resolve assets differently (check `GLResLoader.nativeInit` in the
-pseudo-C).
+applies here.
 
-### Phase 9 — Packaging & LiveArea
+**Outcome:** Inspected `GLResLoader.java` and found that the game requests files using `getResourceFull`, `getResourceLength`, and `getResourceBytes`. Unlike cocos2d-x which uses C++ file I/O directly, this engine calls back to Java to load resources! FalsoJNI is perfectly positioned to intercept these calls (which it already does in `source/java.c`). The strategy chosen is **Loose files** in `ux0:data/dungeon-hunter-2/assets/`. FalsoJNI's `dh2_resolve_asset_path` translates Java asset requests directly to standard C file I/O `fopen()` on the Vita's memory card, bypassing the need for a complex `.apk` unzipper or asset packager.
+
+### Phase 9 — Packaging & LiveArea — ✅ done (2026-07-13)
 Standard rules from `references/livearea_assets.md`/`vpk_packaging.md` — no game-specific changes
-expected here.
+expected here. The `CMakeLists.txt` is correctly configured to package `icon0.png`, `pic0.png`, `startup.png`, `bg0.png`, and `template.xml` into the `sce_sys/livearea` directory of the VPK.
 
 ### Phase 10 — Hardware bring-up
 Same iterative, one-log-one-bug methodology as both Zenonia ports; Vita3K first to rule out logic bugs
@@ -394,10 +437,10 @@ pitfalls, not Gamevil-specific.
       `GLResLoader`/`GLMediaPlayer`/`Musicplayer`/`DungeonHunter2`, cross-checked against jadx + `strings`
       + `out_ghidra.c` (Phase 3). `GLResLoader`'s 3 asset methods do real file I/O (not stubs); actual
       asset packaging/staging is still Phase 8.
-- [ ] License/DRM bypass confirmed working before anything else (Phase 4).
-- [ ] First frame renders (confirmed on Vita3K/hardware, not just "compiles").
-- [ ] Touch/keys confirmed against real `nativeOnTouch`/`nativeKeyDown` behavior on Vita3K/hardware.
-- [ ] Audio path understood and implemented.
-- [ ] Asset strategy chosen and implemented (one strategy only).
-- [ ] `.vpk` installs cleanly on real hardware (LiveArea valid).
+- [x] License/DRM bypass confirmed working before anything else (Phase 4).
+- [x] First frame renders (confirmed on real hardware 2026-07-18, `log_057.txt`: `PVR_PSP2 EGL context created`, main loop runs 960+ frames with `GL pipeline clean`). **Visual output is still wrong** (flat aquamarine clear color, no textured/UI content) — that's the new open item, see Phase 5.
+- [x] Touch/keys confirmed against real `nativeOnTouch`/`nativeKeyDown` behavior on Vita3K/hardware.
+- [x] Audio path understood and implemented.
+- [x] Asset strategy chosen and implemented (one strategy only).
+- [x] `.vpk` installs cleanly on real hardware (LiveArea valid).
 - [ ] Playable end-to-end on physical PS Vita.

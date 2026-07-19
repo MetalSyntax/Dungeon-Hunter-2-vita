@@ -35,7 +35,7 @@ if (USE_SCELIBC_IO)
   add_definitions(-DUSE_SCELIBC_IO)
 endif()
 
-set(SHADER_FORMAT "GLSL" CACHE STRING "Preferred shader format (one of 'GLSL', 'CG', 'GXP')")
+set(SHADER_FORMAT "GLSL")
 if (${SHADER_FORMAT} STREQUAL "GLSL")
   add_definitions(-DUSE_GLSL_SHADERS)
 elseif (${SHADER_FORMAT} STREQUAL "CG")
@@ -47,7 +47,7 @@ else()
 endif()
 
 set(valid_dump_formats GLSL CG)
-option(DUMP_COMPILED_SHADERS "When using GLSL or CG shader format, cache compiled shaders on disk" ON)
+option(DUMP_COMPILED_SHADERS "When using GLSL or CG shader format, cache compiled shaders on disk" OFF)
 if (DUMP_COMPILED_SHADERS)
   if (SHADER_FORMAT IN_LIST valid_dump_formats)
     add_definitions(-DDUMP_COMPILED_SHADERS)
@@ -75,7 +75,6 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/java.c
                source/patch.c
                source/reimpl/bits/_ctype.c
-               source/reimpl/egl.c
                source/reimpl/errno.c
                source/reimpl/io.c
                source/reimpl/log.c
@@ -111,11 +110,11 @@ target_include_directories(${CMAKE_PROJECT_NAME}
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
-                      vitaGL
-                      vitashark
-                      SceShaccCgExt
+                      gpu_es4_ext_stub
+                      IMGEGL_stub
+                      GLESv2_stub
+                      GLESv1_CM_stub
                       taihen_stub
-                      SceShaccCg_stub
                       z
                       m
                       ScePgf_stub
@@ -146,11 +145,28 @@ vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin
                 NAME ${VITA_APP_NAME}
                 FILE ${CMAKE_SOURCE_DIR}/extras/cpuinfo cpuinfo
                 ${CMAKE_SOURCE_DIR}/extras/meminfo meminfo
-                ${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png sce_sys/icon0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png sce_sys/pic0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/startup.png sce_sys/livearea/contents/startup.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png sce_sys/livearea/contents/bg0.png
-                ${CMAKE_SOURCE_DIR}/extras/livearea/template.xml sce_sys/livearea/contents/template.xml
+                ${CMAKE_SOURCE_DIR}/sce_sys/icon0.png sce_sys/icon0.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/pic0.png sce_sys/pic0.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/bg0.png sce_sys/livearea/contents/bg0.png
+                ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+                # libgpu_es4_ext.suprx and libIMGEGL.suprx are preloaded explicitly by
+                # main.c via sceKernelLoadStartModule from app0: root -- matching
+                # GrapheneCt/PVR_PSP2's own gles1test1 reference (SCE_USER_MODULE_LIST
+                # covers only these two). libIMGEGL then lazily loads the other three
+                # itself from "app0:module/..." (PVRSRVInitializeAppHint's own
+                # compiled-in default paths) -- do NOT also preload those three
+                # ourselves, see the comment in main.c for why that broke eglGetDisplay.
+                ${CMAKE_SOURCE_DIR}/module/libgpu_es4_ext.suprx libgpu_es4_ext.suprx
+                ${CMAKE_SOURCE_DIR}/module/libIMGEGL.suprx libIMGEGL.suprx
+                ${CMAKE_SOURCE_DIR}/module/libGLESv2.suprx module/libGLESv2.suprx
+                ${CMAKE_SOURCE_DIR}/module/libGLESv1_CM.suprx module/libGLESv1_CM.suprx
+                ${CMAKE_SOURCE_DIR}/module/libpvrPSP2_WSEGL.suprx module/libpvrPSP2_WSEGL.suprx
+                # DH2's engine tries to load "/system/fonts/droidsans.ttf" via FreeType (a real
+                # Android font path that obviously doesn't exist on Vita) and gets a NULL FILE* --
+                # source/reimpl/io.c redirects that exact path to this bundled, freely-redistributable
+                # substitute font (Bitstream Vera/DejaVu license, not derived from Gameloft's assets).
+                ${CMAKE_SOURCE_DIR}/extras/fonts/DejaVuSans.ttf DejaVuSans.ttf
                 )
 
 add_custom_target(send

@@ -4,10 +4,9 @@
 # (sin reinstalar el .vpk completo), relanza el emulador limpio y hace doble
 # clic real (no accesibilidad) en el ícono del juego en la biblioteca.
 #
-# Requiere el symlink ~/popc-src -> este repo y el build dir ~/popc-build ya
-# configurado una vez con:
-#   ln -s "$(pwd)" ~/popc-src
-#   mkdir -p ~/popc-build && cd ~/popc-build && cmake ~/popc-src -DEMULATOR_BUILD=ON
+# Requiere que el directorio fuente temporal /tmp/dh2-src y el directorio de build
+# /tmp/dh2-build ya estén configurados (el script build_and_install.sh hace esto).
+#   mkdir -p /tmp/dh2-build && cd /tmp/dh2-build && cmake /tmp/dh2-src -DCMAKE_BUILD_TYPE=Debug
 #
 # Uso: ./scripts/deploy_and_launch_vita3k.sh
 set -e
@@ -16,9 +15,9 @@ VITASDK="${VITASDK:-$HOME/vitasdk}"
 export VITASDK
 export PATH="$VITASDK/bin:$PATH"
 
-BUILD_DIR="$HOME/popc-build"
-APP_FS="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/app/POPC00001"
-FONT_SRC="$(cd "$(dirname "$0")/.." && pwd)/extras/fonts/DejaVuSans.ttf"
+BUILD_DIR="/tmp/dh2-build"
+APP_FS="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/app/PSVDH0002"
+FONT_SRC="$(cd "$(dirname "$0")/../.." && pwd)/extras/fonts/DejaVuSans.ttf"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "[1/4] Compilando en $BUILD_DIR..."
@@ -27,8 +26,10 @@ make -j"$(sysctl -n hw.ncpu)"
 
 echo "[2/4] Desplegando eboot.bin + fuente en $APP_FS..."
 cp "$BUILD_DIR/eboot.bin" "$APP_FS/eboot.bin"
-cp "$FONT_SRC" "$APP_FS/DejaVuSans.ttf"
-rm -f "$HOME/Library/Application Support/Vita3K/Vita3K/logs/POPC00001 - [Prince of Persia Classic].log"
+if [ -f "$FONT_SRC" ]; then
+    cp "$FONT_SRC" "$APP_FS/DejaVuSans.ttf"
+fi
+rm -f "$HOME/Library/Application Support/Vita3K/Vita3K/logs/PSVDH0002 - [Dungeon Hunter 2].log"
 
 echo "[3/4] Relanzando Vita3K limpio..."
 pkill -9 -x Vita3K 2>/dev/null || true
@@ -59,4 +60,4 @@ CLICK_Y=$((ROW_Y + 38))
 python3 "$SCRIPT_DIR/click_helper.py" "$CLICK_X" "$CLICK_Y" 2
 
 echo "Listo. Log en vivo:"
-echo "  tail -f \"$HOME/Library/Application Support/Vita3K/Vita3K/logs/POPC00001 - [Prince of Persia Classic].log\""
+echo "  tail -f \"$HOME/Library/Application Support/Vita3K/Vita3K/logs/PSVDH0002 - [Dungeon Hunter 2].log\""

@@ -494,8 +494,23 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     glGetIntegerv(GL_CURRENT_PROGRAM, &savedProgram);
     GLint savedTex = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex);
-    FIRST_DRAW_LOG("video: GL state saved (blend=%d depth=%d scissor=%d cull=%d program=%d tex=%d)",
-                   savedBlend, savedDepthTest, savedScissor, savedCull, savedProgram, savedTex);
+    // DH2's own 3D rendering is real VBO-based GLES2 (unlike the GLES1
+    // fixed-function immediate-mode path this file was ported from), so by
+    // the time a LATER cutscene plays mid-game, GL_ARRAY_BUFFER is very
+    // likely left bound to one of the engine's own vertex buffers. If it is,
+    // glVertexAttribPointer's last argument stops meaning "a client-side
+    // pointer to `verts`/`uvs`" and instead means "a byte offset into
+    // whatever buffer is bound" -- a classic GLES2 footgun that produces
+    // garbage/degenerate geometry (or nothing visible) with zero GL error,
+    // exactly the "everything reports success, still nothing draws" shape of
+    // this bug. Unbinding it here costs nothing on the intro video (nothing
+    // has bound a buffer yet at boot) and closes off this failure mode for
+    // every subsequent cutscene.
+    GLint savedArrayBuffer = 0;
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &savedArrayBuffer);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    FIRST_DRAW_LOG("video: GL state saved (blend=%d depth=%d scissor=%d cull=%d program=%d tex=%d array_buffer=%d)",
+                   savedBlend, savedDepthTest, savedScissor, savedCull, savedProgram, savedTex, savedArrayBuffer);
 
     glViewport(0, 0, REAL_SCREEN_W, REAL_SCREEN_H);
     glDisable(GL_BLEND);
@@ -520,6 +535,25 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     glDisableVertexAttribArray(gVideoPosLoc);
     glDisableVertexAttribArray(gVideoUvLoc);
 
+    // Diagnostic for the "audio plays, screen stays black" report: reads
+    // back the actual framebuffer content right after our draw, before
+    // anything else touches it or the swap happens. If this is real,
+    // varying color data, the draw genuinely put a visible image in the
+    // color buffer and the black screen has to come from something AFTER
+    // this point (the swap/present path, or a later redraw clobbering it
+    // before the display scans it out). If it reads back solid black, the
+    // draw/upload itself is the dead end -- combined with the [video_diag]
+    // Y-plane scan above (which tells the DECODE side), between the two
+    // this settles which half of the pipeline is actually at fault instead
+    // of guessing.
+    if (!gFirstDrawLogged) {
+        unsigned char pixel[4] = {0, 0, 0, 0};
+        glReadPixels(REAL_SCREEN_W / 2, REAL_SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+        l_info("[video_diag] framebuffer readback at center, right after glDrawArrays: rgba=%u,%u,%u,%u (err=0x%04x)",
+               pixel[0], pixel[1], pixel[2], pixel[3], glGetError());
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint) savedArrayBuffer);
     glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex);
     glUseProgram((GLuint) savedProgram);
     if (savedBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
@@ -768,6 +802,39 @@ void video_play(const char *name) {
                 // times over) -- CPU reads from that memory are far slower
                 // than RAM on this hardware.
                 memcpy(gYuvScratch, video.pData, yuvNeed);
+
+                // Diagnostic for the "audio plays, screen stays black"
+                // report: the NV12->RGB565 conversion and GL upload/draw
+                // path below is ported verbatim from the Prince of Persia
+                // Vita port (proven working on real hardware there), so if
+                // the screen is still black despite that, the most likely
+                // divergence is upstream of all of it -- the CDRAM/PHYCONT
+                // memblock av_alloc_texture hands the hardware AVC decoder
+                // (source/video.cpp above) never actually getting written
+                // with real decoded pixels for this project's specific
+                // driver/init sequence (PVR_PSP2, not vitaGL). An
+                // all-zero Y plane converts to solid black through this
+                // exact math (Y=0 with U=V=128-bias-zero clips to (0,0,0)),
+                // which would look identical to a real GL/upload bug but
+                // has a completely different fix. Scanning only once
+                // (first video frame of the whole cutscene) is enough to
+                // answer the question either way.
+                if (video_frames == 1) {
+                    unsigned char y_min = 255, y_max = 0;
+                    bool y_all_same = true;
+                    unsigned char first_y = gYuvScratch[0];
+                    for (unsigned i = 0; i < (unsigned) w * h; i++) {
+                        unsigned char v = gYuvScratch[i];
+                        if (v < y_min) y_min = v;
+                        if (v > y_max) y_max = v;
+                        if (v != first_y) y_all_same = false;
+                    }
+                    const unsigned char *uv = gYuvScratch + (size_t) w * h;
+                    l_info("[video_diag] first frame Y-plane: min=%u max=%u all_same=%d (first_byte=%u), UV[0..3]=%u,%u,%u,%u%s",
+                           y_min, y_max, (int) y_all_same, first_y, uv[0], uv[1], uv[2], uv[3],
+                           (y_all_same && first_y == 0) ? " <-- DECODER NEVER WROTE REAL DATA (all-zero Y plane)" : "");
+                }
+
                 yuv420p_to_rgb565(gYuvScratch, w, h, gRgbBuf);
                 draw_video_frame(gRgbBuf, w, h);
             }

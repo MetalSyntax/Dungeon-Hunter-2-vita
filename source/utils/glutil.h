@@ -118,6 +118,27 @@ void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void
 // place of the raw glUniformMatrix4fv entry point.
 void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 
+// Invisible-enemy investigation, next candidate after opacity was ruled out
+// with certainty (CharProperties::RecalcProperty/PROPS_GetOpacity both read
+// 1.0 for every character, see PORTING_PLAN.md) and the geometry/transform
+// path was already clean (glUniformMatrix4fv_soloader above never once
+// logged a degenerate matrix across three full combat sessions): the shipped
+// GL_Diffuse_L1_iPhone shader derives ALL fragment alpha from the diffuse
+// texture's own decoded alpha channel (vertex alpha is hardcoded to 1.0),
+// so a texture whose real pixel data decodes to alpha=0 would produce
+// exactly this bug with zero GL error and a fully-issued draw call. Only the
+// PVRTC container's HEADER bytes have ever been compared between a working
+// (player) and suspect (monster) texture -- never the actual compressed
+// block data. This wrapper logs the real internalformat GL enum (confirms
+// RGB-only vs RGBA-capable PVRTC at actual upload time, not just inferred
+// from a static file header) and flags the cheapest possible corruption
+// signal -- a compressed blob where every byte is identical, which cannot
+// encode real image detail regardless of format. Wired into dynlib.c in
+// place of the raw glCompressedTexImage2D entry point.
+void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
+                                      GLsizei width, GLsizei height, GLint border,
+                                      GLsizei imageSize, const void *data);
+
 // Logs every real glDepthRangef call (args + frame) -- log_075's gl_diag3
 // showed GL_DEPTH_RANGE collapsed to (1.0, 1.0) from the moment the 3D
 // character preview starts drawing, staying that way for the rest of the

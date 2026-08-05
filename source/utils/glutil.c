@@ -783,6 +783,44 @@ void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transp
     glUniformMatrix4fv(location, count, transpose, value);
 }
 
+void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
+                                      GLsizei width, GLsizei height, GLint border,
+                                      GLsizei imageSize, const void *data) {
+#ifdef DEBUG_SOLOADER
+    GLint tex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+
+    const char *fmt_name = "unknown";
+    int has_alpha = -1;
+    switch (internalformat) {
+        case GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG:  fmt_name = "PVRTC_RGB_4BPP";  has_alpha = 0; break;
+        case GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG:  fmt_name = "PVRTC_RGB_2BPP";  has_alpha = 0; break;
+        case GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG: fmt_name = "PVRTC_RGBA_4BPP"; has_alpha = 1; break;
+        case GL_COMPRESSED_RGBA_PVRTC_2BPPV1_IMG: fmt_name = "PVRTC_RGBA_2BPP"; has_alpha = 1; break;
+        default: break;
+    }
+
+    // Cheapest possible corruption signal without a full PVRTC block decoder:
+    // a compressed blob where every single byte is identical (0x00 most
+    // tellingly) cannot encode real image variation no matter the format --
+    // flag it before anyone attempts real block-level decode work.
+    int degenerate = 0;
+    if (data && imageSize > 1) {
+        const unsigned char *bytes = (const unsigned char *) data;
+        unsigned char first = bytes[0];
+        degenerate = 1;
+        for (GLsizei i = 1; i < imageSize; i++) {
+            if (bytes[i] != first) { degenerate = 0; break; }
+        }
+    }
+
+    l_debug("[gl_diag_pvrtc] texture=%d level=%d format=0x%04x(%s alpha=%d) %dx%d imageSize=%d%s",
+            tex, level, internalformat, fmt_name, has_alpha, width, height, imageSize,
+            degenerate ? " <-- DEGENERATE (every byte identical)" : "");
+#endif
+    glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
+}
+
 void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
     // DH2's logical canvas for a 960-wide screen (see glutil.h for how this
     // was confirmed) vs. the target this actually renders to -- REAL_W/REAL_H

@@ -613,7 +613,7 @@ so_default_dynlib default_dynlib[] = {
         { "glColorMask", (uintptr_t)&glColorMask },
         { "glColorPointer", (uintptr_t)&glColorPointer },
         { "glCompileShader", (uintptr_t)&glCompileShader_soloader },
-        { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D },
+        { "glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D_soloader },
         { "glCompressedTexSubImage2D", (uintptr_t)&glCompressedTexSubImage2D },
         { "glCopyTexImage2D", (uintptr_t)&glCopyTexImage2D },
         { "glCopyTexSubImage2D", (uintptr_t)&glCopyTexSubImage2D },

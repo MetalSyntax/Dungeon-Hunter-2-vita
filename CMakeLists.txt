@@ -13,7 +13,11 @@ include("${VITASDK}/share/vita.cmake" REQUIRED)
 # Vita application configuration
 set(VITA_APP_NAME "Dungeon Hunter 2")
 set(VITA_TITLEID "PSVDH0002")
-set(VITA_VPKNAME "dungeon_hunter_2")
+# Overridable so porting_tools/build/build_and_install.sh's performance-test
+# flags (see build.sh at the repo root) can produce distinctly-named VPKs
+# (e.g. dungeon_hunter_2_downsample_test.vpk) side by side with the normal
+# build instead of overwriting it on every experiment.
+set(VITA_VPKNAME "dungeon_hunter_2" CACHE STRING "Output VPK base name (without .vpk)")
 set(VITA_VERSION "01.00")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
@@ -63,6 +67,35 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   #add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
 endif()
 
+# --- Performance-investigation flags (Phase: FPS 8-14 -> target 20-30) -----
+# Each is OFF by default so the normal build is never affected; porting_tools/
+# build/build_and_install.sh exposes them as named, individually-buildable
+# variants (see build.sh at the repo root), same pattern proven in the
+# sibling Zenonia4-vita port's own perf-investigation phase.
+
+# Diagnostic only: skips eglSwapInterval's vblank wait entirely. Causes
+# visible tearing -- exists purely to answer "is our ~8-14 FPS artificially
+# capped by vsync, or genuinely GPU/CPU-bound below the refresh rate?" before
+# investing in the more invasive DOWNSAMPLE_RENDER below.
+option(DISABLE_VSYNC "Diagnostic: skip eglSwapInterval's vblank wait (tearing, FPS-ceiling test only)" OFF)
+if (DISABLE_VSYNC)
+  add_definitions(-DDISABLE_VSYNC)
+endif()
+
+# Renders the whole scene (3D world + 2D HUD, same as the real device sees)
+# into a reduced-resolution offscreen FBO, then upscales that FBO onto the
+# real screen with one GL_LINEAR-filtered blit -- trades sharpness for GPU
+# fill-rate/shading cost, which matters here because log_078 showed sustained
+# combat scenes (particle effects, alpha-blended lighting) running at 8-14
+# FPS, consistent with a fill-rate-bound bottleneck rather than draw-call
+# count (log_075/076 already confirmed draw calls and GL state are healthy).
+option(DOWNSAMPLE_RENDER "Render at reduced internal resolution, upscale via GPU blit (trades sharpness for fill-rate)" OFF)
+set(DS_NUM "2" CACHE STRING "Downsample numerator -- render at DS_NUM/DS_DEN of native resolution")
+set(DS_DEN "3" CACHE STRING "Downsample denominator")
+if (DOWNSAMPLE_RENDER)
+  add_definitions(-DDOWNSAMPLE_RENDER -DDS_NUM=${DS_NUM} -DDS_DEN=${DS_DEN})
+endif()
+
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
@@ -74,6 +107,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/dynlib.c
                source/java.c
                source/patch.c
+               source/video.cpp
                source/reimpl/bits/_ctype.c
                source/reimpl/errno.c
                source/reimpl/io.c
@@ -134,6 +168,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceFios2_stub
                       SceCtrl_stub
                       SceGxm_stub
+                      SceAvPlayer_stub
+                      SceSysmodule_stub
                       ScePower_stub
                       SceTouch_stub
                       SceVshBridge_stub

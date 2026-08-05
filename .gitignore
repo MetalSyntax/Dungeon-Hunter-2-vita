@@ -47,10 +47,13 @@ log_*.txt
 log.txt
 *.psp2dmp
 
-# IDE files
+# IDE / agent tool files
 .vscode/
 .idea/
 *.swp
+.agents/
+__pycache__/
+*.pyc
 
 # Private working notes (may reference details derived from the original binary) —
 # not for GitHub, local status tracking only
@@ -58,3 +61,5 @@ log.txt
 crash_dump/
 glsl_dump/
 assets
+2026-*.jpg
+dungeon-*.webp

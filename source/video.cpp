@@ -1,0 +1,852 @@
+// Cutscene playback via the Vita's native SceAvPlayer, wired into
+// GLMediaPlayer_loadMovie (java.c). Ported from the Prince of Persia Classic
+// Vita port's source/video.cpp (same soloader lineage, hardware-confirmed
+// there across several rounds) -- see that project's Fixes_Log.md #16-#19 for
+// the original debugging history. Two things differ here because this
+// project's graphics stack is different:
+//
+//  * No vitaGL: this project renders through the real PVR_PSP2 GLES2 driver
+//    (source/utils/glutil.c), a GLES2-only context with no fixed-function
+//    matrix stack/immediate-mode arrays. draw_video_frame() below is a small
+//    dedicated GLSL ES program (compiled with the same glCompileShader_/
+//    glLinkProgram_soloader status-checking wrappers glutil.c already proves
+//    work against the real on-device GLSL compiler) instead of the
+//    glOrthof/glVertexPointer calls the vitaGL/GLES1 build used. Buffer
+//    presentation goes through this project's own gl_swap() (glutil.h)
+//    instead of vglSwapBuffers().
+//  * SceAvPlayer's memory-allocator/event/file-replacement setup and the NV12
+//    (Y + interleaved UV) -> RGB565 NEON conversion are UNCHANGED: none of
+//    that touches vitaGL/GLES at all (memalign/free, a dedicated
+//    sceKernelAllocMemBlock CDRAM/PHYCONT block per texture allocation +
+//    sceGxmMapMemory, and plain NEON intrinsics), so it carries over as-is.
+//
+// Same never-hangs contract as the original: video_play() always returns
+// (natural end, user skip, or any open/init failure), so the caller can
+// unconditionally poke videoDone afterwards.
+
+#include "video.h"
+#include "utils/logger.h"
+#include "utils/glutil.h"
+
+#include <psp2/avplayer.h>
+#include <psp2/sysmodule.h>
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+#include <psp2/ctrl.h>
+#include <psp2/audioout.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/gxm.h>
+
+#include <GLES2/gl2.h>
+
+#include <arm_neon.h>
+#include <malloc.h>
+#include <pthread.h>
+#include <string.h>
+#include <string>
+
+static bool gModuleLoaded = false;
+static unsigned short *gRgbBuf = NULL;
+static unsigned gRgbBufCap = 0;
+static unsigned char *gYuvScratch = NULL;
+static unsigned gYuvScratchCap = 0;
+
+// --- SceAvPlayer file I/O: plain sceIo, with visibility into how far the
+// player actually got into the file before giving up (see the original
+// project's file-level comment for why this exists instead of leaving
+// fileReplacement unset -- it's the difference between "silent black
+// screen" and a log that shows open/size/read results). ---
+struct AvFileCtx {
+    SceUID fd;
+    uint64_t total_read;
+    unsigned read_calls;
+};
+static AvFileCtx gAvFileCtx = { -1, 0, 0 };
+
+static int av_file_open(void *p, const char *filename) {
+    AvFileCtx *ctx = (AvFileCtx *) p;
+    ctx->fd = sceIoOpen(filename, SCE_O_RDONLY, 0);
+    ctx->total_read = 0;
+    ctx->read_calls = 0;
+    l_info("video: file open(%s) -> fd=0x%08X", filename, (unsigned) ctx->fd);
+    return ctx->fd < 0 ? -1 : 0;
+}
+
+static int av_file_close(void *p) {
+    AvFileCtx *ctx = (AvFileCtx *) p;
+    l_info("video: file close (reads=%u, total_bytes=%llu)", ctx->read_calls,
+           (unsigned long long) ctx->total_read);
+    if (ctx->fd >= 0) sceIoClose(ctx->fd);
+    ctx->fd = -1;
+    return 0;
+}
+
+static int av_file_read(void *p, uint8_t *buffer, uint64_t position, uint32_t length) {
+    AvFileCtx *ctx = (AvFileCtx *) p;
+    int n = sceIoPread(ctx->fd, buffer, length, (SceOff) position);
+    ctx->read_calls++;
+    if (ctx->read_calls <= 5 || n < 0)
+        l_info("video: file read #%u pos=%llu len=%u -> %d", ctx->read_calls,
+               (unsigned long long) position, length, n);
+    if (n > 0) ctx->total_read += (uint64_t) n;
+    return n;
+}
+
+static uint64_t av_file_size(void *p) {
+    AvFileCtx *ctx = (AvFileCtx *) p;
+    SceOff end = sceIoLseek(ctx->fd, 0, SCE_SEEK_END);
+    l_info("video: file size -> %llu", (unsigned long long) end);
+    return (uint64_t) end;
+}
+
+// --- SceAvPlayer event callback: the player's own diagnostic channel --
+// every state transition, and (WARNING_ID) the actual error code on a silent
+// abort, arrives here instead of just IsActive flipping to false. ---
+static const char *av_event_name(int32_t id) {
+    switch (id) {
+        case 0x01: return "STATE_STOP";
+        case 0x02: return "STATE_READY";
+        case 0x03: return "STATE_PLAY";
+        case 0x04: return "STATE_PAUSE";
+        case 0x05: return "STATE_BUFFERING";
+        case 0x10: return "TIMED_TEXT_DELIVERY";
+        case 0x20: return "WARNING_ID";
+        default:   return "?";
+    }
+}
+
+static void av_event_cb(void *p, int32_t eventId, int32_t sourceId, void *eventData) {
+    (void) p;
+    if (eventId == 0x20 && eventData) {
+        l_error("video: event WARNING_ID source=%d code=0x%08X", sourceId,
+                (unsigned) *(int32_t *) eventData);
+    } else {
+        l_info("video: event %s (0x%02X) source=%d data=%p", av_event_name(eventId),
+               (unsigned) eventId, sourceId, eventData);
+    }
+}
+
+// --- SceAvPlayer memory: general allocations to the newlib heap (memalign/
+// free -- AvPlayer makes many small internal allocations at startup;
+// backing each with its own kernel memblock exhausts the process's memblock
+// limit before the player finishes activating), texture/frame-buffer
+// allocations to a DEDICATED kernel memblock per allocation (CDRAM, falling
+// back to PHYCONT), sceGxmMapMemory'd -- the pattern proven on real hardware
+// by OpenFMV and carried over unchanged from the Prince of Persia port. This
+// is independent of vitaGL/PVR_PSP2: sceGxm is the shared low-level graphics
+// API underneath either driver, and mapping memory into it doesn't touch
+// whichever GL driver happens to be using it for rendering. ---
+#define AV_FB_ALIGNMENT 0x40000
+#define AV_ALIGN_MEM(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
+
+static void *av_alloc(void *arg, uint32_t alignment, uint32_t size) {
+    (void) arg;
+    void *p = memalign(alignment, size);
+    if (!p)
+        l_error("video: general alloc FAILED (align=%u size=%u)", alignment, size);
+    return p;
+}
+
+static void av_free(void *arg, void *ptr) {
+    (void) arg;
+    free(ptr);
+}
+
+#define AV_TEX_MAX_BLOCKS 8
+static struct { void *base; SceUID uid; } gAvTexBlocks[AV_TEX_MAX_BLOCKS];
+
+static void *av_alloc_texture(void *arg, uint32_t alignment, uint32_t size) {
+    (void) arg;
+    uint32_t req_align = alignment, req_size = size;
+    if (alignment < AV_FB_ALIGNMENT)
+        alignment = AV_FB_ALIGNMENT;
+    size = AV_ALIGN_MEM(size, alignment);
+
+    SceKernelAllocMemBlockOpt opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.size = sizeof(opt);
+    opt.attr = 0x00000004U; // SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT
+    opt.alignment = alignment;
+    SceUID blk = sceKernelAllocMemBlock("av_tex", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, size, &opt);
+    SceUID usedType = SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW;
+    if (blk < 0) {
+        // Retry once from the PHYCONT partition (a separate physical pool
+        // from CDRAM) before failing for real -- same fallback the source
+        // project needed on real hardware when CDRAM was tight.
+        SceUID blk2 = sceKernelAllocMemBlock("av_tex_phycont", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, size, &opt);
+        if (blk2 < 0) {
+            l_error("video: texture memblock alloc FAILED on both CDRAM (0x%08X) and PHYCONT (0x%08X) (req align=%u size=%u -> size=%u)",
+                    (unsigned) blk, (unsigned) blk2, req_align, req_size, size);
+            return NULL;
+        }
+        l_warn("video: CDRAM alloc failed (0x%08X) -- fell back to PHYCONT for this frame buffer", (unsigned) blk);
+        blk = blk2;
+        usedType = SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW;
+    }
+    void *base = NULL;
+    sceKernelGetMemBlockBase(blk, &base);
+    int map = sceGxmMapMemory(base, size, (SceGxmMemoryAttribFlags)(SCE_GXM_MEMORY_ATTRIB_READ | SCE_GXM_MEMORY_ATTRIB_WRITE));
+
+    int slot = -1;
+    for (int i = 0; i < AV_TEX_MAX_BLOCKS; i++) {
+        if (!gAvTexBlocks[i].base) { slot = i; break; }
+    }
+    if (slot >= 0) {
+        gAvTexBlocks[slot].base = base;
+        gAvTexBlocks[slot].uid = blk;
+    }
+    l_info("video: texture memblock ok (%s) (req align=%u size=%u -> size=%u) base=%p uid=0x%08X gxm_map=0x%08X",
+           usedType == SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW ? "CDRAM" : "PHYCONT",
+           req_align, req_size, size, base, (unsigned) blk, (unsigned) map);
+    return base;
+}
+
+static void av_free_texture(void *arg, void *ptr) {
+    (void) arg;
+    if (!ptr) return;
+    glFinish();
+    for (int i = 0; i < AV_TEX_MAX_BLOCKS; i++) {
+        if (gAvTexBlocks[i].base == ptr) {
+            l_info("video: texture memblock free %p uid=0x%08X", ptr, (unsigned) gAvTexBlocks[i].uid);
+            sceGxmUnmapMemory(ptr);
+            sceKernelFreeMemBlock(gAvTexBlocks[i].uid);
+            gAvTexBlocks[i].base = NULL;
+            gAvTexBlocks[i].uid = -1;
+            return;
+        }
+    }
+    l_warn("video: texture free for unknown ptr %p (leaking it)", ptr);
+}
+
+// --- NV12 (Y plane + interleaved U/V, each subsampled 2x2) -> RGB565, BT.601,
+// NEON-vectorized -- unchanged from the source project (pure C/NEON, no GL
+// dependency at all). See that project's video.cpp for the derivation notes;
+// kept verbatim here since it's already proven correct on real hardware. ---
+
+static int CV_R[256];
+static int CV_G[256];
+static int CU_G[256];
+static int CU_B[256];
+static unsigned char clip_table[768];
+static bool tables_init = false;
+
+static void init_yuv_tables() {
+    if (tables_init) return;
+    for (int i = 0; i < 256; i++) {
+        int V = i - 128;
+        int U = i - 128;
+        CV_R[i] = (91881 * V) >> 16;
+        CV_G[i] = (46802 * V) >> 16;
+        CU_G[i] = (22554 * U) >> 16;
+        CU_B[i] = (116130 * U) >> 16;
+    }
+    for (int i = 0; i < 768; i++) {
+        int v = i - 256;
+        clip_table[i] = (v < 0) ? 0 : ((v > 255) ? 255 : v);
+    }
+    tables_init = true;
+}
+
+#define CLIP(X) (clip_table[(X) + 256])
+
+static inline void store_rgb565_8(unsigned short *dst, uint8x8_t r, uint8x8_t g, uint8x8_t b) {
+    uint16x8_t rw = vmovl_u8(r);
+    uint16x8_t gw = vmovl_u8(g);
+    uint16x8_t bw = vmovl_u8(b);
+    uint16x8_t rr = vshlq_n_u16(vandq_u16(rw, vdupq_n_u16(0xF8)), 8);
+    uint16x8_t gg = vshlq_n_u16(vandq_u16(gw, vdupq_n_u16(0xFC)), 3);
+    uint16x8_t bb = vshrq_n_u16(bw, 3);
+    vst1q_u16((uint16_t *) dst, vorrq_u16(vorrq_u16(rr, gg), bb));
+}
+
+static void yuv420p_to_rgb565(const unsigned char *src, unsigned w, unsigned h, unsigned short *dst) {
+    init_yuv_tables();
+    const unsigned char *yp = src;
+    const unsigned char *uvp = src + (size_t) w * h;
+    for (unsigned y = 0; y < h; y += 2) {
+        const unsigned char *yrow0 = yp + (size_t) y * w;
+        const unsigned char *yrow1 = yrow0 + w;
+        const unsigned char *uvrow = uvp + (size_t) (y / 2) * w;
+        unsigned short *drow0 = dst + (size_t) y * w;
+        unsigned short *drow1 = drow0 + w;
+
+        unsigned x = 0;
+        for (; x + 16 <= w; x += 16) {
+            uint8x8x2_t uv = vld2_u8(uvrow + x);
+            int16x8_t Uc = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uv.val[0])), vdupq_n_s16(128));
+            int16x8_t Vc = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uv.val[1])), vdupq_n_s16(128));
+
+            int32x4_t Uc_lo = vmovl_s16(vget_low_s16(Uc));
+            int32x4_t Uc_hi = vmovl_s16(vget_high_s16(Uc));
+            int32x4_t Vc_lo = vmovl_s16(vget_low_s16(Vc));
+            int32x4_t Vc_hi = vmovl_s16(vget_high_s16(Vc));
+
+            int16x4_t r_add_lo = vmovn_s32(vshrq_n_s32(vmulq_n_s32(Vc_lo, 91881), 16));
+            int16x4_t r_add_hi = vmovn_s32(vshrq_n_s32(vmulq_n_s32(Vc_hi, 91881), 16));
+
+            int32x4_t cu_g_lo = vshrq_n_s32(vmulq_n_s32(Uc_lo, 22554), 16);
+            int32x4_t cu_g_hi = vshrq_n_s32(vmulq_n_s32(Uc_hi, 22554), 16);
+            int32x4_t cv_g_lo = vshrq_n_s32(vmulq_n_s32(Vc_lo, 46802), 16);
+            int32x4_t cv_g_hi = vshrq_n_s32(vmulq_n_s32(Vc_hi, 46802), 16);
+            int16x4_t g_add_lo = vneg_s16(vmovn_s32(vaddq_s32(cu_g_lo, cv_g_lo)));
+            int16x4_t g_add_hi = vneg_s16(vmovn_s32(vaddq_s32(cu_g_hi, cv_g_hi)));
+
+            int16x4_t b_add_lo = vmovn_s32(vshrq_n_s32(vmulq_n_s32(Uc_lo, 116130), 16));
+            int16x4_t b_add_hi = vmovn_s32(vshrq_n_s32(vmulq_n_s32(Uc_hi, 116130), 16));
+
+            int16x8_t r_add8 = vcombine_s16(r_add_lo, r_add_hi);
+            int16x8_t g_add8 = vcombine_s16(g_add_lo, g_add_hi);
+            int16x8_t b_add8 = vcombine_s16(b_add_lo, b_add_hi);
+            int16x8x2_t r_dup = vzipq_s16(r_add8, r_add8);
+            int16x8x2_t g_dup = vzipq_s16(g_add8, g_add8);
+            int16x8x2_t b_dup = vzipq_s16(b_add8, b_add8);
+
+            for (int half = 0; half < 2; half++) {
+                const unsigned char *yr0 = yrow0 + x + half * 8;
+                const unsigned char *yr1 = yrow1 + x + half * 8;
+                int16x8_t r_add = half == 0 ? r_dup.val[0] : r_dup.val[1];
+                int16x8_t g_add = half == 0 ? g_dup.val[0] : g_dup.val[1];
+                int16x8_t b_add = half == 0 ? b_dup.val[0] : b_dup.val[1];
+
+                int16x8_t Y0 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(yr0)));
+                int16x8_t Y1 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(yr1)));
+
+                uint8x8_t r0 = vqmovun_s16(vaddq_s16(Y0, r_add));
+                uint8x8_t g0 = vqmovun_s16(vaddq_s16(Y0, g_add));
+                uint8x8_t b0 = vqmovun_s16(vaddq_s16(Y0, b_add));
+                uint8x8_t r1 = vqmovun_s16(vaddq_s16(Y1, r_add));
+                uint8x8_t g1 = vqmovun_s16(vaddq_s16(Y1, g_add));
+                uint8x8_t b1 = vqmovun_s16(vaddq_s16(Y1, b_add));
+
+                store_rgb565_8(drow0 + x + half * 8, r0, g0, b0);
+                store_rgb565_8(drow1 + x + half * 8, r1, g1, b1);
+            }
+        }
+
+        for (; x < w; x += 2) {
+            unsigned char U = uvrow[x + 0];
+            unsigned char V = uvrow[x + 1];
+
+            int r_add = CV_R[V];
+            int g_add = -(CU_G[U] + CV_G[V]);
+            int b_add = CU_B[U];
+
+            int Y00 = yrow0[x];
+            unsigned char r00 = CLIP(Y00 + r_add), g00 = CLIP(Y00 + g_add), b00 = CLIP(Y00 + b_add);
+            drow0[x] = (unsigned short) (((r00 & 0xF8) << 8) | ((g00 & 0xFC) << 3) | (b00 >> 3));
+
+            int Y01 = yrow0[x+1];
+            unsigned char r01 = CLIP(Y01 + r_add), g01 = CLIP(Y01 + g_add), b01 = CLIP(Y01 + b_add);
+            drow0[x+1] = (unsigned short) (((r01 & 0xF8) << 8) | ((g01 & 0xFC) << 3) | (b01 >> 3));
+
+            int Y10 = yrow1[x];
+            unsigned char r10 = CLIP(Y10 + r_add), g10 = CLIP(Y10 + g_add), b10 = CLIP(Y10 + b_add);
+            drow1[x] = (unsigned short) (((r10 & 0xF8) << 8) | ((g10 & 0xFC) << 3) | (b10 >> 3));
+
+            int Y11 = yrow1[x+1];
+            unsigned char r11 = CLIP(Y11 + r_add), g11 = CLIP(Y11 + g_add), b11 = CLIP(Y11 + b_add);
+            drow1[x+1] = (unsigned short) (((r11 & 0xF8) << 8) | ((g11 & 0xFC) << 3) | (b11 >> 3));
+        }
+    }
+}
+
+// --- GLES2 fullscreen-quad draw (replaces the vitaGL/GLES1 immediate-mode
+// path: no glMatrixMode/glOrthof/glVertexPointer in a GLES2-only context).
+// Same shader-compile/link idiom as source/utils/glutil.c's DOWNSAMPLE_RENDER
+// blit program (glCompileShader_soloader/glLinkProgram_soloader, already
+// proven against the real on-device GLSL ES compiler by this project's own
+// shaders), just with a video-appropriate quad recomputed per (w,h). ---
+
+static GLuint gVideoProgram = 0;
+static GLint gVideoPosLoc = -1;
+static GLint gVideoUvLoc = -1;
+static GLint gVideoTexLoc = -1;
+static GLuint gVideoTex = 0;
+static unsigned gVideoTexW = 0;
+static unsigned gVideoTexH = 0;
+
+static void ensure_video_program() {
+    if (gVideoProgram) return;
+
+    static const char *kVideoVS =
+        "attribute vec2 aPos;\n"
+        "attribute vec2 aUV;\n"
+        "varying vec2 vUV;\n"
+        "void main() {\n"
+        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+        "    vUV = aUV;\n"
+        "}\n";
+    static const char *kVideoFS =
+        "precision mediump float;\n"
+        "varying vec2 vUV;\n"
+        "uniform sampler2D uTex;\n"
+        "void main() {\n"
+        "    gl_FragColor = vec4(texture2D(uTex, vUV).rgb, 1.0);\n"
+        "}\n";
+
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &kVideoVS, NULL);
+    glCompileShader_soloader(vs);
+
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &kVideoFS, NULL);
+    glCompileShader_soloader(fs);
+
+    gVideoProgram = glCreateProgram();
+    glAttachShader(gVideoProgram, vs);
+    glAttachShader(gVideoProgram, fs);
+    glBindAttribLocation(gVideoProgram, 0, "aPos");
+    glBindAttribLocation(gVideoProgram, 1, "aUV");
+    glLinkProgram_soloader(gVideoProgram);
+
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    gVideoPosLoc = 0;
+    gVideoUvLoc = 1;
+    gVideoTexLoc = glGetUniformLocation(gVideoProgram, "uTex");
+
+    l_info("video: GLES2 program ready (program=%u posLoc=%d uvLoc=%d texLoc=%d)",
+           gVideoProgram, gVideoPosLoc, gVideoUvLoc, gVideoTexLoc);
+}
+
+#define REAL_SCREEN_W 960
+#define REAL_SCREEN_H 544
+
+static bool gFirstDrawLogged = false;
+#define FIRST_DRAW_LOG(...) do { if (!gFirstDrawLogged) l_info(__VA_ARGS__); } while (0)
+
+static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned h) {
+    // Fine-grained, first-frame-only tracing: this is new code (no vitaGL
+    // equivalent proven on this driver yet), so if it ever hangs again the
+    // next log needs to show exactly which GL call never returned instead of
+    // just going silent after "GLES2 program ready".
+    FIRST_DRAW_LOG("video: draw_video_frame ENTER (%ux%u)", w, h);
+    ensure_video_program();
+    FIRST_DRAW_LOG("video: ensure_video_program() returned");
+
+    // Allocate the texture's storage once per (w,h) -- a cutscene's
+    // resolution never changes mid-playback, and reallocating storage every
+    // frame (glTexImage2D) is a known stall source on embedded GL drivers.
+    if (!gVideoTex || gVideoTexW != w || gVideoTexH != h) {
+        FIRST_DRAW_LOG("video: creating texture storage...");
+        if (!gVideoTex) glGenTextures(1, &gVideoTex);
+        glBindTexture(GL_TEXTURE_2D, gVideoTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        FIRST_DRAW_LOG("video: about to glTexImage2D (%ux%u, RGB565)...", w, h);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, (GLsizei) w, (GLsizei) h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
+        FIRST_DRAW_LOG("video: glTexImage2D returned (err=0x%04x)", glGetError());
+        gVideoTexW = w;
+        gVideoTexH = h;
+    }
+    glBindTexture(GL_TEXTURE_2D, gVideoTex);
+    FIRST_DRAW_LOG("video: about to glTexSubImage2D...");
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, rgb565);
+    FIRST_DRAW_LOG("video: glTexSubImage2D returned (err=0x%04x)", glGetError());
+
+    // Letterbox against the REAL physical 960x544 screen -- on real Android
+    // the cutscene plays in its own separate fullscreen Activity/View, with
+    // no relationship to this engine's internal 960x640 logical canvas (see
+    // glutil.c's compute_letterbox_rect), so this deliberately does NOT use
+    // that same letterbox.
+    float srcAspect = (float) w / (float) h;
+    float dstAspect = (float) REAL_SCREEN_W / (float) REAL_SCREEN_H;
+    float qx0 = 0, qy0 = 0, qx1 = REAL_SCREEN_W, qy1 = REAL_SCREEN_H;
+    if (srcAspect > dstAspect) {
+        float qh = REAL_SCREEN_W / srcAspect;
+        qy0 = (REAL_SCREEN_H - qh) / 2.0f;
+        qy1 = qy0 + qh;
+    } else {
+        float qw = REAL_SCREEN_H * srcAspect;
+        qx0 = (REAL_SCREEN_W - qw) / 2.0f;
+        qx1 = qx0 + qw;
+    }
+
+    // Pixel space (y=0 top) -> NDC (y=+1 top): x' = x/W*2-1, y' = 1 - y/H*2.
+    float nx0 = qx0 / REAL_SCREEN_W * 2.0f - 1.0f;
+    float nx1 = qx1 / REAL_SCREEN_W * 2.0f - 1.0f;
+    float ny0 = 1.0f - qy0 / REAL_SCREEN_H * 2.0f; // top edge
+    float ny1 = 1.0f - qy1 / REAL_SCREEN_H * 2.0f; // bottom edge
+
+    // Triangle strip: top-left, top-right, bottom-left, bottom-right.
+    // UV (0,0) at top-left matches row 0 of the CPU buffer being the
+    // frame's top scanline (yuv420p_to_rgb565 writes top-to-bottom).
+    const GLfloat verts[8] = {
+        nx0, ny0,  nx1, ny0,  nx0, ny1,  nx1, ny1,
+    };
+    const GLfloat uvs[8] = {
+        0.0f, 0.0f,  1.0f, 0.0f,  0.0f, 1.0f,  1.0f, 1.0f,
+    };
+
+    FIRST_DRAW_LOG("video: about to save GL state...");
+    GLboolean savedBlend = glIsEnabled(GL_BLEND);
+    GLboolean savedDepthTest = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean savedScissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean savedCull = glIsEnabled(GL_CULL_FACE);
+    GLint savedViewport[4];
+    glGetIntegerv(GL_VIEWPORT, savedViewport);
+    GLint savedProgram = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &savedProgram);
+    GLint savedTex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex);
+    FIRST_DRAW_LOG("video: GL state saved (blend=%d depth=%d scissor=%d cull=%d program=%d tex=%d)",
+                   savedBlend, savedDepthTest, savedScissor, savedCull, savedProgram, savedTex);
+
+    glViewport(0, 0, REAL_SCREEN_W, REAL_SCREEN_H);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    FIRST_DRAW_LOG("video: viewport/disables done");
+
+    glUseProgram(gVideoProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gVideoTex);
+    glUniform1i(gVideoTexLoc, 0);
+    FIRST_DRAW_LOG("video: program/texture bound");
+
+    glVertexAttribPointer(gVideoPosLoc, 2, GL_FLOAT, GL_FALSE, 0, verts);
+    glVertexAttribPointer(gVideoUvLoc, 2, GL_FLOAT, GL_FALSE, 0, uvs);
+    glEnableVertexAttribArray(gVideoPosLoc);
+    glEnableVertexAttribArray(gVideoUvLoc);
+    FIRST_DRAW_LOG("video: about to glDrawArrays...");
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    FIRST_DRAW_LOG("video: glDrawArrays returned (err=0x%04x)", glGetError());
+    glDisableVertexAttribArray(gVideoPosLoc);
+    glDisableVertexAttribArray(gVideoUvLoc);
+
+    glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex);
+    glUseProgram((GLuint) savedProgram);
+    if (savedBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (savedDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (savedScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (savedCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
+    FIRST_DRAW_LOG("video: GL state restored, about to gl_swap()...");
+
+    gl_swap();
+    FIRST_DRAW_LOG("video: gl_swap() returned -- first frame fully presented");
+    gFirstDrawLogged = true;
+}
+
+// --- cutscene audio: dedicated output thread, unchanged from the source
+// project -- decoupling the blocking sceAudioOutOutput() call from the same
+// loop that pays for the YUV conversion above, so a slow video frame can't
+// delay the next audio block (and vice versa). Uses only a mutex + short poll
+// for the producer/consumer handshake (no pthread_cond_t): this project's own
+// pthread port (source/reimpl/pthr.c) is the same lineage the source project
+// found crashes a statically-initialized cond var on first use. ---
+static pthread_mutex_t gCutAudioLock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char *gCutAudioBuf[2] = { NULL, NULL };
+static unsigned gCutAudioBufCap = 0;
+static unsigned gCutAudioLen[2] = { 0, 0 };
+static int gCutAudioWriteSlot = 0;
+static int gCutAudioPort = -1;
+static volatile bool gCutAudioQuit = false;
+
+static int cutscene_audio_thread(SceSize args, void *argp) {
+    (void) args; (void) argp;
+    int slot = 0;
+    for (;;) {
+        pthread_mutex_lock(&gCutAudioLock);
+        unsigned len = gCutAudioLen[slot];
+        bool quit = gCutAudioQuit;
+        pthread_mutex_unlock(&gCutAudioLock);
+
+        if (len == 0) {
+            if (quit)
+                break;
+            sceKernelDelayThread(500);
+            continue;
+        }
+
+        if (gCutAudioPort >= 0)
+            sceAudioOutOutput(gCutAudioPort, gCutAudioBuf[slot]);
+        pthread_mutex_lock(&gCutAudioLock);
+        gCutAudioLen[slot] = 0;
+        pthread_mutex_unlock(&gCutAudioLock);
+        slot ^= 1;
+    }
+    return 0;
+}
+
+static void cutscene_audio_submit(const void *pData, unsigned bytes) {
+    if (bytes > gCutAudioBufCap) {
+        free(gCutAudioBuf[0]);
+        free(gCutAudioBuf[1]);
+        gCutAudioBuf[0] = (unsigned char *) malloc(bytes);
+        gCutAudioBuf[1] = (unsigned char *) malloc(bytes);
+        gCutAudioBufCap = (gCutAudioBuf[0] && gCutAudioBuf[1]) ? bytes : 0;
+    }
+    if (!gCutAudioBuf[0] || !gCutAudioBuf[1] || gCutAudioBufCap < bytes)
+        return;
+
+    for (;;) {
+        pthread_mutex_lock(&gCutAudioLock);
+        bool free_slot = gCutAudioLen[gCutAudioWriteSlot] == 0;
+        if (free_slot) {
+            memcpy(gCutAudioBuf[gCutAudioWriteSlot], pData, bytes);
+            gCutAudioLen[gCutAudioWriteSlot] = bytes;
+        }
+        pthread_mutex_unlock(&gCutAudioLock);
+        if (free_slot)
+            break;
+        sceKernelDelayThread(500);
+    }
+    gCutAudioWriteSlot ^= 1;
+}
+
+void video_init() {
+    int ret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVPLAYER);
+    if (ret < 0) {
+        l_error("video: sceSysmoduleLoadModule(AVPLAYER) failed (0x%08X) -- cutscenes will be skipped", (unsigned) ret);
+        gModuleLoaded = false;
+        return;
+    }
+    gModuleLoaded = true;
+    l_success("video: SceAvPlayer module loaded.");
+}
+
+void video_shutdown() {
+    if (gVideoTex) {
+        glDeleteTextures(1, &gVideoTex);
+        gVideoTex = 0;
+        gVideoTexW = 0;
+        gVideoTexH = 0;
+    }
+    if (gVideoProgram) {
+        glDeleteProgram(gVideoProgram);
+        gVideoProgram = 0;
+    }
+    free(gRgbBuf);
+    gRgbBuf = NULL;
+    gRgbBufCap = 0;
+    free(gYuvScratch);
+    gYuvScratch = NULL;
+    gYuvScratchCap = 0;
+    if (gModuleLoaded) {
+        sceSysmoduleUnloadModule(SCE_SYSMODULE_AVPLAYER);
+        gModuleLoaded = false;
+    }
+}
+
+void video_play(const char *name) {
+    if (!gModuleLoaded) {
+        l_warn("video: AVPLAYER module not loaded, skipping cutscene request \"%s\"", name ? name : "(null)");
+        return;
+    }
+    if (!name) {
+        l_warn("video: video_play() called with a null name, skipping");
+        return;
+    }
+
+    // Try DATA_PATH root first: log_095 showed every other asset in this
+    // port (shaders.pak, *.savegame, data/...) staged flat under DATA_PATH,
+    // not under a "files/" subfolder -- that subfolder only exists on real
+    // Android's own app-private storage layout (getSDFolder() + name), which
+    // doesn't apply to how this port's own assets got laid out on the memory
+    // card. Still try "files/<name>" as a second candidate in case that
+    // subfolder does get used for this file specifically.
+    char path[512];
+    bool found = false;
+    SceIoStat st;
+
+    snprintf(path, sizeof(path), DATA_PATH "%s", name);
+    if (sceIoGetstat(path, &st) >= 0) {
+        found = true;
+    } else {
+        snprintf(path, sizeof(path), DATA_PATH "files/%s", name);
+        if (sceIoGetstat(path, &st) >= 0) {
+            found = true;
+        }
+    }
+
+    if (!found) {
+        l_error("video: file not found for \"%s\" (tried %s%s and %sfiles/%s)",
+                name, DATA_PATH, name, DATA_PATH, name);
+        return;
+    }
+
+    SceAvPlayerInitData init;
+    memset(&init, 0, sizeof(init));
+    init.memoryReplacement.allocate = av_alloc;
+    init.memoryReplacement.deallocate = av_free;
+    init.memoryReplacement.allocateTexture = av_alloc_texture;
+    init.memoryReplacement.deallocateTexture = av_free_texture;
+    init.fileReplacement.objectPointer = &gAvFileCtx;
+    init.fileReplacement.open = av_file_open;
+    init.fileReplacement.close = av_file_close;
+    init.fileReplacement.readOffset = av_file_read;
+    init.fileReplacement.size = av_file_size;
+    init.eventReplacement.objectPointer = NULL;
+    init.eventReplacement.eventCallback = av_event_cb;
+    init.basePriority = 0xA0;
+    init.numOutputVideoFrameBuffers = 2;
+    init.autoStart = SCE_TRUE;
+    init.debugLevel = 0;
+
+    SceAvPlayerHandle handle = sceAvPlayerInit(&init);
+    if ((unsigned)handle == 0 || (unsigned)handle == 0xFFFFFFFF || ((unsigned)handle & 0xFF000000) == 0x80000000) {
+        l_error("video: sceAvPlayerInit failed (0x%08X) for %s", (unsigned) handle, path);
+        return;
+    }
+
+    if (sceAvPlayerAddSource(handle, path) < 0) {
+        l_error("video: sceAvPlayerAddSource failed for %s", path);
+        sceAvPlayerClose(handle);
+        return;
+    }
+
+    l_success("video: playing %s", path);
+
+    int audioPort = -1;
+    int audioChannels = 0;
+    unsigned audioFrameLen = 0;
+    SceUID cutAudioThreadUid = -1;
+
+    SceCtrlData pad_start;
+    sceCtrlPeekBufferPositive(0, &pad_start, 1);
+    uint32_t old_pad_buttons = pad_start.buttons;
+
+    bool skipped = false;
+
+    int wait_count = 0;
+    while (!sceAvPlayerIsActive(handle) && wait_count < 500) {
+        sceKernelDelayThread(10000); // 10ms
+        wait_count++;
+    }
+
+    l_info("video: loop starting. active=%d, wait_count=%d", sceAvPlayerIsActive(handle), wait_count);
+    uint64_t play_start_time = sceKernelGetProcessTimeWide();
+
+    int frame_count = 0;
+    int video_frames = 0, audio_frames = 0;
+    bool audioOpenAttempted = false;
+
+    if (!sceAvPlayerIsActive(handle)) {
+        l_warn("video: timed out waiting for video decoder to become active (%s)", path);
+    }
+
+    while (sceAvPlayerIsActive(handle)) {
+        SceCtrlData pad;
+        sceCtrlPeekBufferPositive(0, &pad, 1);
+        uint32_t pressed = pad.buttons & ~old_pad_buttons;
+
+        if (pressed & (SCE_CTRL_CROSS | SCE_CTRL_START)) {
+            l_info("video: skipped by user button press!");
+            skipped = true;
+            break;
+        }
+        old_pad_buttons = pad.buttons;
+
+        SceAvPlayerFrameInfo video;
+        if (sceAvPlayerGetVideoData(handle, &video)) {
+            unsigned w = video.details.video.width;
+            unsigned h = video.details.video.height;
+            if (++video_frames == 1)
+                l_info("video: first video frame decoded (%ux%u, pData=%p)", w, h, video.pData);
+            unsigned need = w * h * sizeof(unsigned short);
+            if (need > gRgbBufCap) {
+                free(gRgbBuf);
+                gRgbBuf = (unsigned short *) malloc(need);
+                gRgbBufCap = gRgbBuf ? need : 0;
+            }
+            unsigned yuvNeed = w * h + w * h / 2; // NV12: Y plane + half-res interleaved UV
+            if (yuvNeed > gYuvScratchCap) {
+                free(gYuvScratch);
+                gYuvScratch = (unsigned char *) malloc(yuvNeed);
+                gYuvScratchCap = gYuvScratch ? yuvNeed : 0;
+            }
+            if (gRgbBuf && gRgbBufCap >= need && gYuvScratch && gYuvScratchCap >= yuvNeed) {
+                // Drain the CDRAM/PHYCONT source with one sequential memcpy
+                // before the per-pixel conversion math (which reads it many
+                // times over) -- CPU reads from that memory are far slower
+                // than RAM on this hardware.
+                memcpy(gYuvScratch, video.pData, yuvNeed);
+                yuv420p_to_rgb565(gYuvScratch, w, h, gRgbBuf);
+                draw_video_frame(gRgbBuf, w, h);
+            }
+        }
+
+        SceAvPlayerFrameInfo audio;
+        if (sceAvPlayerGetAudioData(handle, &audio)) {
+            if (++audio_frames == 1)
+                l_info("video: first audio frame decoded (ch=%u rate=%u)",
+                       (unsigned) audio.details.audio.channelCount,
+                       (unsigned) audio.details.audio.sampleRate);
+            if (audioPort < 0 && !audioOpenAttempted) {
+                audioOpenAttempted = true;
+                audioChannels = audio.details.audio.channelCount;
+                SceAudioOutMode mode = (audioChannels >= 2) ? SCE_AUDIO_OUT_MODE_STEREO : SCE_AUDIO_OUT_MODE_MONO;
+                audioFrameLen = audio.details.audio.size / (audioChannels * sizeof(int16_t));
+                l_info("video: cutscene audio port: %u frames/channel (size=%u bytes, ch=%u)",
+                       audioFrameLen, (unsigned) audio.details.audio.size, audioChannels);
+                // VOICE, not MAIN: MAIN requires exactly 48000Hz; VOICE has
+                // no such restriction and is a distinct port type from
+                // whatever this project's own (not yet implemented) BGM/SFX
+                // mixer will use later, so it can't collide with it either.
+                audioPort = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_VOICE, audioFrameLen,
+                                                (int) audio.details.audio.sampleRate, mode);
+                if (audioPort < 0) {
+                    l_warn("video: sceAudioOutOpenPort for cutscene audio failed (0x%08X) -- cutscene audio disabled",
+                           (unsigned) audioPort);
+                } else {
+                    gCutAudioPort = audioPort;
+                    gCutAudioWriteSlot = 0;
+                    gCutAudioLen[0] = 0;
+                    gCutAudioLen[1] = 0;
+                    gCutAudioQuit = false;
+                    cutAudioThreadUid = sceKernelCreateThread("cutscene audio out", cutscene_audio_thread,
+                                                               0x10000100, 0x4000, 0, 0, NULL);
+                    if (cutAudioThreadUid >= 0) {
+                        sceKernelStartThread(cutAudioThreadUid, 0, NULL);
+                    } else {
+                        l_warn("video: cutscene audio thread creation failed (0x%08X) -- cutscene audio disabled",
+                               (unsigned) cutAudioThreadUid);
+                        sceAudioOutReleasePort(audioPort);
+                        audioPort = -1;
+                        gCutAudioPort = -1;
+                    }
+                }
+            }
+            if (audioPort >= 0) {
+                cutscene_audio_submit(audio.pData, (unsigned) audio.details.audio.size);
+            }
+        }
+
+        frame_count++;
+        if (frame_count == 1) {
+            l_info("video: successfully completed first loop iteration!");
+        }
+
+        sceKernelDelayThread(1000); // avoid a tight spin when neither frame type is ready yet
+    }
+
+    uint64_t play_end_time = sceKernelGetProcessTimeWide();
+    double elapsed_sec = (double) (play_end_time - play_start_time) / 1000000.0;
+    double avg_fps = elapsed_sec > 0.0 ? (double) video_frames / elapsed_sec : 0.0;
+    l_info("video: loop exited! active=%d, iterations=%d, video_frames=%d, audio_frames=%d, elapsed=%.2fs, avg_fps=%.1f",
+           sceAvPlayerIsActive(handle), frame_count, video_frames, audio_frames, elapsed_sec, avg_fps);
+
+    if (cutAudioThreadUid >= 0) {
+        pthread_mutex_lock(&gCutAudioLock);
+        gCutAudioQuit = true;
+        pthread_mutex_unlock(&gCutAudioLock);
+        sceKernelWaitThreadEnd(cutAudioThreadUid, NULL, NULL);
+        sceKernelDeleteThread(cutAudioThreadUid);
+    }
+    gCutAudioPort = -1;
+
+    if (audioPort >= 0)
+        sceAudioOutReleasePort(audioPort);
+
+    sceAvPlayerStop(handle);
+    sceAvPlayerClose(handle);
+
+    l_success("video: %s (%s)", skipped ? "skipped" : "finished", path);
+}

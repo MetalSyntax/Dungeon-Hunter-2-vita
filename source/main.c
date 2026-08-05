@@ -20,6 +20,7 @@
 #include "utils/glutil.h"
 #include "utils/logger.h"
 #include "utils/dialog.h"
+#include "video.h"
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -35,6 +36,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include "utils/dialog.h"
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -117,6 +119,26 @@ static int (* nativeCanInterrupt)(JNIEnv *env, jobject clazz);
 #define AKEYCODE_DPAD_CENTER  23
 #define AKEYCODE_MENU         82
 
+// RULED OUT, do not re-attempt without new evidence: standard Android
+// gamepad KeyEvent codes (BUTTON_A/X/Y/L1/R1) sent via nativeKeyDown/Up,
+// modeled after the sibling Prince-of-Persia port where this genuinely works
+// for its cocos2d-x build. Traced DH2's own nativeKeyDown all the way
+// through in out_ghidra.c: Java_..._DungeonHunter2_nativeKeyDown ->
+// appKeyPressed(void) -- and appKeyPressed is a complete no-op stub in this
+// compiled .so (just `_DEBUG_OUT("keypresseddddddddddddddddddddddddd %d",
+// lastOpenMenuID); return;`, doesn't even reference its keycode argument).
+// This means NO keycode -- D-Pad, BACK, MENU, or any BUTTON_* value -- can
+// ever drive gameplay through this entry point, regardless of which int we
+// send. The D-Pad/menu keycodes in btn_map above are kept only because they
+// still reach real menu-navigation code through a DIFFERENT native function
+// (nativegetState, called directly for MENU/BACK -- see
+// DungeonHunter2.onKeyUp in the decompiled Java), not through appKeyPressed.
+// The only real gameplay input path in this engine is appOnTouch (fully
+// implemented, dispatches to real vtable methods) -- i.e. nativeOnTouch,
+// which action_btn_map below already uses. If Cross/Square still do nothing
+// through touch, the bug is in the touch coordinates/protocol, not in
+// choosing touch over keycodes.
+
 // Best-effort physical button mapping (Phase 6 TODO in PORTING_PLAN.md: this
 // engine's action-button semantics -- attack/skill/inventory -- are not yet
 // confirmed from the UI Java classes, only the D-pad/back/menu keycodes
@@ -131,6 +153,87 @@ static const struct { unsigned int btn; int keycode; } btn_map[] = {
     { SCE_CTRL_START,    AKEYCODE_MENU },
 };
 #define BTN_MAP_COUNT (sizeof(btn_map) / sizeof(btn_map[0]))
+
+// DH2's actual combat actions (attack/dodge/block + equipped skills) are
+// 100% touch-driven HUD buttons drawn by dqhud.swf -- confirmed via
+// GameGLSurfaceView.java, which forwards raw MotionEvent coordinates
+// straight into nativeOnTouch with no scaling and no engine-side gamepad
+// path reachable on this Android build (InputManager::GetFirstConnectedGamepad()
+// is real native code, but nothing in the decompiled Java ever registers a
+// gamepad -- no MOGA/InputDevice/KEYCODE_BUTTON_* anywhere -- so it always
+// returns null here; not worth hooking). So physical buttons are wired as
+// synthetic taps at each HUD button's on-screen coordinate instead of a
+// key-code path.
+//
+// Coordinates below are measured directly off a real Vita screenshot
+// (2026-07-23-225855.jpg, our actual 960x544 output, letterboxed bars and
+// all) by cropping each icon and computing its center -- NOT estimated from
+// the earlier iPhone reference anymore, so these should be exact for
+// whatever we're currently rendering.
+//
+// That real capture only shows THREE distinct combat-style buttons (the
+// plain red sphere bottom-left, a sword+flame icon, and a bigger sword+
+// helmet icon in the bottom-right cluster) -- no second/third skill icon
+// like the iPhone reference had. Most likely this savegame just hasn't
+// unlocked/equipped any active skills yet, so those slots aren't drawn.
+// L1/R1 below are wired to the two other real icons on screen (the gold
+// rune-wheel and the health-potion quick-use) as a stopgap so the buttons
+// aren't left idle -- neither is confirmed to be a "power" slot. Re-screenshot
+// once skills are equipped so L1/R1 can be pointed at the real skill icons.
+//
+// Each button gets its own fixed pointer_id (1-5, real touch panel uses 0)
+// so a physical-button tap never collides with a real finger on the touch
+// panel or with another physical button held at the same time.
+static const struct { unsigned int btn; int x; int y; long long pointer_id; const char *name; } action_btn_map[] = {
+    { SCE_CTRL_CROSS,    180, 445, 1, "plain red sphere, bottom-left (likely: primary attack)" },
+    { SCE_CTRL_SQUARE,   683, 373, 2, "sword+flame icon (likely: block/heavy attack)" },
+    { SCE_CTRL_TRIANGLE, 760, 453, 3, "sword+helmet icon, bottom-right corner, biggest (likely: dodge/special)" },
+    { SCE_CTRL_L1,       810, 273, 4, "gold rune-wheel icon, mid-right (UNCONFIRMED -- not clearly a skill slot)" },
+    { SCE_CTRL_R1,       820,  50, 5, "health potion quick-use icon, top-right (stopgap, not a combat 'power')" },
+};
+#define ACTION_BTN_MAP_COUNT (sizeof(action_btn_map) / sizeof(action_btn_map[0]))
+
+// Force English regardless of whatever language got persisted into
+// dh2_settings.savegame on an earlier run (this build's copy of that file
+// on the test device was stuck loading the ".german"-suffixed text pack
+// rather than English, even though our own Get_PhoneLanguage stub already
+// correctly returns 0/English -- see java.c -- because the engine only
+// re-derives language from Get_PhoneLanguage on a genuinely fresh/first-ever
+// settings file, not on every boot). Confirmed via real exported symbols
+// (not Ghidra placeholders): every SavegameManager::setLanguage call site in
+// the real .so operates on the SavegameManager* stored at byte offset 76
+// inside the Singleton<Application> instance (a real global object, not a
+// pointer-to-pointer):
+//   Singleton<Application>::s_inst -- _ZN9SingletonI11ApplicationE6s_instE
+//   SavegameManager::setLanguage(int) -- _ZN15SavegameManager11setLanguageEi
+// Applied every frame for a short window after boot (rather than once at a
+// guessed frame number) because GSInit's own settings-load and
+// StringManager::switchPack steps are both driven by its internal multi-frame
+// step machine -- calling this after every nativeRender() for the first
+// LANGUAGE_FORCE_FRAMES frames guarantees our override always lands after
+// whatever GSInit did that frame, regardless of exactly which frame each
+// step happens to run on.
+static void *app_singleton_inst;
+static void (* SavegameManager_setLanguage)(void *this_, int lang);
+#define LANGUAGE_FORCE_FRAMES 180
+#define LANGUAGE_ENGLISH 0
+
+// RULED OUT, reverted (see the appKeyPressed finding below in
+// action_btn_map's comment area): forcing DH2's "DPad" saved option (via
+// SavegameManager::setOption, same mechanism as setLanguage above) once
+// looked like a legitimate way to get digital movement through the engine's
+// own control path -- Application::IsUsingDPad()'s readback DID confirm the
+// write took (log_077: "readback after forcing DPad=1: 1"), but D-Pad
+// movement still never worked (log_083), and tracing WHY revealed
+// nativeKeyDown's real handler (appKeyPressed) is a no-op stub in this
+// compiled .so -- no keycode can ever drive movement here, D-Pad or
+// otherwise. Worse, forcing "DPad"=1 is actively counterproductive now:
+// Character::Ctrl_Click (out_ghidra.c) skips its click-to-move/auto-target
+// object-iteration loop specifically WHEN IsUsingDPad() is true, on the
+// assumption that a real D-Pad is handling movement instead -- since ours
+// never can, forcing this option risked disabling whatever touch-based
+// movement/targeting DOES work, for zero benefit. Kept only as a comment so
+// a future session doesn't reintroduce it without the appKeyPressed context.
 
 static void *so_sym_or_warn(const char *name) {
     void *addr = (void *) so_symbol(&so_mod, name);
@@ -171,6 +274,8 @@ int main() {
     nativePause            = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativePause");
     nativeResume           = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeResume");
     nativeCanInterrupt     = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeCanInterrupt");
+    app_singleton_inst     = so_sym_or_warn("_ZN9SingletonI11ApplicationE6s_instE");
+    SavegameManager_setLanguage = so_sym_or_warn("_ZN15SavegameManager11setLanguageEi");
 
     int (* JNI_OnLoad)(void *jvm) = (void *) so_symbol(&so_mod, "JNI_OnLoad");
     if (!JNI_OnLoad) {
@@ -216,6 +321,8 @@ int main() {
 
     gl_init();
     l_success("PVR_PSP2 initialized.");
+
+    video_init();
 
     // Real Android sequence (DungeonHunter2.onCreate): nativeSetPhone is
     // called with the ACTUAL screen pixel dimensions before the
@@ -285,18 +392,57 @@ int main() {
             if (released & btn_map[i].btn) pending_key_up = btn_map[i].keycode;
         }
 
-        // Touch panel is 1920x1088 (2x the 960x544 native resolution) --
-        // scale down to match the SCREEN_W/H space nativeSetPhone was told about.
-        if (touch.reportNum > 0) {
-            int x = touch.report[0].x * SCREEN_W / 1920;
-            int y = touch.report[0].y * SCREEN_H / 1088;
-            if (!last_touch) {
-                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, x, y, 0, 0, 0);
-                last_touch = 1;
-            } else if (x != last_tx || y != last_ty) {
-                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 2, x, y, 0, 0, 0);
+        // Combat action buttons: synthesize a touch-down at the mapped HUD
+        // button's coordinate on press, touch-up on release -- mirrors a
+        // real finger holding that button (matters for anything that reacts
+        // to hold-vs-tap). See action_btn_map's comment for the coordinate
+        // caveats.
+        for (int i = 0; i < ACTION_BTN_MAP_COUNT; i++) {
+            // action_btn_map's coordinates are measured off a real physical-
+            // screen screenshot, but nativeOnTouch hit-tests against the
+            // engine's logical 960x640 canvas -- convert through the same
+            // letterbox inverse as real touches (see glutil_screen_touch_to_logical).
+            int lx, ly;
+            if (!glutil_screen_touch_to_logical(action_btn_map[i].x, action_btn_map[i].y, &lx, &ly)) {
+                lx = action_btn_map[i].x; ly = action_btn_map[i].y;
             }
-            last_tx = x; last_ty = y;
+            if (pressed & action_btn_map[i].btn) {
+                l_debug("action_btn: synthetic touch DOWN (%d,%d)->(%d,%d) ptr=%lld [%s]",
+                        action_btn_map[i].x, action_btn_map[i].y, lx, ly, action_btn_map[i].pointer_id, action_btn_map[i].name);
+                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, lx, ly,
+                                                  action_btn_map[i].pointer_id, 0, 0);
+            }
+            if (released & action_btn_map[i].btn) {
+                l_debug("action_btn: synthetic touch UP (%d,%d)->(%d,%d) ptr=%lld [%s]",
+                        action_btn_map[i].x, action_btn_map[i].y, lx, ly, action_btn_map[i].pointer_id, action_btn_map[i].name);
+                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, lx, ly,
+                                                  action_btn_map[i].pointer_id, 0, 0);
+            }
+        }
+
+        // Touch panel is 1920x1088 (2x the 960x544 native resolution) --
+        // scale down to physical-screen space, then invert the letterbox
+        // (glutil_screen_touch_to_logical) to land in the engine's logical
+        // 960x640 space that nativeOnTouch hit-tests against -- without this,
+        // on-screen buttons only registered when tapped off-position (below
+        // and to the right of where they're actually drawn).
+        if (touch.reportNum > 0) {
+            int phys_x = touch.report[0].x * SCREEN_W / 1920;
+            int phys_y = touch.report[0].y * SCREEN_H / 1088;
+            int x, y;
+            if (glutil_screen_touch_to_logical(phys_x, phys_y, &x, &y)) {
+                if (!last_touch) {
+                    if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, x, y, 0, 0, 0);
+                    last_touch = 1;
+                } else if (x != last_tx || y != last_ty) {
+                    if (nativeOnTouch) nativeOnTouch(&jni, NULL, 2, x, y, 0, 0, 0);
+                }
+                last_tx = x; last_ty = y;
+            } else if (last_touch) {
+                // Finger slid into the pillarbox bars -- treat as a release.
+                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, last_tx, last_ty, 0, 0, 0);
+                last_touch = 0;
+            }
         } else if (last_touch) {
             if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, last_tx, last_ty, 0, 0, 0);
             last_touch = 0;
@@ -306,6 +452,22 @@ int main() {
         if (pending_key_up != -1 && nativeKeyUp) { nativeKeyUp(&jni, NULL, pending_key_up); pending_key_up = -1; }
 
         if (nativeRender) nativeRender(&jni, NULL);
+
+        // Force English for the first LANGUAGE_FORCE_FRAMES frames -- see the
+        // declarations above for why this can't just be done once at a fixed
+        // frame number. Cheap (one function call) and self-limiting.
+        {
+            static int lang_force_frame = 0;
+            if (lang_force_frame < LANGUAGE_FORCE_FRAMES) {
+                lang_force_frame++;
+                if (app_singleton_inst && SavegameManager_setLanguage) {
+                    void *sgm = *(void **)((char *) app_singleton_inst + 76);
+                    if (sgm) {
+                        SavegameManager_setLanguage(sgm, LANGUAGE_ENGLISH);
+                    }
+                }
+            }
+        }
 
         // Diagnostic: the game reaches its main loop and runs its update/menu
         // logic, but nothing draws (black screen). Log any accumulated GL error
@@ -321,6 +483,31 @@ int main() {
                 } else {
                     l_info("[gl_diag] frame %d: GL pipeline clean (no error)", diag_frame);
                 }
+                gl_log_render_diag(diag_frame);
+            }
+        }
+
+        // Always-on FPS counter (l_error, never compiled out by DEBUG_SOLOADER)
+        // so real frame-rate numbers are visible in both Debug and Release
+        // logs -- needed as an actual measurement to drive the performance
+        // work, instead of an eyeballed "~12 FPS".
+        {
+            static SceRtcTick fps_last_tick;
+            static int fps_frame_count = 0;
+            static int fps_initialized = 0;
+            SceRtcTick now;
+            sceRtcGetCurrentTick(&now);
+            if (!fps_initialized) {
+                fps_last_tick = now;
+                fps_initialized = 1;
+            }
+            fps_frame_count++;
+            uint64_t elapsed_us = now.tick - fps_last_tick.tick;
+            if (elapsed_us >= 3000000) {
+                float fps = (float) fps_frame_count * 1000000.0f / (float) elapsed_us;
+                l_error("[fps] %.1f frames/sec (%d frames in %.2fs)", fps, fps_frame_count, (double) elapsed_us / 1000000.0);
+                fps_frame_count = 0;
+                fps_last_tick = now;
             }
         }
 

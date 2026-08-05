@@ -47,13 +47,16 @@
 
 #include <falso_jni/FalsoJNI_Impl.h>
 #include <falso_jni/FalsoJNI.h>
+#include <so_util/so_util.h>
 
 #include "utils/logger.h"
+#include "video.h"
 
 #include <psp2/kernel/processmgr.h>
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
@@ -226,9 +229,29 @@ void GLMediaPlayer_initSoundPoolArray(jmethodID id, va_list args) { (void) args;
 jint GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
     const char *name = (const char *) va_arg(args, jstring);
     (void) va_arg(args, jint);
-    l_warn("[Java] GLMediaPlayer.loadMovie(%s): movies not implemented yet, returning 0 to force skip",
-           name ? name : "(null)");
-    return 0; // 0 = failure, forces the game to skip the video directly rather than waiting
+    l_info("[Java] GLMediaPlayer.loadMovie(%s): playing via SceAvPlayer", name ? name : "(null)");
+
+    // Real Android backgrounds the app into a separate video Activity
+    // (MyVideoView) and its onResume() is what sets the engine's own
+    // "videoDone" flag to 1 once that Activity finishes -- GSInit::Update
+    // polls that same flag every frame while "waiting for the intro movie"
+    // and never advances past it otherwise. video_play() is synchronous
+    // (blocks until the video ends, is skipped, or fails to open/init) and
+    // always returns, so poking the flag right after it -- regardless of
+    // outcome -- reproduces that same never-hangs contract.
+    if (name) {
+        video_play(name);
+    }
+
+    extern so_module so_mod;
+    uint8_t *videoDone = (uint8_t *) so_symbol(&so_mod, "videoDone");
+    if (videoDone) {
+        *videoDone = 1;
+    } else {
+        l_warn("[Java] GLMediaPlayer.loadMovie: 'videoDone' symbol not found, GSInit may hang");
+    }
+
+    return name ? 1 : 0;
 }
 
 jint GLMediaPlayer_getWidth(jmethodID id, va_list args) {

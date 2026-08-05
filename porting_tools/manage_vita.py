@@ -8,7 +8,13 @@ from ftplib import FTP, all_errors
 
 VITA_IP = "192.168.3.15"
 VITA_PORT = 1337
-LOCAL_VPK_PATH = "build/dungeon_hunter_2.vpk"
+# Carpeta donde build.sh/build_and_install.sh dejan los .vpk generados. A
+# diferencia de un LOCAL_VPK_PATH fijo a un solo archivo, esto se recorre
+# dinamicamente (ver list_local_vpks()) para soportar cualquier cantidad de
+# variantes de build (dungeon_hunter_2.vpk, dungeon_hunter_2_gpu_quads_test.vpk, etc.) sin
+# tener que hardcodear cada nombre -- generico para cualquier proyecto que
+# genere sus VPKs bajo esta carpeta, no solo Dungeon Hunter 2.
+BUILD_DIR = "build"
 VITA_DOWNLOADS_DIR = "/ux0:/downloads"
 VITA_DATA_DIR = "/ux0:/data"
 VITA_LOGS_DIR = "/ux0:/data/dungeon-hunter-2/logs"
@@ -16,10 +22,20 @@ VITA_CG_DIR = "ux0:/data/dungeon-hunter-2/cg"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def print_banner():
-    print("====================================================")
-    print("         PS VITA DEPLOYMENT & DEBUG TOOL            ")
-    print("                (Dungeon Hunter 2)                  ")
-    print("====================================================")
+    pass
+
+def getch():
+    import sys, tty, termios
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            ch += sys.stdin.read(2)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
 
 def disconnect_proton_vpn():
     print("[*] Intentando desconectar Proton VPN...")
@@ -97,9 +113,60 @@ def create_directory_if_not_exists(ftp, path):
         except all_errors as e:
             print(f"[-] No se pudo crear el directorio '{path}': {e}")
 
+def list_local_vpks():
+    """Todos los .vpk en BUILD_DIR/, mas reciente primero -- detecta
+    automaticamente cualquier variante de build (build.sh genera un nombre
+    de VPK distinto por flag, ver build.sh --help en la cabecera del
+    archivo) sin que este script tenga que conocer sus nombres de antemano."""
+    project_root = os.path.dirname(BASE_DIR)
+    build_dir = os.path.join(project_root, BUILD_DIR)
+    if not os.path.isdir(build_dir):
+        return []
+    vpks = [
+        os.path.join(build_dir, f) for f in os.listdir(build_dir)
+        if f.endswith(".vpk") and not f.startswith("._")
+    ]
+    vpks.sort(key=os.path.getmtime, reverse=True)
+    return vpks
+
+
+def choose_vpk():
+    """Si hay un solo VPK lo usa directo; si hay varios, muestra un menu
+    (tamano + fecha de modificacion para distinguir variantes de un vistazo)
+    y deja elegir -- Enter usa el mas reciente."""
+    vpks = list_local_vpks()
+    if not vpks:
+        print(f"[-] No se encontró ningún .vpk en '{BUILD_DIR}/'. Compilá el proyecto primero "
+              f"(build.sh o build_and_install.sh, opción 5 de este menú).")
+        return None
+
+    if len(vpks) == 1:
+        print(f"[*] Un solo VPK encontrado: {os.path.basename(vpks[0])}")
+        return vpks[0]
+
+    print(f"[*] Se encontraron {len(vpks)} VPKs en '{BUILD_DIR}/' (más reciente primero):")
+    for i, path in enumerate(vpks, 1):
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+        print(f"  {i}. {os.path.basename(path):<40} {size_mb:6.2f} MB   {mtime}")
+    print()
+
+    choice = input(f"Elegí el VPK a subir [1-{len(vpks)}] (Enter = el más reciente): ").strip()
+    if not choice:
+        return vpks[0]
+    try:
+        idx = int(choice)
+        if 1 <= idx <= len(vpks):
+            return vpks[idx - 1]
+    except ValueError:
+        pass
+    print("[-] Opción inválida.")
+    return None
+
+
 def upload_vpk():
-    if not os.path.exists(LOCAL_VPK_PATH):
-        print(f"[-] Error: No se encontró el archivo VPK local en '{LOCAL_VPK_PATH}'.")
+    local_vpk_path = choose_vpk()
+    if not local_vpk_path:
         return
 
     disconnect_proton_vpn()
@@ -109,17 +176,99 @@ def upload_vpk():
 
     try:
         create_directory_if_not_exists(ftp, VITA_DOWNLOADS_DIR)
-        filename = os.path.basename(LOCAL_VPK_PATH)
+        filename = os.path.basename(local_vpk_path)
         dest_file_path = f"{VITA_DOWNLOADS_DIR}/{filename}"
 
-        print(f"[*] Subiendo {LOCAL_VPK_PATH} a {dest_file_path}...")
-        
-        with open(LOCAL_VPK_PATH, "rb") as f:
+        print(f"[*] Subiendo {local_vpk_path} a {dest_file_path}...")
+
+        with open(local_vpk_path, "rb") as f:
             ftp.storbinary(f"STOR {dest_file_path}", f)
-            
+
         print(f"[+] Transferencia exitosa! Instala el VPK en tu Vita desde '{VITA_DOWNLOADS_DIR.replace('/ux0:', 'ux0:')}/{filename}'")
     except all_errors as e:
         print(f"[-] Falló la transferencia del VPK: {e}")
+    finally:
+        try:
+            ftp.quit()
+        except:
+            pass
+
+def list_local_ebootbins():
+    """Todos los eboot*.bin en BUILD_DIR/ (mas reciente primero) -- build.sh
+    genera un eboot_<variante>.bin por cada flag de perf/diagnostico ademas
+    del eboot.bin generico del build normal (ver build.sh), asi que puede
+    haber varios a la vez sin que ninguno pise a otro."""
+    project_root = os.path.dirname(BASE_DIR)
+    build_dir = os.path.join(project_root, BUILD_DIR)
+    if not os.path.isdir(build_dir):
+        return []
+    ebootbins = [
+        os.path.join(build_dir, f) for f in os.listdir(build_dir)
+        if f.endswith(".bin") and f.startswith("eboot") and not f.startswith("._")
+    ]
+    ebootbins.sort(key=os.path.getmtime, reverse=True)
+    return ebootbins
+
+
+def choose_eboot():
+    """Mismo patron que choose_vpk() -- si hay un solo eboot*.bin lo usa
+    directo, si hay varios (build normal + variantes de perf) deja elegir en
+    vez de asumir cual es el que se quiere subir."""
+    ebootbins = list_local_ebootbins()
+    if not ebootbins:
+        return None
+    if len(ebootbins) == 1:
+        print(f"[*] Un solo eboot.bin encontrado: {os.path.basename(ebootbins[0])}")
+        return ebootbins[0]
+
+    print(f"[*] Se encontraron {len(ebootbins)} eboot*.bin en '{BUILD_DIR}/' (más reciente primero):")
+    for i, path in enumerate(ebootbins, 1):
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+        print(f"  {i}. {os.path.basename(path):<40} {size_mb:6.2f} MB   {mtime}")
+    print()
+
+    choice = input(f"Elegí el eboot.bin a subir [1-{len(ebootbins)}] (Enter = el más reciente): ").strip()
+    if not choice:
+        return ebootbins[0]
+    try:
+        idx = int(choice)
+        if 1 <= idx <= len(ebootbins):
+            return ebootbins[idx - 1]
+    except ValueError:
+        pass
+    print("[-] Opción inválida.")
+    return None
+
+
+def upload_eboot():
+    local_eboot_path = choose_eboot()
+
+    if not local_eboot_path:
+        project_root = os.path.dirname(BASE_DIR)
+        fallback_path = os.path.join(project_root, BUILD_DIR, "eboot.bin")
+        print(f"[-] No se encontró ningún eboot*.bin en '{BUILD_DIR}/' (ej. '{fallback_path}'). "
+              f"Asegúrate de haber compilado el proyecto.")
+        return
+
+    disconnect_proton_vpn()
+    ftp = connect_ftp()
+    if not ftp:
+        return
+
+    dest_dir = "/ux0:/app/PSVDH0002"
+    dest_file_path = f"{dest_dir}/eboot.bin"
+
+    try:
+        create_directory_if_not_exists(ftp, dest_dir)
+        print(f"[*] Subiendo {local_eboot_path} a {dest_file_path}...")
+        
+        with open(local_eboot_path, "rb") as f:
+            ftp.storbinary(f"STOR {dest_file_path}", f)
+            
+        print("[+] ¡eboot.bin subido exitosamente! Ya puedes iniciar el juego sin tener que reinstalar el VPK entero.")
+    except all_errors as e:
+        print(f"[-] Falló la transferencia del eboot.bin: {e}")
     finally:
         try:
             ftp.quit()
@@ -172,6 +321,13 @@ def download_latest_debug_files():
                 with open(local_dmp_name, "wb") as f:
                     ftp.retrbinary(f"RETR {latest_dmp}", f.write)
                 print(f"[+] Descargado '{latest_dmp}' en la carpeta logs/.")
+
+                print("[*] Ejecutando parse_dump.py sobre el dump descargado...")
+                try:
+                    parse_script = os.path.join(BASE_DIR, "parse_dump.py")
+                    subprocess.run([sys.executable, parse_script, local_dmp_name])
+                except Exception as e:
+                    print(f"[-] Error al iniciar parse_dump.py: {e}")
             else:
                 print("[-] No se encontraron archivos de crash dump en ux0:/data.")
         except all_errors as e:
@@ -464,7 +620,7 @@ def _ftp_shallow_count(ftp, path):
 
 def verify_data_assets():
     """Compara, carpeta por carpeta, cuántas entradas de primer nivel hay en
-    el volcado local de referencia (com.gameloft.android.GAND.GloftD2SS/files/data/)
+    el volcado local de referencia (com.gameloft.android.GAND.GloftD2SS/files/data)
     contra lo que realmente está subido en ux0:data/dungeon-hunter-2/data/ en
     la Vita. Es un chequeo SUPERFICIAL (no recursivo) a propósito: contar
     recursivamente todo adentro de carpetas con miles de subcarpetas (3d/)
@@ -541,65 +697,71 @@ def run_script(folder, script_name, is_python=False):
         print(f"[-] Error: No se encontró el script en '{script_path}'.")
 
 def main():
+    options = [
+        ("Subir VPK compilado a la PS Vita (ux0:downloads/)", upload_vpk),
+        ("Subir SOLO el eboot.bin a la PS Vita (ux0:app/PSVDH0002/)", upload_eboot),
+        ("Descargar el último dump (.dmp) y log (.txt) de Dungeon Hunter 2", download_latest_debug_files),
+        ("Desconectar Proton VPN ahora mismo", disconnect_proton_vpn),
+        ("Ejecutar clean_macos.sh (build/)", lambda: run_script("build", "clean_macos.sh")),
+        ("Ejecutar build_and_install.sh (build/)", lambda: run_script("build", "build_and_install.sh")),
+        ("Ejecutar deploy_and_launch_vita3k.sh (build/)", lambda: run_script("build", "deploy_and_launch_vita3k.sh")),
+        ("Ejecutar decompile_all.sh (build/)", lambda: run_script("build", "decompile_all.sh")),
+        ("Ejecutar run_tests.sh (tests/)", lambda: run_script("tests", "run_tests.sh")),
+        ("Ejecutar get_dump.sh (misc/)", lambda: run_script("misc", "get_dump.sh")),
+        ("Descargar Shaders GLSL dumpeados", download_glsl_shaders),
+        ("Subir Shaders CG traducidos (assets/cg/ -> Vita)", upload_cg_shaders),
+        ("Sincronizar Shaders (descargar GLSL + subir CG)", sync_shaders),
+        ("Chequear libshacccg.suprx (tamano/existencia por FTP)", check_libshacccg),
+        ("Verificar data/ completa (conteo de archivos local vs Vita)", verify_data_assets),
+        ("Salir", None)
+    ]
+    
+    current_idx = 0
     while True:
-        print_banner()
-        print("1. Subir VPK compilado a la PS Vita (ux0:downloads/)")
-        print("2. Descargar el último dump (.dmp) y log (.txt) de Dungeon Hunter 2")
-        print("3. Desconectar Proton VPN ahora mismo")
-        print("4. Ejecutar clean_macos.sh (build/)")
-        print("5. Ejecutar build_and_install.sh (build/)")
-        print("6. Ejecutar deploy_and_launch_vita3k.sh (build/)")
-        print("7. Ejecutar decompile_all.sh (build/)")
-        print("8. Ejecutar run_tests.sh (tests/)")
-        print("9. Ejecutar get_dump.sh (misc/)")
-        print("10. Descargar Shaders GLSL dumpeados")
-        print("11. Subir Shaders CG traducidos (assets/cg/ -> Vita)")
-        print("12. Sincronizar Shaders (descargar GLSL + subir CG, todo en uno)")
-        print("13. Chequear libshacccg.suprx (tamano/existencia por FTP)")
-        print("14. Verificar data/ completa (conteo de archivos local vs Vita)")
-        print("15. Salir")
-        print("====================================================")
-        try:
-            opcion = input("Elige una opción (1-15): ").strip()
-            print()
-            if opcion == "1":
-                upload_vpk()
-            elif opcion == "2":
-                download_latest_debug_files()
-            elif opcion == "3":
-                disconnect_proton_vpn()
-            elif opcion == "4":
-                run_script("build", "clean_macos.sh")
-            elif opcion == "5":
-                run_script("build", "build_and_install.sh")
-            elif opcion == "6":
-                run_script("build", "deploy_and_launch_vita3k.sh")
-            elif opcion == "7":
-                run_script("build", "decompile_all.sh")
-            elif opcion == "8":
-                run_script("tests", "run_tests.sh")
-            elif opcion == "9":
-                run_script("misc", "get_dump.sh")
-            elif opcion == "10":
-                download_glsl_shaders()
-            elif opcion == "11":
-                upload_cg_shaders()
-            elif opcion == "12":
-                sync_shaders()
-            elif opcion == "13":
-                check_libshacccg()
-            elif opcion == "14":
-                verify_data_assets()
-            elif opcion == "15":
-                print("¡Hasta luego!")
-                break
+        # Limpiar la pantalla
+        print("\033[H\033[J", end="")
+        print("\033[96m====================================================\033[0m")
+        print("\033[92m         PS VITA DEPLOYMENT & DEBUG TOOL            \033[0m")
+        print("\033[93m                  (Dungeon Hunter 2)                \033[0m")
+        print("\033[96m====================================================\033[0m")
+        print("\033[90mUsa las flechas \033[97m↑/↓\033[90m para moverte y \033[97mENTER\033[90m para elegir.\033[0m\n")
+        
+        for i, (text, func) in enumerate(options):
+            prefix = f"{i+1:2d}. "
+            if i == current_idx:
+                print(f"\033[44;97m> {prefix}{text}\033[0m")
             else:
-                print("[-] Opción no válida. Inténtalo de nuevo.")
-        except KeyboardInterrupt:
-            print("\n¡Hasta luego!")
+                print(f"  {prefix}{text}")
+                
+        print("\033[96m====================================================\033[0m")
+        
+        c = getch()
+        if c == '\x1b[A': # up arrow
+            current_idx = (current_idx - 1) % len(options)
+        elif c == '\x1b[B': # down arrow
+            current_idx = (current_idx + 1) % len(options)
+        elif c in ('\r', '\n'): # enter
+            print("\033[H\033[J", end="")
+            print(f"\033[92m[*] Ejecutando: {options[current_idx][0]}\033[0m\n")
+            if options[current_idx][1] is None:
+                print("\033[93m¡Hasta luego!\033[0m")
+                break
+            
+            try:
+                options[current_idx][1]()
+            except Exception as e:
+                print(f"\033[91m[-] Error inesperado en la ejecución: {e}\033[0m")
+                
+            print("\n\033[90m[ \033[97mPresiona ENTER para volver al menú principal...\033[90m ]\033[0m")
+            input()
+        elif c == '\x03': # Ctrl+C
+            print("\n\033[93m¡Hasta luego!\033[0m")
             break
-        print("\nPresiona ENTER para volver al menú principal...")
-        input()
+        elif c.isdigit():
+            # Si presiona un número del 1 al 9, saltar directamente a esa opción
+            val = int(c)
+            if 1 <= val <= min(9, len(options)):
+                current_idx = val - 1
 
 if __name__ == "__main__":
     main()

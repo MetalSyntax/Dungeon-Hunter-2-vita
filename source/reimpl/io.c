@@ -31,6 +31,17 @@
 #include "reimpl/bits/_struct_converters.c"
 
 FILE * fopen_soloader(const char * filename, const char * mode) {
+    // The engine's own on-demand asset streaming (glitch::collada::COnDemandReader,
+    // used for .bdae model/character data) sometimes re-resolves an already-absolute
+    // path through its own "prepend base data path" logic a second time, producing
+    // DATA_PATH DATA_PATH <relative path...> (confirmed via crash triage on a real
+    // hardware dump: PC landed in COnDemandReader::read() dereferencing a NULL
+    // stream member -- the doubled path's fopen() had failed). Collapse the
+    // duplicate prefix instead of letting that second, broken open silently fail.
+    if (strncmp(filename, DATA_PATH DATA_PATH, strlen(DATA_PATH DATA_PATH)) == 0) {
+        return fopen_soloader(filename + strlen(DATA_PATH), mode);
+    }
+
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
         return fopen_soloader("app0:/cpuinfo", mode);
     } else if (strcmp(filename, "/proc/meminfo") == 0) {
@@ -49,6 +60,62 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 #else
     FILE* ret = fopen(filename, mode);
 #endif
+
+    if (!ret) {
+        // Dungeon environment alpha masks (data/3d/textures/env_<theme>_alpha.tga)
+        // are shipped on disk under a "pvr2_" prefix for most level themes (e.g.
+        // pvr2_env_swamp_alpha.tga -- confirmed by inspecting the real extracted
+        // app-data dump: no plain env_swamp_alpha.tga exists anywhere, only the
+        // pvr2_-prefixed one) while the engine always requests the plain name.
+        // Not every theme follows this (env_darkwoods_alpha.tga exists under
+        // BOTH names), so only redirect after the plain name genuinely fails.
+        const char *slash = strrchr(filename, '/');
+        const char *base = slash ? slash + 1 : filename;
+        size_t base_len = strlen(base);
+        static const char alpha_suffix[] = "_alpha.tga";
+        if (strncmp(base, "env_", 4) == 0 && base_len > sizeof(alpha_suffix) - 1 &&
+            strcmp(base + base_len - (sizeof(alpha_suffix) - 1), alpha_suffix) == 0) {
+            char redirected[512];
+            snprintf(redirected, sizeof(redirected), "%.*spvr2_%s",
+                     (int) (base - filename), filename, base);
+            ret = fopen_soloader(redirected, mode);
+            if (ret) return ret;
+        }
+
+        // A handful of character textures referenced by the swamp-intro cutscene NPC
+        // (cs_swamp_intro_prisonner_scene01.bdae) and the Faerie companion
+        // (faeries_template_anim.bdae) are missing from every real app-data dump we have
+        // access to (two independent Android installs checked, neither has them, and
+        // neither has the "qata" directory the engine's own on-demand reader falls back
+        // to on failure -- confirmed that fallback is genuine, unmodified engine
+        // behavior, not something this port introduced). These are cosmetic-only:
+        // a one-time intro cutscene and a companion model, not core gameplay. Since the
+        // real Gameloft art for these specific files is unobtainable from any source we
+        // have, redirect to the closest real, already-legitimate in-game texture instead
+        // of leaving the model with no texture at all (flat aquamarine).
+        if (strcmp(base, "tex_prince.tga") == 0 ||
+            strcmp(base, "tex_princehair.tga") == 0 ||
+            strcmp(base, "tex_prince_pants.tga") == 0 ||
+            strcmp(base, "tex_plate_shoulder_default_000.tga") == 0) {
+            char redirected[512];
+            snprintf(redirected, sizeof(redirected), "%.*sprince-warrior.tga",
+                     (int) (base - filename), filename);
+            ret = fopen_soloader(redirected, mode);
+            if (ret) return ret;
+        } else if (strcmp(base, "char_faerie.tga") == 0) {
+            char redirected[512];
+            snprintf(redirected, sizeof(redirected), "%.*sfx_sparkles_01.tga",
+                     (int) (base - filename), filename);
+            ret = fopen_soloader(redirected, mode);
+            if (ret) return ret;
+        } else if (strcmp(base, "fx_spark.tga") == 0) {
+            char redirected[512];
+            snprintf(redirected, sizeof(redirected), "%.*sfx_spark_01.tga",
+                     (int) (base - filename), filename);
+            ret = fopen_soloader(redirected, mode);
+            if (ret) return ret;
+        }
+    }
 
     if (ret)
         l_debug("fopen(%s, %s): %p", filename, mode, ret);

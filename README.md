@@ -1,3 +1,5 @@
+<p align="center"><img src="DH2LOGO.jpeg" alt="Dungeon Hunter 2"></p>
+
 # Dungeon Hunter 2 — PS Vita Port
 
 A native port of Gameloft's **Dungeon Hunter 2** (Android) to the PlayStation Vita, built on

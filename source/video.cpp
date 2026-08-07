@@ -359,11 +359,39 @@ static void yuv420p_to_rgb565(const unsigned char *src, unsigned w, unsigned h, 
 // proven against the real on-device GLSL ES compiler by this project's own
 // shaders), just with a video-appropriate quad recomputed per (w,h). ---
 
+// Perf fix (log_106/107/108.txt): yuv420p_to_rgb565's CPU NEON conversion
+// measured at 228ms/frame for a 1280x720 cutscene (84% of total elapsed
+// time) -- confirmed NOT a Debug-vs-Release artifact (CMakeLists.txt applies
+// -O3 unconditionally to both build types; CMAKE_BUILD_TYPE only toggles the
+// DEBUG_SOLOADER log macro), so the CPU conversion itself is the genuine
+// bottleneck on real hardware. Standard fix for exactly this: skip the CPU
+// color conversion entirely and let the GPU's texture sampler + a few ALU
+// ops in the fragment shader do it -- upload the Y plane as a GL_LUMINANCE
+// texture and the interleaved NV12 UV plane as a GL_LUMINANCE_ALPHA texture
+// at half resolution (each (L,A) texel IS one (U,V) byte pair, no repacking
+// needed), then compute BT.601 RGB per-pixel in the fragment shader using
+// the exact same coefficients (91881/116130/22554/46802, all /65536) the CPU
+// path already used -- same math, same visual output, just running on the
+// GPU's fixed-function texture units instead of NEON. Bonus: sampling the
+// half-res UV texture with GL_LINEAR gives smooth bilinear chroma upsampling
+// for free, an improvement over the CPU path's nearest-block replication.
+// Gated behind a compile-time flag (not a runtime check) so a hardware
+// regression (wrong colors, black screen) has a one-line revert instead of
+// needing another round trip to re-add the proven CPU path.
+#define VIDEO_GPU_YUV_CONVERT 1
+
 static GLuint gVideoProgram = 0;
 static GLint gVideoPosLoc = -1;
 static GLint gVideoUvLoc = -1;
+#if VIDEO_GPU_YUV_CONVERT
+static GLint gVideoYTexLoc = -1;
+static GLint gVideoUVTexLoc = -1;
+static GLuint gVideoYTex = 0;
+static GLuint gVideoUVTex = 0;
+#else
 static GLint gVideoTexLoc = -1;
 static GLuint gVideoTex = 0;
+#endif
 static unsigned gVideoTexW = 0;
 static unsigned gVideoTexH = 0;
 
@@ -378,6 +406,21 @@ static void ensure_video_program() {
         "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
         "    vUV = aUV;\n"
         "}\n";
+#if VIDEO_GPU_YUV_CONVERT
+    static const char *kVideoFS =
+        "precision mediump float;\n"
+        "varying vec2 vUV;\n"
+        "uniform sampler2D uYTex;\n"
+        "uniform sampler2D uUVTex;\n"
+        "void main() {\n"
+        "    float y = texture2D(uYTex, vUV).r;\n"
+        "    vec2 uv = texture2D(uUVTex, vUV).ra - vec2(0.5, 0.5);\n"
+        "    float r = y + 1.401993 * uv.y;\n"
+        "    float g = y - 0.344136 * uv.x - 0.714136 * uv.y;\n"
+        "    float b = y + 1.772000 * uv.x;\n"
+        "    gl_FragColor = vec4(r, g, b, 1.0);\n"
+        "}\n";
+#else
     static const char *kVideoFS =
         "precision mediump float;\n"
         "varying vec2 vUV;\n"
@@ -385,6 +428,7 @@ static void ensure_video_program() {
         "void main() {\n"
         "    gl_FragColor = vec4(texture2D(uTex, vUV).rgb, 1.0);\n"
         "}\n";
+#endif
 
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(vs, 1, &kVideoVS, NULL);
@@ -406,10 +450,16 @@ static void ensure_video_program() {
 
     gVideoPosLoc = 0;
     gVideoUvLoc = 1;
+#if VIDEO_GPU_YUV_CONVERT
+    gVideoYTexLoc = glGetUniformLocation(gVideoProgram, "uYTex");
+    gVideoUVTexLoc = glGetUniformLocation(gVideoProgram, "uUVTex");
+    l_info("video: GLES2 YUV program ready (program=%u posLoc=%d uvLoc=%d yTexLoc=%d uvTexLoc=%d)",
+           gVideoProgram, gVideoPosLoc, gVideoUvLoc, gVideoYTexLoc, gVideoUVTexLoc);
+#else
     gVideoTexLoc = glGetUniformLocation(gVideoProgram, "uTex");
-
     l_info("video: GLES2 program ready (program=%u posLoc=%d uvLoc=%d texLoc=%d)",
            gVideoProgram, gVideoPosLoc, gVideoUvLoc, gVideoTexLoc);
+#endif
 }
 
 #define REAL_SCREEN_W 960
@@ -418,6 +468,67 @@ static void ensure_video_program() {
 static bool gFirstDrawLogged = false;
 #define FIRST_DRAW_LOG(...) do { if (!gFirstDrawLogged) l_info(__VA_ARGS__); } while (0)
 
+#if VIDEO_GPU_YUV_CONVERT
+// Perf follow-up (log_109.txt): the GPU YUV conversion already took the
+// intro from 2.6 to 13.9 avg fps (45.6ms/frame total, down from 318ms), and
+// the user asked to push toward 25fps (needs ~40ms/frame). Rather than
+// guess at which of texture-upload/glDrawArrays/gl_swap (vsync wait) is the
+// remaining cost, split all three explicitly -- accumulated here and read
+// by video_play()'s per-loop summary line, same pattern as
+// convert_us_total/draw_us_total already use.
+uint64_t gVideoUploadUsTotal = 0;
+uint64_t gVideoGlDrawUsTotal = 0;
+uint64_t gVideoSwapUsTotal = 0;
+#endif
+
+#if VIDEO_GPU_YUV_CONVERT
+// yuvData layout matches gYuvScratch: w*h Y-plane bytes followed by the NV12
+// interleaved UV plane (w*h/2 bytes, (w/2)x(h/2) U/V byte pairs) -- exactly
+// what av_alloc_texture/the AVC decoder already produces, so this uploads it
+// straight through with no CPU-side repacking at all.
+static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned h) {
+    FIRST_DRAW_LOG("video: draw_video_frame ENTER (%ux%u, GPU YUV convert)", w, h);
+    ensure_video_program();
+    FIRST_DRAW_LOG("video: ensure_video_program() returned");
+
+    const unsigned char *yPlane = yuvData;
+    const unsigned char *uvPlane = yuvData + (size_t) w * h;
+    unsigned uvW = w / 2, uvH = h / 2;
+
+    if (!gVideoYTex || gVideoTexW != w || gVideoTexH != h) {
+        FIRST_DRAW_LOG("video: creating Y/UV texture storage...");
+        if (!gVideoYTex) glGenTextures(1, &gVideoYTex);
+        if (!gVideoUVTex) glGenTextures(1, &gVideoUVTex);
+
+        glBindTexture(GL_TEXTURE_2D, gVideoYTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei) w, (GLsizei) h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+        FIRST_DRAW_LOG("video: Y glTexImage2D returned (err=0x%04x)", glGetError());
+
+        glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei) uvW, (GLsizei) uvH, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
+        FIRST_DRAW_LOG("video: UV glTexImage2D returned (err=0x%04x)", glGetError());
+
+        gVideoTexW = w;
+        gVideoTexH = h;
+    }
+
+    uint64_t uploadStart = sceKernelGetProcessTimeWide();
+    glBindTexture(GL_TEXTURE_2D, gVideoYTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_LUMINANCE, GL_UNSIGNED_BYTE, yPlane);
+    FIRST_DRAW_LOG("video: Y glTexSubImage2D returned (err=0x%04x)", glGetError());
+    glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) uvW, (GLsizei) uvH, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uvPlane);
+    FIRST_DRAW_LOG("video: UV glTexSubImage2D returned (err=0x%04x)", glGetError());
+    gVideoUploadUsTotal += sceKernelGetProcessTimeWide() - uploadStart;
+#else
 static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned h) {
     // Fine-grained, first-frame-only tracing: this is new code (no vitaGL
     // equivalent proven on this driver yet), so if it ever hangs again the
@@ -448,6 +559,7 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     FIRST_DRAW_LOG("video: about to glTexSubImage2D...");
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, rgb565);
     FIRST_DRAW_LOG("video: glTexSubImage2D returned (err=0x%04x)", glGetError());
+#endif
 
     // Letterbox against the REAL physical 960x544 screen -- on real Android
     // the cutscene plays in its own separate fullscreen Activity/View, with
@@ -492,8 +604,29 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     glGetIntegerv(GL_VIEWPORT, savedViewport);
     GLint savedProgram = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &savedProgram);
+#if VIDEO_GPU_YUV_CONVERT
+    // Two sampler units now (Y on unit 0, UV on unit 1) -- DH2's own
+    // alpha_map(AL/AT) shader variant already uses BOTH texture units for
+    // its own diffuse+alpha-mask sampling (see glutil.c's
+    // [gl_diag_alphamap] diagnostic), so a LATER cutscene mid-game can very
+    // plausibly find unit 1 already bound to something real. Save/restore
+    // both units' bindings (and the active-unit pointer itself) explicitly,
+    // same rigor as glutil.c's own alphamap probe uses for this exact
+    // situation -- anything less risks the same class of "silently wrong
+    // texture bound" bug the GL_ARRAY_BUFFER fix above already closed once.
+    GLint savedActiveTexture = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &savedActiveTexture);
+    glActiveTexture(GL_TEXTURE0);
+    GLint savedTex0 = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex0);
+    glActiveTexture(GL_TEXTURE1);
+    GLint savedTex1 = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex1);
+    glActiveTexture((GLenum) savedActiveTexture);
+#else
     GLint savedTex = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex);
+#endif
     // DH2's own 3D rendering is real VBO-based GLES2 (unlike the GLES1
     // fixed-function immediate-mode path this file was ported from), so by
     // the time a LATER cutscene plays mid-game, GL_ARRAY_BUFFER is very
@@ -509,8 +642,13 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     GLint savedArrayBuffer = 0;
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &savedArrayBuffer);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+#if VIDEO_GPU_YUV_CONVERT
+    FIRST_DRAW_LOG("video: GL state saved (blend=%d depth=%d scissor=%d cull=%d program=%d tex0=%d tex1=%d array_buffer=%d)",
+                   savedBlend, savedDepthTest, savedScissor, savedCull, savedProgram, savedTex0, savedTex1, savedArrayBuffer);
+#else
     FIRST_DRAW_LOG("video: GL state saved (blend=%d depth=%d scissor=%d cull=%d program=%d tex=%d array_buffer=%d)",
                    savedBlend, savedDepthTest, savedScissor, savedCull, savedProgram, savedTex, savedArrayBuffer);
+#endif
 
     glViewport(0, 0, REAL_SCREEN_W, REAL_SCREEN_H);
     glDisable(GL_BLEND);
@@ -520,9 +658,18 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     FIRST_DRAW_LOG("video: viewport/disables done");
 
     glUseProgram(gVideoProgram);
+#if VIDEO_GPU_YUV_CONVERT
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gVideoYTex);
+    glUniform1i(gVideoYTexLoc, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
+    glUniform1i(gVideoUVTexLoc, 1);
+#else
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, gVideoTex);
     glUniform1i(gVideoTexLoc, 0);
+#endif
     FIRST_DRAW_LOG("video: program/texture bound");
 
     glVertexAttribPointer(gVideoPosLoc, 2, GL_FLOAT, GL_FALSE, 0, verts);
@@ -530,10 +677,16 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     glEnableVertexAttribArray(gVideoPosLoc);
     glEnableVertexAttribArray(gVideoUvLoc);
     FIRST_DRAW_LOG("video: about to glDrawArrays...");
+#if VIDEO_GPU_YUV_CONVERT
+    uint64_t glDrawStart = sceKernelGetProcessTimeWide();
+#endif
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     FIRST_DRAW_LOG("video: glDrawArrays returned (err=0x%04x)", glGetError());
     glDisableVertexAttribArray(gVideoPosLoc);
     glDisableVertexAttribArray(gVideoUvLoc);
+#if VIDEO_GPU_YUV_CONVERT
+    gVideoGlDrawUsTotal += sceKernelGetProcessTimeWide() - glDrawStart;
+#endif
 
     // Diagnostic for the "audio plays, screen stays black" report: reads
     // back the actual framebuffer content right after our draw, before
@@ -554,7 +707,15 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint) savedArrayBuffer);
+#if VIDEO_GPU_YUV_CONVERT
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex0);
+    glActiveTexture((GLenum) savedActiveTexture);
+#else
     glBindTexture(GL_TEXTURE_2D, (GLuint) savedTex);
+#endif
     glUseProgram((GLuint) savedProgram);
     if (savedBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
     if (savedDepthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
@@ -563,7 +724,13 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     glViewport(savedViewport[0], savedViewport[1], savedViewport[2], savedViewport[3]);
     FIRST_DRAW_LOG("video: GL state restored, about to gl_swap()...");
 
+#if VIDEO_GPU_YUV_CONVERT
+    uint64_t swapStart = sceKernelGetProcessTimeWide();
+#endif
     gl_swap();
+#if VIDEO_GPU_YUV_CONVERT
+    gVideoSwapUsTotal += sceKernelGetProcessTimeWide() - swapStart;
+#endif
     FIRST_DRAW_LOG("video: gl_swap() returned -- first frame fully presented");
     gFirstDrawLogged = true;
 }
@@ -647,12 +814,25 @@ void video_init() {
 }
 
 void video_shutdown() {
+#if VIDEO_GPU_YUV_CONVERT
+    if (gVideoYTex) {
+        glDeleteTextures(1, &gVideoYTex);
+        gVideoYTex = 0;
+    }
+    if (gVideoUVTex) {
+        glDeleteTextures(1, &gVideoUVTex);
+        gVideoUVTex = 0;
+    }
+    gVideoTexW = 0;
+    gVideoTexH = 0;
+#else
     if (gVideoTex) {
         glDeleteTextures(1, &gVideoTex);
         gVideoTex = 0;
         gVideoTexW = 0;
         gVideoTexH = 0;
     }
+#endif
     if (gVideoProgram) {
         glDeleteProgram(gVideoProgram);
         gVideoProgram = 0;
@@ -743,10 +923,6 @@ void video_play(const char *name) {
     unsigned audioFrameLen = 0;
     SceUID cutAudioThreadUid = -1;
 
-    SceCtrlData pad_start;
-    sceCtrlPeekBufferPositive(0, &pad_start, 1);
-    uint32_t old_pad_buttons = pad_start.buttons;
-
     bool skipped = false;
 
     int wait_count = 0;
@@ -755,12 +931,56 @@ void video_play(const char *name) {
         wait_count++;
     }
 
-    l_info("video: loop starting. active=%d, wait_count=%d", sceAvPlayerIsActive(handle), wait_count);
+    // Sample the pad AFTER the activation wait (which can take up to 5s),
+    // not before it -- otherwise a button already released/re-pressed by the
+    // user during that wait (e.g. finishing a tap on the previous screen)
+    // reads as a fresh edge the instant this loop starts, producing an
+    // instantaneous false "skip" that looks identical to a real user skip
+    // in the log (see the [video_diag] investigation: log_101.txt showed
+    // exactly this -- a skip 0.10s after "loop starting" that the user says
+    // did not happen on their end).
+    SceCtrlData pad_start;
+    sceCtrlPeekBufferPositive(0, &pad_start, 1);
+    uint32_t old_pad_buttons = pad_start.buttons;
+
+    l_info("video: loop starting. active=%d, wait_count=%d, initial_pad_buttons=0x%08X",
+           sceAvPlayerIsActive(handle), wait_count, (unsigned) old_pad_buttons);
     uint64_t play_start_time = sceKernelGetProcessTimeWide();
 
     int frame_count = 0;
     int video_frames = 0, audio_frames = 0;
     bool audioOpenAttempted = false;
+
+    // Perf investigation (user-reported, log_104/105.txt: intro now decodes
+    // and draws real frames, confirmed on hardware, but only at ~2.6-2.7 avg
+    // fps for a 1280x720 cutscene). "loop exited" only ever reported the
+    // OUTCOME (video_frames over elapsed_sec) with no way to tell whether our
+    // own CPU work (NV12->RGB565 NEON conversion + glTexSubImage2D upload +
+    // draw + gl_swap) is the bottleneck vs. the hardware AVC decoder itself
+    // simply not producing frames faster than this for a 720p source --
+    // those need completely different fixes (optimize our code vs. nothing
+    // to optimize here at all). Timed separately per successful video frame,
+    // summed, and reported as a fraction of total elapsed time in the final
+    // summary line -- e.g. "convert+draw=3.1s (14% of 21.1s)" means the
+    // decoder itself, not our path, owns the other 86%.
+    //
+    // log_106.txt answered that question: convert+draw was 84% of elapsed
+    // (318.8ms/frame) -- so it's OUR code, not the hardware decoder, eating
+    // the time. Split the single bucket in two (yuv420p_to_rgb565's NEON
+    // CPU work vs. draw_video_frame's texture upload+GL draw+gl_swap) so the
+    // next log says which half is actually slow instead of guessing at an
+    // optimization blind.
+    uint64_t convert_us_total = 0;
+    uint64_t draw_us_total = 0;
+#if VIDEO_GPU_YUV_CONVERT
+    // draw_video_frame() accumulates into these file-scope globals (it has
+    // no other channel back to this function's summary line) -- reset here
+    // since a second video_play() call in the same process run (a later
+    // cutscene) must not carry over the previous one's totals.
+    gVideoUploadUsTotal = 0;
+    gVideoGlDrawUsTotal = 0;
+    gVideoSwapUsTotal = 0;
+#endif
 
     if (!sceAvPlayerIsActive(handle)) {
         l_warn("video: timed out waiting for video decoder to become active (%s)", path);
@@ -772,7 +992,8 @@ void video_play(const char *name) {
         uint32_t pressed = pad.buttons & ~old_pad_buttons;
 
         if (pressed & (SCE_CTRL_CROSS | SCE_CTRL_START)) {
-            l_info("video: skipped by user button press!");
+            l_info("video: skipped by user button press! (pad=0x%08X old_pad=0x%08X pressed=0x%08X, %d loop iteration(s) in)",
+                   (unsigned) pad.buttons, (unsigned) old_pad_buttons, (unsigned) pressed, frame_count);
             skipped = true;
             break;
         }
@@ -784,19 +1005,25 @@ void video_play(const char *name) {
             unsigned h = video.details.video.height;
             if (++video_frames == 1)
                 l_info("video: first video frame decoded (%ux%u, pData=%p)", w, h, video.pData);
+#if !VIDEO_GPU_YUV_CONVERT
             unsigned need = w * h * sizeof(unsigned short);
             if (need > gRgbBufCap) {
                 free(gRgbBuf);
                 gRgbBuf = (unsigned short *) malloc(need);
                 gRgbBufCap = gRgbBuf ? need : 0;
             }
+#endif
             unsigned yuvNeed = w * h + w * h / 2; // NV12: Y plane + half-res interleaved UV
             if (yuvNeed > gYuvScratchCap) {
                 free(gYuvScratch);
                 gYuvScratch = (unsigned char *) malloc(yuvNeed);
                 gYuvScratchCap = gYuvScratch ? yuvNeed : 0;
             }
+#if VIDEO_GPU_YUV_CONVERT
+            if (gYuvScratch && gYuvScratchCap >= yuvNeed) {
+#else
             if (gRgbBuf && gRgbBufCap >= need && gYuvScratch && gYuvScratchCap >= yuvNeed) {
+#endif
                 // Drain the CDRAM/PHYCONT source with one sequential memcpy
                 // before the per-pixel conversion math (which reads it many
                 // times over) -- CPU reads from that memory are far slower
@@ -835,8 +1062,23 @@ void video_play(const char *name) {
                            (y_all_same && first_y == 0) ? " <-- DECODER NEVER WROTE REAL DATA (all-zero Y plane)" : "");
                 }
 
+                uint64_t t0 = sceKernelGetProcessTimeWide();
+#if VIDEO_GPU_YUV_CONVERT
+                // No CPU color conversion step anymore -- draw_video_frame
+                // uploads the Y/UV planes as-is and the fragment shader does
+                // the YUV->RGB math. convert_us_total stays 0 so the summary
+                // line makes the shift obvious at a glance.
+                draw_video_frame(gYuvScratch, w, h);
+                uint64_t t2 = sceKernelGetProcessTimeWide();
+                draw_us_total += t2 - t0;
+#else
                 yuv420p_to_rgb565(gYuvScratch, w, h, gRgbBuf);
+                uint64_t t1 = sceKernelGetProcessTimeWide();
                 draw_video_frame(gRgbBuf, w, h);
+                uint64_t t2 = sceKernelGetProcessTimeWide();
+                convert_us_total += t1 - t0;
+                draw_us_total += t2 - t1;
+#endif
             }
         }
 
@@ -897,8 +1139,28 @@ void video_play(const char *name) {
     uint64_t play_end_time = sceKernelGetProcessTimeWide();
     double elapsed_sec = (double) (play_end_time - play_start_time) / 1000000.0;
     double avg_fps = elapsed_sec > 0.0 ? (double) video_frames / elapsed_sec : 0.0;
-    l_info("video: loop exited! active=%d, iterations=%d, video_frames=%d, audio_frames=%d, elapsed=%.2fs, avg_fps=%.1f",
-           sceAvPlayerIsActive(handle), frame_count, video_frames, audio_frames, elapsed_sec, avg_fps);
+    double convert_sec = (double) convert_us_total / 1000000.0;
+    double draw_sec = (double) draw_us_total / 1000000.0;
+    double convert_draw_sec = convert_sec + draw_sec;
+    double convert_draw_pct = elapsed_sec > 0.0 ? (convert_draw_sec / elapsed_sec) * 100.0 : 0.0;
+    double convert_ms_per_frame = video_frames > 0 ? (convert_sec * 1000.0) / video_frames : 0.0;
+    double draw_ms_per_frame = video_frames > 0 ? (draw_sec * 1000.0) / video_frames : 0.0;
+#if VIDEO_GPU_YUV_CONVERT
+    double upload_ms_per_frame = video_frames > 0 ? ((double) gVideoUploadUsTotal / 1000.0) / video_frames : 0.0;
+    double gldraw_ms_per_frame = video_frames > 0 ? ((double) gVideoGlDrawUsTotal / 1000.0) / video_frames : 0.0;
+    double swap_ms_per_frame = video_frames > 0 ? ((double) gVideoSwapUsTotal / 1000.0) / video_frames : 0.0;
+    l_info("video: loop exited! active=%d, iterations=%d, video_frames=%d, audio_frames=%d, elapsed=%.2fs, avg_fps=%.1f, "
+           "convert+draw=%.2fs (%.0f%% of elapsed) [yuv_convert=%.1fms/frame, tex_upload=%.1fms/frame, "
+           "glDrawArrays=%.1fms/frame, gl_swap(vsync)=%.1fms/frame]",
+           sceAvPlayerIsActive(handle), frame_count, video_frames, audio_frames, elapsed_sec, avg_fps,
+           convert_draw_sec, convert_draw_pct, convert_ms_per_frame, upload_ms_per_frame,
+           gldraw_ms_per_frame, swap_ms_per_frame);
+#else
+    l_info("video: loop exited! active=%d, iterations=%d, video_frames=%d, audio_frames=%d, elapsed=%.2fs, avg_fps=%.1f, "
+           "convert+draw=%.2fs (%.0f%% of elapsed) [yuv_convert=%.1fms/frame, tex_upload+gl_draw+swap=%.1fms/frame]",
+           sceAvPlayerIsActive(handle), frame_count, video_frames, audio_frames, elapsed_sec, avg_fps,
+           convert_draw_sec, convert_draw_pct, convert_ms_per_frame, draw_ms_per_frame);
+#endif
 
     if (cutAudioThreadUid >= 0) {
         pthread_mutex_lock(&gCutAudioLock);

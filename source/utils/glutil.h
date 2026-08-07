@@ -110,6 +110,49 @@ void glDisable_soloader(GLenum cap);
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count);
 void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void *indices);
 
+// Diagnostic for the invisible-enemy bug (DEBUG_SOLOADER-gated, real GL calls
+// always run unmodified either way): patch.c's SkinnedMeshSceneNode/
+// CModularSkinnedMeshSceneNode/XrayModularSkinnedMeshSceneNode render() hooks
+// bracket their SO_CONTINUE call with reset/get so each render() invocation
+// can be attributed a "draw_calls issued, last texture bound, last vertex/
+// index count" summary -- settling whether a specific scene-node instance's
+// render() draws NOTHING at all (a mesh/submesh-list problem upstream of any
+// texture/shader concern) vs. draws with a suspicious texture/geometry
+// (0-vertex draws, or a texture ID that never appears for known-visible
+// characters). Every real glDrawArrays_soloader/glDrawElements_soloader call
+// updates this regardless of whether a render() hook is currently on the
+// stack, so callers must reset immediately before SO_CONTINUE and read
+// immediately after, not across any other GL activity.
+//
+// 2026-08-06 (log_104.txt) extension: draw_calls/last_texture alone showed
+// most enemies DO issue a real draw with a valid texture during actual
+// gameplay (only 1/8 new instances post-load had draw_calls==0, the other 76
+// zero-draw hits were all during the loading screen, before any mesh is
+// ready -- expected, not the bug). User also reports the SAME player
+// character renders visibly transparent in cutscenes/character-select. A
+// draw that happens but is see-through is a blend/depth-state question, not
+// a "nothing drew" one -- so this now also captures the exact blend/depth
+// state active at the moment of the last draw call for the tracked node,
+// settles whether an invisible-but-drawing character is due to e.g. blend
+// left enabled with a src/dst factor pair that composites to fully
+// transparent, or depth-write disabled letting something else immediately
+// paint over it.
+typedef struct {
+    unsigned draw_calls;
+    GLint last_texture;
+    GLsizei last_vertex_count;
+    GLboolean last_blend_enabled;
+    GLint last_blend_src_rgb;
+    GLint last_blend_dst_rgb;
+    GLint last_blend_src_alpha;
+    GLint last_blend_dst_alpha;
+    GLboolean last_depth_test_enabled;
+    GLboolean last_depth_write_mask;
+} GLNodeDrawState;
+
+void gl_diag_reset_render_track(void);
+void gl_diag_get_render_track(GLNodeDrawState *out);
+
 // Sanity-checks every matrix uploaded via glUniformMatrix4fv (camera/model/
 // projection, whichever the engine is setting) for being all-zero or
 // containing NaN/Inf -- draw_calls and depth_test look correct per log_073,
@@ -117,6 +160,14 @@ void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void
 // transform is the next most likely silent cause. Wired into dynlib.c in
 // place of the raw glUniformMatrix4fv entry point.
 void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
+
+// Sibling check for plain vec4 uniforms (tint/color multiplies, common
+// mobile-shader idiom) -- glUniformMatrix4fv_soloader only ever sees 4x4
+// matrices, so a vec4 alpha-multiply uniform sitting at near-zero would
+// slip past it entirely. Flags NaN/Inf same as the matrix check, plus a
+// vec4-that-looks-like-a-color-with-near-zero-alpha heuristic. Wired into
+// dynlib.c in place of the raw glUniform4fv entry point.
+void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value);
 
 // Invisible-enemy investigation, next candidate after opacity was ruled out
 // with certainty (CharProperties::RecalcProperty/PROPS_GetOpacity both read

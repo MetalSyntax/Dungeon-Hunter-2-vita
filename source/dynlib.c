@@ -811,7 +811,7 @@ so_default_dynlib default_dynlib[] = {
         { "glUniform3fv", (uintptr_t)&glUniform3fv },
         { "glUniform3iv", (uintptr_t)&glUniform3iv },
         { "glUniform4f", (uintptr_t)&glUniform4f },
-        { "glUniform4fv", (uintptr_t)&glUniform4fv },
+        { "glUniform4fv", (uintptr_t)&glUniform4fv_soloader },
         { "glUniform4iv", (uintptr_t)&glUniform4iv },
         { "glUniformMatrix2fv", (uintptr_t)&glUniformMatrix2fv },
         { "glUniformMatrix3fv", (uintptr_t)&glUniformMatrix3fv },

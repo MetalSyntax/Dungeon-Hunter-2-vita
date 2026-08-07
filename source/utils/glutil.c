@@ -724,6 +724,45 @@ static void track_seen_texture(void) {
 }
 #endif
 
+#ifdef DEBUG_SOLOADER
+// Per-render-call geometry/texture attribution for the invisible-enemy
+// investigation -- see glutil.h's gl_diag_reset_render_track() comment.
+// Updated by every real draw call unconditionally (cheap: one branch, one
+// glGetIntegerv only when a draw actually happens), read by patch.c's
+// SkinnedMeshSceneNode/CModularSkinnedMeshSceneNode/XrayModularSkinnedMeshSceneNode
+// render() hooks immediately after their SO_CONTINUE returns.
+static GLNodeDrawState s_node_state;
+
+void gl_diag_reset_render_track(void) {
+    memset(&s_node_state, 0, sizeof(s_node_state));
+    s_node_state.last_texture = -1;
+    s_node_state.last_vertex_count = -1;
+    s_node_state.last_blend_src_rgb = -1;
+    s_node_state.last_blend_dst_rgb = -1;
+    s_node_state.last_blend_src_alpha = -1;
+    s_node_state.last_blend_dst_alpha = -1;
+}
+
+void gl_diag_get_render_track(GLNodeDrawState *out) {
+    if (out) *out = s_node_state;
+}
+
+static void track_render_call(GLsizei count) {
+    s_node_state.draw_calls++;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s_node_state.last_texture);
+    s_node_state.last_vertex_count = count;
+
+    s_node_state.last_blend_enabled = glIsEnabled(GL_BLEND);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &s_node_state.last_blend_src_rgb);
+    glGetIntegerv(GL_BLEND_DST_RGB, &s_node_state.last_blend_dst_rgb);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &s_node_state.last_blend_src_alpha);
+    glGetIntegerv(GL_BLEND_DST_ALPHA, &s_node_state.last_blend_dst_alpha);
+
+    s_node_state.last_depth_test_enabled = glIsEnabled(GL_DEPTH_TEST);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &s_node_state.last_depth_write_mask);
+}
+#endif
+
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
 #ifdef DEBUG_SOLOADER
     if (s_draw_calls_since_diag == 0) {
@@ -731,6 +770,7 @@ void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
     }
     s_draw_calls_since_diag++;
     track_seen_texture();
+    track_render_call(count);
 #endif
     glDrawArrays(mode, first, count);
 }
@@ -742,6 +782,7 @@ void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void
     }
     s_draw_calls_since_diag++;
     track_seen_texture();
+    track_render_call(count);
 #endif
     glDrawElements(mode, count, type, indices);
 }
@@ -781,6 +822,50 @@ void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transp
     }
 #endif
     glUniformMatrix4fv(location, count, transpose, value);
+}
+
+// Invisible-enemy investigation, next candidate after render()'s own
+// draw-call/texture/blend/depth state all came back clean in log_110.txt
+// (0 zero-draw-calls, valid nonzero textures, only 3 SUSPICIOUS blend/depth
+// hits in a full session with a reported invisible-then-visible enemy
+// transition) -- the geometry pipeline itself isn't showing the anomaly, so
+// the next most likely silent-invisibility mechanism is a plain vec4
+// uniform (a tint/color multiply, common in mobile shaders for exactly this
+// kind of per-instance opacity/fade effect) rather than the 4x4 matrices
+// glUniformMatrix4fv_soloader above already watches. A vec4 with a
+// near-zero 4th (alpha) component multiplied into the fragment color would
+// produce a fully invisible-but-successfully-drawn character with zero GL
+// error -- exactly the shape of this bug, and NOT something the opacity
+// property investigation (CharProperties::PROPS_GetOpacity, confirmed
+// always 1.0) would ever have caught if this tint is applied via a
+// completely separate uniform rather than that property.
+void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) {
+#ifdef DEBUG_SOLOADER
+    for (GLsizei i = 0; i < count; i++) {
+        const GLfloat *v = value + (size_t) i * 4;
+        int has_nan_or_inf = 0;
+        for (int j = 0; j < 4; j++) {
+            if (isnan(v[j]) || isinf(v[j])) has_nan_or_inf = 1;
+        }
+        // Plausible tint/color range check, not a hard rule (this uniform
+        // could legitimately be something unrelated to color, e.g. a light
+        // position/params vec4) -- only flags the specific "looks like a
+        // color, alpha is near zero" shape rather than every low value, to
+        // stay quiet on the overwhelmingly common unrelated-uniform case.
+        int looks_like_color = v[0] >= 0.0f && v[0] <= 1.0f && v[1] >= 0.0f && v[1] <= 1.0f &&
+                                v[2] >= 0.0f && v[2] <= 1.0f && v[3] >= 0.0f && v[3] <= 1.0f;
+        int near_zero_alpha = looks_like_color && v[3] < 0.05f;
+        if (has_nan_or_inf || near_zero_alpha) {
+            GLint program = -1;
+            glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+            l_warn("[gl_diag_uniform4] glUniform4fv(location=%d, vec %d/%d)=(%.3f,%.3f,%.3f,%.3f) program=%u "
+                   "frame=%d%s%s",
+                   location, i + 1, count, v[0], v[1], v[2], v[3], (GLuint) program, s_frame_counter,
+                   has_nan_or_inf ? " NAN_OR_INF" : "", near_zero_alpha ? " NEAR_ZERO_ALPHA" : "");
+        }
+    }
+#endif
+    glUniform4fv(location, count, value);
 }
 
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,

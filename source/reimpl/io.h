@@ -86,6 +86,29 @@ int close_soloader(int fd);
 
 int fclose_soloader(FILE *f);
 
+// Cache-handle-safe wrappers for the small read-only file cache in io.c --
+// see fopen_soloader's implementation comment for why every one of these
+// exists (a cache handle must never reach the real libc function).
+size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *f);
+size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb, FILE *f);
+int fseek_soloader(FILE *f, long offset, int whence);
+long ftell_soloader(FILE *f);
+void rewind_soloader(FILE *f);
+int feof_soloader(FILE *f);
+int ferror_soloader(FILE *f);
+int fflush_soloader(FILE *f);
+int fgetc_soloader(FILE *f);
+int getc_soloader(FILE *f);
+int fputc_soloader(int c, FILE *f);
+int putc_soloader(int c, FILE *f);
+char *fgets_soloader(char *str, int n, FILE *f);
+int fputs_soloader(const char *str, FILE *f);
+int fileno_soloader(FILE *f);
+int setvbuf_soloader(FILE *f, char *buf, int mode, size_t size);
+int ungetc_soloader(int c, FILE *f);
+int fseeko_soloader(FILE *f, off_t offset, int whence);
+off_t ftello_soloader(FILE *f);
+
 int closedir_soloader(DIR *dir);
 
 int fcntl_soloader(int fd, int cmd, ...);

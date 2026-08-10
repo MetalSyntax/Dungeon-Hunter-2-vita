@@ -16,6 +16,7 @@
 #include <dirent.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <malloc.h>
 #include <psp2/kernel/threadmgr.h>
 
 #ifdef USE_SCELIBC_IO
@@ -75,8 +76,18 @@
 // (no git revert needed for a quick isolate-and-test cycle -- see
 // PORTING_PLAN.md's 2026-08-08 session entry for the full writeup and the
 // git commit boundary if a real revert is what's wanted instead).
+// log_117.txt (2026-08-08): the cache hit its old FCACHE_MAX_ENTRIES (64) cap
+// at just 1.4MB of the 16MB byte budget -- entry #64 was a small pydata file
+// cached during initial boot/loading, before the engine even starts streaming
+// the actually-hot repeated assets (shaders.pak reopened 176x, individual
+// .bdae animations 100+x, per log_110's fopen count) that this cache exists
+// to help. No eviction policy exists once the entry cap is hit (see
+// fcache_populate below), so every single fopen() for the rest of the session
+// -- i.e. essentially all of real gameplay -- got zero caching benefit. Raised
+// the entry cap so the byte budget (still the real, unchanged safety bound)
+// is what actually limits the cache, not an arbitrary low file count.
 #define FCACHE_ENABLED 1
-#define FCACHE_MAX_ENTRIES 64
+#define FCACHE_MAX_ENTRIES 512
 #define FCACHE_MAX_FILE_SIZE (512 * 1024)
 #define FCACHE_MAX_TOTAL_BYTES (16 * 1024 * 1024)
 #define FCACHE_MAX_HANDLES 32
@@ -98,6 +109,26 @@ static long s_fcache_total_bytes = 0;
 static FCacheHandle s_fcache_handles[FCACHE_MAX_HANDLES];
 static int s_fcache_handles_init = 0;
 static pthread_mutex_t s_fcache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// User asked to size the next FCACHE_MAX_TOTAL_BYTES bump off real numbers
+// instead of guessing a bigger constant blind (same discipline as every
+// other budget change in this file's history -- 64->512 entries in Phase 13
+// was sized off an observed cap-hit, not a round number picked up front).
+// Two things are needed to make that call safely next session: (1) how much
+// demand the cache is actually turning away once the byte budget is full
+// (bytes/files rejected purely for being over budget, not counting the
+// separate per-file FCACHE_MAX_FILE_SIZE skip, which is a different knob),
+// and (2) how much real headroom exists in the 256MB newlib heap
+// (_newlib_heap_size_user, source/main.c) at the moment that happens, via
+// mallinfo() -- raising the budget is only actually safe if there's heap
+// left to give it. Logged once when the byte cap is first hit (so the
+// mallinfo() snapshot reflects real mid-game memory pressure, not an empty
+// boot heap) and then as a periodic running total, not per-rejection, since
+// a cap-hit session can reject hundreds of files.
+static int s_fcache_byte_cap_hit_logged = 0;
+static long s_fcache_bytes_rejected = 0;
+static int s_fcache_files_rejected = 0;
+#define FCACHE_REJECT_LOG_EVERY 50
 
 static void fcache_init_handles_locked(void) {
     if (s_fcache_handles_init) return;
@@ -144,6 +175,8 @@ static int fcache_is_cacheable_mode(const char *mode) {
 #endif
 }
 
+static int s_fcache_entry_cap_hit_logged = 0;
+
 // Called right after a real fopen() succeeds for a cacheable path not
 // already in the cache -- reads the whole file via the SAME real
 // (non-wrapped) fread/fseek/ftell the rest of this file already uses, then
@@ -152,7 +185,21 @@ static int fcache_is_cacheable_mode(const char *mode) {
 static void fcache_populate(const char *path, FILE *real_file) {
     pthread_mutex_lock(&s_fcache_lock);
     fcache_init_handles_locked();
-    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES || strlen(path) >= sizeof(s_fcache_entries[0].path)) {
+    if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES) {
+        int should_log = !s_fcache_entry_cap_hit_logged;
+        if (should_log) s_fcache_entry_cap_hit_logged = 1;
+        pthread_mutex_unlock(&s_fcache_lock);
+        // Phase 19: the byte budget has been the binding constraint since the
+        // entry cap was raised to 512, but log it explicitly if this ever
+        // flips back (e.g. after a future FCACHE_MAX_TOTAL_BYTES increase
+        // makes the entry count the new bottleneck instead).
+        if (should_log) {
+            l_warn("[fcache] entry cap (%d files) FULL -- further files skip caching regardless of byte budget "
+                   "left (%ld/%d bytes used)", FCACHE_MAX_ENTRIES, s_fcache_total_bytes, FCACHE_MAX_TOTAL_BYTES);
+        }
+        return;
+    }
+    if (strlen(path) >= sizeof(s_fcache_entries[0].path)) {
         pthread_mutex_unlock(&s_fcache_lock);
         return;
     }
@@ -171,7 +218,26 @@ static void fcache_populate(const char *path, FILE *real_file) {
 
     pthread_mutex_lock(&s_fcache_lock);
     if (s_fcache_total_bytes + size > FCACHE_MAX_TOTAL_BYTES) {
+        s_fcache_bytes_rejected += size;
+        s_fcache_files_rejected++;
+        int should_log_first_hit = !s_fcache_byte_cap_hit_logged;
+        if (should_log_first_hit) s_fcache_byte_cap_hit_logged = 1;
+        int rejected_files_snapshot = s_fcache_files_rejected;
+        long rejected_bytes_snapshot = s_fcache_bytes_rejected;
         pthread_mutex_unlock(&s_fcache_lock);
+
+        if (should_log_first_hit) {
+            extern int _newlib_heap_size_user;
+            struct mallinfo mi = mallinfo();
+            l_warn("[fcache] byte budget (%d) FULL -- further files skip caching from here on. "
+                   "Heap at this moment: %d bytes used / %d bytes max (_newlib_heap_size_user, source/main.c) -- "
+                   "use this + the periodic reject totals below to size the next FCACHE_MAX_TOTAL_BYTES bump",
+                   FCACHE_MAX_TOTAL_BYTES, mi.uordblks, _newlib_heap_size_user);
+        } else if (rejected_files_snapshot % FCACHE_REJECT_LOG_EVERY == 0) {
+            l_warn("[fcache] byte budget still full: %d files / %ld bytes rejected so far this session "
+                   "(would need budget >= current %d + this to cache everything seen)",
+                   rejected_files_snapshot, rejected_bytes_snapshot, FCACHE_MAX_TOTAL_BYTES);
+        }
         return;
     }
     pthread_mutex_unlock(&s_fcache_lock);
@@ -279,7 +345,9 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 
         // A handful of character textures referenced by the swamp-intro cutscene NPC
         // (cs_swamp_intro_prisonner_scene01.bdae) and the Faerie companion
-        // (faeries_template_anim.bdae) are missing from every real app-data dump we have
+        // (faeries_template_anim.bdae, requested under at least two different
+        // literal filenames -- char_faerie.tga and tex_faerie_001.tga, see
+        // log_125.txt) are missing from every real app-data dump we have
         // access to (two independent Android installs checked, neither has them, and
         // neither has the "qata" directory the engine's own on-demand reader falls back
         // to on failure -- confirmed that fallback is genuine, unmodified engine
@@ -297,7 +365,19 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                      (int) (base - filename), filename);
             ret = fopen_soloader(redirected, mode);
             if (ret) return ret;
-        } else if (strcmp(base, "char_faerie.tga") == 0) {
+        } else if (strcmp(base, "char_faerie.tga") == 0 || strcmp(base, "tex_faerie_001.tga") == 0) {
+            // log_125.txt: "tex_faerie_001.tga" -- a sibling request for the same
+            // Faerie companion this redirect already covers under a different
+            // literal filename, also absent from every real app-data dump we
+            // have -- failed to open 40 times in one session (both the plain
+            // path and the engine's own "qata" fallback, same confirmed-genuine
+            // mechanism as char_faerie.tga above), leaving the companion
+            // rendering with no diffuse texture bound for the rest of that draw.
+            // User-reported "purple/wrong-colored effects that didn't exist
+            // before" is consistent with this: a draw call with no texture
+            // re-bound can end up sampling whatever texture unit 0 was LAST
+            // bound to (e.g. a weapon-trail effect drawn just before it in the
+            // same frame), not just a flat placeholder color.
             char redirected[512];
             snprintf(redirected, sizeof(redirected), "%.*sfx_sparkles_01.tga",
                      (int) (base - filename), filename);

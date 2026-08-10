@@ -654,45 +654,52 @@ void so_patch(void) {
         (uintptr_t)&hook_GetSavedOption);
 
 #ifdef DEBUG_SOLOADER
-    s_hook_modular_render = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZN17BaseMeshSceneNodeIN6glitch7collada28CModularSkinnedMeshSceneNodeEE6renderEPv"),
-        (uintptr_t)&modular_render_hook);
-    s_hook_xray_render = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZN31XrayModularSkinnedMeshSceneNode6renderEPv"),
-        (uintptr_t)&xray_render_hook);
-    s_hook_skinned_render = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZN17BaseMeshSceneNodeIN6glitch7collada21CSkinnedMeshSceneNodeEE6renderEPv"),
-        (uintptr_t)&skinned_render_hook);
+    // log_119.txt (2026-08-08): stats were STILL corrupted (MP=-661407/142,
+    // Points left=-67) in a session where CF__CalcDamage/_GetProperty/potion
+    // hooks below never fired even once (0 damage_diag/prop_diag hits) --
+    // proof those specific hooks were NOT the only source. The three render()
+    // hooks right below are installed via the exact same hook_addr()/kubridge
+    // inline-trampoline mechanism, on functions that fire far MORE often
+    // (every single draw call, every frame, for every on-screen character)
+    // than _GetProperty ever did. If a subtly-wrong trampoline (register
+    // save/restore, stack alignment) is what corrupts adjacent memory --
+    // the working theory for why removing the stats hooks alone wasn't
+    // enough -- these are at least as likely a culprit and were missed the
+    // first time because they don't touch CharProperties/Character directly.
+    // Disabling all of them (render + the attach/clone/remove_display_object
+    // Flash-clip counters right below, same mechanism) until proven
+    // otherwise on a hardware session with a FRESH character (an already-
+    // corrupted save's negative MP/points won't self-heal just because the
+    // hook that (maybe) wrote them is gone -- that needs a new save to test
+    // cleanly).
+    // s_hook_modular_render = hook_addr(
+    //     (uintptr_t)so_symbol(&so_mod, "_ZN17BaseMeshSceneNodeIN6glitch7collada28CModularSkinnedMeshSceneNodeEE6renderEPv"),
+    //     (uintptr_t)&modular_render_hook);
+    // s_hook_xray_render = hook_addr(
+    //     (uintptr_t)so_symbol(&so_mod, "_ZN31XrayModularSkinnedMeshSceneNode6renderEPv"),
+    //     (uintptr_t)&xray_render_hook);
+    // s_hook_skinned_render = hook_addr(
+    //     (uintptr_t)so_symbol(&so_mod, "_ZN17BaseMeshSceneNodeIN6glitch7collada21CSkinnedMeshSceneNodeEE6renderEPv"),
+    //     (uintptr_t)&skinned_render_hook);
 
-    s_hook_recalc_property = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZN14CharProperties14RecalcPropertyEi"),
-        (uintptr_t)&recalc_property_hook);
+    // Desactivados todos los hooks de diagnóstico sobre clases de personajes (CharProperties / Character)
+    // para garantizar cero interferencias con la memoria y registros de la Vita.
     s_real_get_opacity = (GetOpacity_t)so_symbol(&so_mod, "_ZNK14CharProperties16PROPS_GetOpacityEv");
 
-    s_hook_calc_damage = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_Z14CF__CalcDamageP9CharacterS0_iiibb"),
-        (uintptr_t)&calc_damage_hook);
     uintptr_t get_property_addr = (uintptr_t)so_symbol(
         &so_mod, "_ZNK14CharProperties12_GetPropertyERKN7Structs19CharacterPropertiesEi");
     s_real_get_property = (GetProperty_t)get_property_addr;
-    s_hook_get_property = hook_addr(get_property_addr, (uintptr_t)&get_property_hook);
 
-    s_hook_attach_movie = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZN7gameswf15sprite_instance12attach_movieERKNS_9tu_stringES1_i"),
-        (uintptr_t)&hook_attach_movie);
-    s_hook_clone_display_object = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZN7gameswf15sprite_instance20clone_display_objectERKNS_9tu_stringEi"),
-        (uintptr_t)&hook_clone_display_object);
-    s_hook_remove_display_object = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZN7gameswf15sprite_instance21remove_display_objectEPNS_9characterE"),
-        (uintptr_t)&hook_remove_display_object);
+    // s_hook_attach_movie = hook_addr(
+    //     (uintptr_t)so_symbol(&so_mod, "_ZN7gameswf15sprite_instance12attach_movieERKNS_9tu_stringES1_i"),
+    //     (uintptr_t)&hook_attach_movie);
+    // s_hook_clone_display_object = hook_addr(
+    //     (uintptr_t)so_symbol(&so_mod, "_ZN7gameswf15sprite_instance20clone_display_objectERKNS_9tu_stringEi"),
+    //     (uintptr_t)&hook_clone_display_object);
+    // s_hook_remove_display_object = hook_addr(
+    //     (uintptr_t)so_symbol(&so_mod, "_ZN7gameswf15sprite_instance21remove_display_objectEPNS_9characterE"),
+    //     (uintptr_t)&hook_remove_display_object);
 
-    s_hook_use_potion = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_Z15NativeUsePotionRKN7gameswf7fn_callE"),
-        (uintptr_t)&use_potion_hook);
-    s_hook_has_potion = hook_addr(
-        (uintptr_t)so_symbol(&so_mod, "_ZNK9Character9HasPotionEv"),
-        (uintptr_t)&has_potion_hook);
     s_real_get_hp_percent = (GetPercent_t)so_symbol(&so_mod, "_ZNK9Character12GetHPPercentEv");
     s_real_get_mp_percent = (GetPercent_t)so_symbol(&so_mod, "_ZNK9Character12GetMPPercentEv");
 #endif

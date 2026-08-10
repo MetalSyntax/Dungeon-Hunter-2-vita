@@ -190,6 +190,30 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
                                       GLsizei width, GLsizei height, GLint border,
                                       GLsizei imageSize, const void *data);
 
+// New lead for the invisible/near-transparent-enemy investigation (2026-08-08,
+// log_120.txt + user screenshot: "casi transparentes", not fully invisible --
+// a stronger, more specific symptom than earlier reports). A real dumped
+// fragment shader (glsl_dump/A6673032....glsl) does
+// "color = texture2D(...) + DiffuseColor; color *= vColor0; color.rgb *= color.a;" --
+// DiffuseColor is ADDITIVE (its usual (0,0,0,0) is the neutral no-op default,
+// not a bug -- the earlier glUniform4fv_soloader NEAR_ZERO_ALPHA hits on it
+// are a red herring). vColor0 is the real suspect: a per-vertex Color0
+// attribute that directly gates final alpha via "color.rgb *= color.a", the
+// opposite of what an older comment in this file assumed ("vertex alpha
+// hardcoded to 1.0" -- true for a DIFFERENT shader variant, not this one).
+// When the engine has no per-vertex color array bound for a draw, GLES
+// convention is to fall back to a CONSTANT value via glVertexAttrib4f/4fv
+// (glVertexAttribPointer's own per-vertex path isn't practically
+// interceptable the same way). If that constant ever comes back (0,0,0,0)
+// instead of the expected opaque-white (1,1,1,1) default -- e.g. the same
+// class of uninitialized/corrupted read already confirmed for CharProperties
+// -- this reproduces "draws, zero GL error, nearly invisible" exactly.
+// Same throttled near-zero-alpha heuristic as glUniform4fv_soloader, keyed by
+// attribute index. Wired into dynlib.c in place of the raw glVertexAttrib4f/
+// glVertexAttrib4fv entry points.
+void glVertexAttrib4f_soloader(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w);
+void glVertexAttrib4fv_soloader(GLuint index, const GLfloat *v);
+
 // Logs every real glDepthRangef call (args + frame) -- log_075's gl_diag3
 // showed GL_DEPTH_RANGE collapsed to (1.0, 1.0) from the moment the 3D
 // character preview starts drawing, staying that way for the rest of the

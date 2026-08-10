@@ -479,6 +479,64 @@ static bool gFirstDrawLogged = false;
 uint64_t gVideoUploadUsTotal = 0;
 uint64_t gVideoGlDrawUsTotal = 0;
 uint64_t gVideoSwapUsTotal = 0;
+// log_125.txt: tex_upload stayed the dominant cost again (39.2ms/frame, ~75%
+// of the whole convert+draw budget) with no visibility into whether the
+// 4x-larger Y plane or the UV plane is actually responsible -- split the two
+// glTexSubImage2D calls' timing separately so the next log can confirm
+// whether this is proportional to bytes uploaded (bandwidth/twiddle-bound,
+// making a downsampled-texture experiment worthwhile) or dominated by fixed
+// per-call overhead instead (which downsampling wouldn't fix).
+uint64_t gVideoUploadYUsTotal = 0;
+uint64_t gVideoUploadUVUsTotal = 0;
+
+// log_126.txt confirmed the hypothesis above with real numbers: Y=24.2ms/frame
+// vs UV=11.5ms/frame is a 2.10x ratio, matching the 2.00x ratio of raw bytes
+// uploaded (1280x720 Y vs 640x360 UV) almost exactly -- this cost is
+// bandwidth/twiddle-bound, not fixed per-call driver overhead, so uploading
+// fewer bytes should give a near-linear win. The display already downscales
+// this 1280x720 source into a <=960x544 letterboxed quad (see REAL_SCREEN_W/H
+// below), so real detail is being thrown away at draw time regardless --
+// halving the uploaded resolution loses comparatively little of what's
+// actually visible. Downsamples via simple nearest-neighbor decimation (pick
+// every other sample, no averaging) rather than a box filter: this is a
+// cutscene on a CPU-bound port (Phase 14), and a strided copy is the cheapest
+// possible way to shrink the upload without adding meaningful CPU cost back.
+// One-line revert: set to 0.
+#define VIDEO_DOWNSAMPLE_UPLOAD 1
+
+#if VIDEO_DOWNSAMPLE_UPLOAD
+static unsigned char *gVideoDsY = NULL;
+static unsigned char *gVideoDsUV = NULL;
+static unsigned gVideoDsYCap = 0, gVideoDsUVCap = 0;
+
+// src is a plain 8-bit luminance plane (srcW*srcH bytes) -- picks one sample
+// per 2x2 block (top-left) into a (srcW/2)x(srcH/2) destination.
+static void downsample2x_luminance(const unsigned char *src, unsigned srcW,
+                                    unsigned char *dst, unsigned dstW, unsigned dstH) {
+    for (unsigned y = 0; y < dstH; y++) {
+        const unsigned char *srow = src + (size_t) (y * 2) * srcW;
+        unsigned char *drow = dst + (size_t) y * dstW;
+        for (unsigned x = 0; x < dstW; x++) {
+            drow[x] = srow[x * 2];
+        }
+    }
+}
+
+// src is interleaved (L,A) byte pairs (NV12's (U,V) read as GL_LUMINANCE_ALPHA,
+// srcW*srcH pairs) -- same 2x2-block top-left pick, applied per-pair so both
+// U and V come from the same source texel.
+static void downsample2x_luminance_alpha(const unsigned char *src, unsigned srcW,
+                                          unsigned char *dst, unsigned dstW, unsigned dstH) {
+    for (unsigned y = 0; y < dstH; y++) {
+        const unsigned char *srow = src + (size_t) (y * 2) * srcW * 2;
+        unsigned char *drow = dst + (size_t) y * dstW * 2;
+        for (unsigned x = 0; x < dstW; x++) {
+            drow[x * 2] = srow[x * 4];
+            drow[x * 2 + 1] = srow[x * 4 + 1];
+        }
+    }
+}
+#endif
 #endif
 
 #if VIDEO_GPU_YUV_CONVERT
@@ -495,7 +553,20 @@ static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned 
     const unsigned char *uvPlane = yuvData + (size_t) w * h;
     unsigned uvW = w / 2, uvH = h / 2;
 
-    if (!gVideoYTex || gVideoTexW != w || gVideoTexH != h) {
+#if VIDEO_DOWNSAMPLE_UPLOAD
+    // Only downsample when the source is big enough to halve cleanly -- a
+    // cutscene's resolution is fixed for its whole playback, so this either
+    // never triggers (tiny/odd source) or always does, no per-frame flapping.
+    int canDownsample = (w >= 4 && h >= 4 && uvW >= 2 && uvH >= 2);
+    unsigned texW = canDownsample ? w / 2 : w;
+    unsigned texH = canDownsample ? h / 2 : h;
+    unsigned uvTexW = canDownsample ? uvW / 2 : uvW;
+    unsigned uvTexH = canDownsample ? uvH / 2 : uvH;
+#else
+    unsigned texW = w, texH = h, uvTexW = uvW, uvTexH = uvH;
+#endif
+
+    if (!gVideoYTex || gVideoTexW != texW || gVideoTexH != texH) {
         FIRST_DRAW_LOG("video: creating Y/UV texture storage...");
         if (!gVideoYTex) glGenTextures(1, &gVideoYTex);
         if (!gVideoUVTex) glGenTextures(1, &gVideoUVTex);
@@ -505,7 +576,7 @@ static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei) w, (GLsizei) h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei) texW, (GLsizei) texH, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
         FIRST_DRAW_LOG("video: Y glTexImage2D returned (err=0x%04x)", glGetError());
 
         glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
@@ -513,20 +584,57 @@ static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei) uvW, (GLsizei) uvH, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei) uvTexW, (GLsizei) uvTexH, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
         FIRST_DRAW_LOG("video: UV glTexImage2D returned (err=0x%04x)", glGetError());
 
-        gVideoTexW = w;
-        gVideoTexH = h;
+        gVideoTexW = texW;
+        gVideoTexH = texH;
+
+#if VIDEO_DOWNSAMPLE_UPLOAD
+        unsigned needY = texW * texH;
+        unsigned needUV = uvTexW * uvTexH * 2;
+        if (needY > gVideoDsYCap) {
+            free(gVideoDsY);
+            gVideoDsY = (unsigned char *) malloc(needY);
+            gVideoDsYCap = gVideoDsY ? needY : 0;
+        }
+        if (needUV > gVideoDsUVCap) {
+            free(gVideoDsUV);
+            gVideoDsUV = (unsigned char *) malloc(needUV);
+            gVideoDsUVCap = gVideoDsUV ? needUV : 0;
+        }
+#endif
     }
 
     uint64_t uploadStart = sceKernelGetProcessTimeWide();
+#if VIDEO_DOWNSAMPLE_UPLOAD
+    const unsigned char *yUpload = yPlane;
+    const unsigned char *uvUpload = uvPlane;
+    if (canDownsample && gVideoDsY && gVideoDsUV) {
+        downsample2x_luminance(yPlane, w, gVideoDsY, texW, texH);
+        downsample2x_luminance_alpha(uvPlane, uvW, gVideoDsUV, uvTexW, uvTexH);
+        yUpload = gVideoDsY;
+        uvUpload = gVideoDsUV;
+    }
+    glBindTexture(GL_TEXTURE_2D, gVideoYTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) texW, (GLsizei) texH, GL_LUMINANCE, GL_UNSIGNED_BYTE, yUpload);
+    FIRST_DRAW_LOG("video: Y glTexSubImage2D returned (err=0x%04x)", glGetError());
+    uint64_t yDoneTime = sceKernelGetProcessTimeWide();
+    gVideoUploadYUsTotal += yDoneTime - uploadStart;
+    glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) uvTexW, (GLsizei) uvTexH, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uvUpload);
+    FIRST_DRAW_LOG("video: UV glTexSubImage2D returned (err=0x%04x)", glGetError());
+#else
     glBindTexture(GL_TEXTURE_2D, gVideoYTex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) w, (GLsizei) h, GL_LUMINANCE, GL_UNSIGNED_BYTE, yPlane);
     FIRST_DRAW_LOG("video: Y glTexSubImage2D returned (err=0x%04x)", glGetError());
+    uint64_t yDoneTime = sceKernelGetProcessTimeWide();
+    gVideoUploadYUsTotal += yDoneTime - uploadStart;
     glBindTexture(GL_TEXTURE_2D, gVideoUVTex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) uvW, (GLsizei) uvH, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, uvPlane);
     FIRST_DRAW_LOG("video: UV glTexSubImage2D returned (err=0x%04x)", glGetError());
+#endif
+    gVideoUploadUVUsTotal += sceKernelGetProcessTimeWide() - yDoneTime;
     gVideoUploadUsTotal += sceKernelGetProcessTimeWide() - uploadStart;
 #else
 static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned h) {
@@ -980,6 +1088,8 @@ void video_play(const char *name) {
     gVideoUploadUsTotal = 0;
     gVideoGlDrawUsTotal = 0;
     gVideoSwapUsTotal = 0;
+    gVideoUploadYUsTotal = 0;
+    gVideoUploadUVUsTotal = 0;
 #endif
 
     if (!sceAvPlayerIsActive(handle)) {
@@ -1147,14 +1257,16 @@ void video_play(const char *name) {
     double draw_ms_per_frame = video_frames > 0 ? (draw_sec * 1000.0) / video_frames : 0.0;
 #if VIDEO_GPU_YUV_CONVERT
     double upload_ms_per_frame = video_frames > 0 ? ((double) gVideoUploadUsTotal / 1000.0) / video_frames : 0.0;
+    double uploadY_ms_per_frame = video_frames > 0 ? ((double) gVideoUploadYUsTotal / 1000.0) / video_frames : 0.0;
+    double uploadUV_ms_per_frame = video_frames > 0 ? ((double) gVideoUploadUVUsTotal / 1000.0) / video_frames : 0.0;
     double gldraw_ms_per_frame = video_frames > 0 ? ((double) gVideoGlDrawUsTotal / 1000.0) / video_frames : 0.0;
     double swap_ms_per_frame = video_frames > 0 ? ((double) gVideoSwapUsTotal / 1000.0) / video_frames : 0.0;
     l_info("video: loop exited! active=%d, iterations=%d, video_frames=%d, audio_frames=%d, elapsed=%.2fs, avg_fps=%.1f, "
-           "convert+draw=%.2fs (%.0f%% of elapsed) [yuv_convert=%.1fms/frame, tex_upload=%.1fms/frame, "
-           "glDrawArrays=%.1fms/frame, gl_swap(vsync)=%.1fms/frame]",
+           "convert+draw=%.2fs (%.0f%% of elapsed) [yuv_convert=%.1fms/frame, tex_upload=%.1fms/frame "
+           "(Y=%.1fms/frame UV=%.1fms/frame), glDrawArrays=%.1fms/frame, gl_swap(vsync)=%.1fms/frame]",
            sceAvPlayerIsActive(handle), frame_count, video_frames, audio_frames, elapsed_sec, avg_fps,
            convert_draw_sec, convert_draw_pct, convert_ms_per_frame, upload_ms_per_frame,
-           gldraw_ms_per_frame, swap_ms_per_frame);
+           uploadY_ms_per_frame, uploadUV_ms_per_frame, gldraw_ms_per_frame, swap_ms_per_frame);
 #else
     l_info("video: loop exited! active=%d, iterations=%d, video_frames=%d, audio_frames=%d, elapsed=%.2fs, avg_fps=%.1f, "
            "convert+draw=%.2fs (%.0f%% of elapsed) [yuv_convert=%.1fms/frame, tex_upload+gl_draw+swap=%.1fms/frame]",

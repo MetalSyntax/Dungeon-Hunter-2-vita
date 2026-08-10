@@ -63,6 +63,7 @@
 #include <sys/stat.h>
 
 #include "sounddefs.h"
+#include "audio.h"
 
 /*
  * GLResLoader: asset bridge
@@ -156,73 +157,21 @@ jobject GLResLoader_getResourceBytes(jmethodID id, va_list args) {
 /*
  * GLMediaPlayer: sound bridge
  *
- * Audio playback itself is Phase 7 (not implemented yet) -- these stubs
- * exist so every numeric return type resolves to a real, sane value now
- * rather than FalsoJNI's "not found" sentinel.
+ * isSoundLoaded(Big)/loadSound(Big)/playSound(Big)/pause/resume/stop(Big)/
+ * setVolume(Big)/setPitch/stopAll{Sounds,Pool,Big} are real now -- see
+ * audio.cpp/audio.h (a sceAudioOut mixer backing this bridge). pause/resume/
+ * stop/setVolume/setPitch's signatures were cross-referenced directly
+ * against out_ghidra.c's GLMediaPlayer_nativeInit GetMethodID calls (real
+ * signature strings: "(II)V" for pause/resume/stop, "(IIF)V" for setVolume/
+ * setPitch) -- not guessed. unloadSound(Big)/resetSound/destroySoundPool/
+ * initSoundPoolArray remain safe no-ops: lower-value lifecycle hints whose
+ * exact semantics (does unload evict a still-in-use cache entry? does reset
+ * mean something beyond stop?) weren't worth the same risk/effort tradeoff.
  */
-
-jint GLMediaPlayer_isSoundLoaded(jmethodID id, va_list args) {
-    (void) va_arg(args, jint);
-    (void) va_arg(args, jint);
-    return 0; // not loaded -- no audio backend yet, see Phase 7
-}
-
-jint GLMediaPlayer_isSoundLoadedBig(jmethodID id, va_list args) {
-    (void) va_arg(args, jint);
-    return 0;
-}
 
 void GLMediaPlayer_unloadSound(jmethodID id, va_list args) { (void) args; }
 void GLMediaPlayer_unloadSoundBig(jmethodID id, va_list args) { (void) args; }
-
-void GLMediaPlayer_loadSound(jmethodID id, va_list args) {
-    int sndId = va_arg(args, jint);
-    int instance = va_arg(args, jint);
-    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
-        l_info("[Java] GLMediaPlayer.loadSound(%d: %s, instance: %d) (no-op, audio not implemented yet)", sndId, Sounddefs[sndId], instance);
-    }
-}
-
-void GLMediaPlayer_loadSoundBig(jmethodID id, va_list args) {
-    int sndId = va_arg(args, jint);
-    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
-        l_info("[Java] GLMediaPlayer.loadSoundBig(%d: %s) (no-op, audio not implemented yet)", sndId, Sounddefs[sndId]);
-    }
-}
-
-void GLMediaPlayer_playSound(jmethodID id, va_list args) {
-    int sndId = va_arg(args, jint);
-    int instance = va_arg(args, jint);
-    float vol = (float) va_arg(args, double);
-    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
-        l_info("[Java] GLMediaPlayer.playSound(%d: %s, instance: %d, vol: %f) (no-op, audio not implemented yet)", sndId, Sounddefs[sndId], instance, vol);
-    }
-}
-
-void GLMediaPlayer_playSoundBig(jmethodID id, va_list args) {
-    int sndId = va_arg(args, jint);
-    float vol = (float) va_arg(args, double);
-    int loop = va_arg(args, jint);
-    int fadeIn = va_arg(args, jint);
-    if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) {
-        l_info("[Java] GLMediaPlayer.playSoundBig(%d: %s, vol: %f, loop: %d, fade: %d) (no-op, audio not implemented yet)",
-               sndId, Sounddefs[sndId], vol, loop, fadeIn);
-    }
-}
-
-void GLMediaPlayer_pauseSound(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_pauseSoundBig(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_resumeSound(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_resumeSoundBig(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_stopSound(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_stopSoundBig(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_setVolume(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_setVolumeBig(jmethodID id, va_list args) { (void) args; }
 void GLMediaPlayer_resetSound(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_setPitch(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_stopAllSounds(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_stopAllPool(jmethodID id, va_list args) { (void) args; }
-void GLMediaPlayer_stopAllBig(jmethodID id, va_list args) { (void) args; }
 void GLMediaPlayer_destroySoundPool(jmethodID id, va_list args) { (void) args; }
 void GLMediaPlayer_initSoundPoolArray(jmethodID id, va_list args) { (void) args; }
 
@@ -457,12 +406,9 @@ jint Misc_GetMinBufferSize(jmethodID id, va_list args) {
     return 16384;
 }
 
-jint Misc_AudioTrackWrite(jmethodID id, va_list args) {
-    (void) args;
-    (void) va_arg(args, jobject);
-    (void) va_arg(args, jint);
-    return va_arg(args, jint); // sizeInBytes
-}
+// Misc_AudioTrackWrite is implemented for real in audio.cpp now -- see its
+// own comment there for why this turned out to be the actual silent-audio
+// culprit (the engine's native Vox audio middleware, not GLMediaPlayer).
 
 void Misc_DummyVoid(jmethodID id, va_list args) {
     (void) args;
@@ -742,7 +688,7 @@ MethodsVoid methodsVoid[] = {
         { M_AudioTrack_play,        Misc_DummyVoid },
         { M_AudioTrack_pause,       Misc_DummyVoid },
         { M_AudioTrack_stop,        Misc_DummyVoid },
-        { M_AudioTrack_release,     Misc_DummyVoid },
+        { M_AudioTrack_release,     Misc_AudioTrackRelease },
 };
 
 /*

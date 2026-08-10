@@ -25,6 +25,39 @@ set -e
 #                                    de la GPU a costa de nitidez. Ratio mas
 #                                    leve: --downsample-test 3 4 (3/4 en vez
 #                                    de 2/3).
+#      ./build.sh --profile-frame-time
+#                                   -> build de diagnostico (PROFILE_FRAME_TIME=ON,
+#                                    junto con DISABLE_VSYNC=ON para que el
+#                                    numero de swap no quede tapado por la
+#                                    espera de vblank) que loguea cada ~60
+#                                    frames cuanto tiempo se va en trabajo de
+#                                    CPU (logica de juego + todas las llamadas
+#                                    GL de ese frame) vs. cuanto tiempo se va
+#                                    DENTRO de eglSwapBuffers (flush/present de
+#                                    GPU) -- responde "es esto CPU-bound
+#                                    (logica de juego, una conversion rara,
+#                                    etc.) o GPU-bound" con datos en vez de
+#                                    adivinar, ya que DOWNSAMPLE_RENDER (menos
+#                                    pixels a sombrear) no mostro ninguna
+#                                    mejora medible -- descarta fill-rate como
+#                                    sospechoso principal.
+#                                    build/dungeon_hunter_2_profile_test.vpk
+#      ./build.sh --shader-cache-test
+#                                   -> build experimental (DUMP_COMPILED_SHADERS=ON,
+#                                    ver PORTING_PLAN.md Fase 20) que cachea a
+#                                    disco (ux0:data/dungeon-hunter-2/shader_cache/)
+#                                    el binario COMPILADO Y LINKEADO de cada
+#                                    shader program via GL_OES_get_program_binary,
+#                                    para saltear glLinkProgram (y probablemente
+#                                    buena parte del compile GLSL en el driver
+#                                    PowerVR) la proxima vez que se vea el mismo
+#                                    par de shaders -- reduce el costo de
+#                                    pantallas de carga, no el FPS en combate.
+#                                    Soporte de esa extension en este build de
+#                                    PVR_PSP2 esta SIN CONFIRMAR -- si no esta
+#                                    disponible el codigo lo detecta en runtime
+#                                    y compila/linkea todo normal, sin cambio de
+#                                    comportamiento. build/dungeon_hunter_2_shader_cache_test.vpk
 #
 # Los flags de perf/diagnostico son opciones de CACHE de CMake -- invocar
 # este script con un modo y despues con otro en el MISMO BUILD_DIR (siempre
@@ -35,15 +68,24 @@ set -e
 # CMakeCache.txt antes de configurar, nunca se deja ninguno sin mencionar.
 
 VPK_OUTPUT_NAME="dungeon_hunter_2"
-CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF)
+CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=OFF)
 
 if [ "$1" = "--no-vsync-test" ]; then
     VPK_OUTPUT_NAME="dungeon_hunter_2_novsync_test"
-    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=ON -DDOWNSAMPLE_RENDER=OFF)
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=ON -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=OFF)
+elif [ "$1" = "--profile-frame-time" ]; then
+    VPK_OUTPUT_NAME="dungeon_hunter_2_profile_test"
+    # DISABLE_VSYNC=ON junto con esto -- ver el comentario de cabecera: si no,
+    # el numero de "eglSwapBuffers" queda dominado por la espera de vblank y
+    # no dice nada sobre cuanto tiempo de GPU real se esta usando.
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=ON -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=ON -DDUMP_COMPILED_SHADERS=OFF)
 elif [ "$1" = "--downsample-test" ]; then
     VPK_OUTPUT_NAME="dungeon_hunter_2_downsample_test"
     DS_N="${2:-2}"; DS_D="${3:-3}"
-    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=ON -DDS_NUM="$DS_N" -DDS_DEN="$DS_D")
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=ON -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=OFF -DDS_NUM="$DS_N" -DDS_DEN="$DS_D")
+elif [ "$1" = "--shader-cache-test" ]; then
+    VPK_OUTPUT_NAME="dungeon_hunter_2_shader_cache_test"
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=ON)
 elif [ -n "$1" ]; then
     echo "Error: flag desconocido '$1'. Ver el comentario de cabecera de este script para la lista completa."
     exit 1
@@ -86,7 +128,6 @@ rsync -a \
     "$PROJECT_DIR/" "$SRC_DIR/"
 
 echo "[2/3] Ejecutando CMake y Make (${1:-build normal})..."
-cd "$BUILD_DIR"
 
 read -p "¿Build de depuracion (logging detallado, DEBUG_SOLOADER)? [S/n] " DEBUG_OPTION
 if [[ "$DEBUG_OPTION" =~ ^[nN]$ ]]; then
@@ -96,8 +137,24 @@ else
 fi
 
 # Ver el comentario de cabecera: nunca dejar un flag sin mencionar entre
-# corridas con distinto modo.
-rm -f "$BUILD_DIR/CMakeCache.txt"
+# corridas con distinto modo. Borrar solo CMakeCache.txt NO alcanza para
+# CMAKE_BUILD_TYPE -- con el generador "Unix Makefiles" (el default de este
+# script, no se pasa -G), make no recompila un .c/.cpp cuyo mtime no cambio
+# aunque los flags del compilador sí (a diferencia de Ninja, que hashea la
+# linea de comando). Resultado real: alternar Debug/Release en el mismo
+# BUILD_DIR podía linkear un binario mitad compilado con -DDEBUG_SOLOADER y
+# mitad sin él, dependiendo de qué .o sobrevivía de la corrida anterior --
+# esto es lo que hacía parecer que "los parches gráficos dependen de modo
+# debug" al probar Release por primera vez. Borrar todo el directorio (es
+# solo un scratch dir en /tmp) garantiza una recompilación limpia siempre.
+# Importante: pararse afuera de BUILD_DIR (cd "$SRC_DIR") ANTES del rm -rf --
+# borrar el cwd actual del proceso lo deja sin working directory valido
+# ("Current working directory cannot be established"), haciendo fallar el
+# cmake/make que sigue.
+cd "$SRC_DIR"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
 
 cmake "$SRC_DIR" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE="$BUILD_TYPE" "${CMAKE_EXTRA_ARGS[@]}"
 make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)

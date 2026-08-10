@@ -21,6 +21,7 @@
 #include "utils/logger.h"
 #include "utils/dialog.h"
 #include "video.h"
+#include "audio.h"
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -28,6 +29,7 @@
 #include <psp2/rtc.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/touch.h>
+#include <psp2/power.h>
 
 #include <falso_jni/FalsoJNI.h>
 #include <so_util/so_util.h>
@@ -244,6 +246,25 @@ static void *so_sym_or_warn(const char *name) {
 }
 
 int main() {
+    // Clock the hardware at its rated maximum instead of whatever
+    // conservative default the kernel booted with -- standard practice for
+    // vitasdk homebrew (these are the chip's documented max frequencies, not
+    // an out-of-spec overclock) and, unlike every other perf lead chased in
+    // this project so far (PROFILE_FRAME_TIME, DOWNSAMPLE_RENDER,
+    // DISABLE_VSYNC), touches no rendering/game-logic code path at all --
+    // zero interaction with the color/render bugs under investigation.
+    // Logged with l_error (survives in Release, matches the [fps] counter's
+    // own reasoning in glutil.c) since this is a one-time boot event worth
+    // confirming actually took effect on real hardware, not per-frame spam.
+    {
+        int armRet = scePowerSetArmClockFrequency(444);
+        int busRet = scePowerSetBusClockFrequency(222);
+        int gpuRet = scePowerSetGpuClockFrequency(222);
+        int gpuXbarRet = scePowerSetGpuXbarClockFrequency(166);
+        l_error("[clock] ARM=444MHz(0x%08X) BUS=222MHz(0x%08X) GPU=222MHz(0x%08X) GPU_XBAR=166MHz(0x%08X)",
+                armRet, busRet, gpuRet, gpuXbarRet);
+    }
+
     // Explicitly initialize pthread to avoid EAGAIN (error 11) on pthread_create.
     // The linker sometimes strips the constructor in pthr.c.
     extern void pthread_init(void);
@@ -323,6 +344,7 @@ int main() {
     l_success("PVR_PSP2 initialized.");
 
     video_init();
+    audio_init();
 
     // Real Android sequence (DungeonHunter2.onCreate): nativeSetPhone is
     // called with the ACTUAL screen pixel dimensions before the

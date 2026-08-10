@@ -3,7 +3,9 @@
 #include "utils/dialog.h"
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -15,6 +17,13 @@ static EGLContext context;
 
 static int s_frame_counter = 0;
 static unsigned int s_draw_calls_since_diag = 0;
+
+#ifdef DUMP_COMPILED_SHADERS
+// Defined further below, alongside the rest of the shader binary cache --
+// forward-declared here so gl_init() (which calls it right after context
+// creation) doesn't need the whole cache implementation moved above it.
+static void shader_cache_init(void);
+#endif
 
 // "Enemigos invisibles" investigation: the periodic single-point-in-time
 // snapshot in gl_log_render_diag only ever caught 2 texture IDs (910013,
@@ -366,6 +375,10 @@ void gl_init() {
 
     l_success("PVR_PSP2 EGL context created.");
 
+#ifdef DUMP_COMPILED_SHADERS
+    shader_cache_init();
+#endif
+
 #ifdef DISABLE_VSYNC
     // Diagnostic only (causes tearing): answers "is our measured FPS
     // artificially capped by vsync, or genuinely below the refresh rate
@@ -384,7 +397,21 @@ void gl_init() {
 #endif
 }
 
+#ifdef PROFILE_FRAME_TIME
+#define PROFILE_FRAME_WINDOW 60
+static uint64_t s_last_swap_end_time = 0;
+static uint64_t s_cpu_us_total = 0;
+static uint64_t s_swap_us_total = 0;
+static int s_profile_frame_count = 0;
+#endif
+
 void gl_swap() {
+#ifdef PROFILE_FRAME_TIME
+    uint64_t now = sceKernelGetProcessTimeWide();
+    if (s_last_swap_end_time != 0) {
+        s_cpu_us_total += now - s_last_swap_end_time;
+    }
+#endif
 #ifdef DOWNSAMPLE_RENDER
     if (s_ds_fbo != 0) {
         // Blit the reduced-resolution FBO up onto the REAL default
@@ -417,9 +444,211 @@ void gl_swap() {
         glDisableVertexAttribArray(1);
     }
 #endif
+#ifdef PROFILE_FRAME_TIME
+    uint64_t swap_start = sceKernelGetProcessTimeWide();
+#endif
     eglSwapBuffers(display, surface);
     s_frame_counter++;
+#ifdef PROFILE_FRAME_TIME
+    uint64_t swap_end = sceKernelGetProcessTimeWide();
+    s_swap_us_total += swap_end - swap_start;
+    s_last_swap_end_time = swap_end;
+    s_profile_frame_count++;
+    if (s_profile_frame_count >= PROFILE_FRAME_WINDOW) {
+        double avg_cpu_ms = (double) s_cpu_us_total / s_profile_frame_count / 1000.0;
+        double avg_swap_ms = (double) s_swap_us_total / s_profile_frame_count / 1000.0;
+        // l_error, not l_info: l_info/debug/warn/success are ALL no-ops
+        // outside DEBUG_SOLOADER (see logger.h) -- this needs to survive in
+        // a Release build the same way the existing [fps] counter does
+        // (which is why that one is also tagged "error", not "info").
+        l_error("[frame_profile] over %d frames: avg CPU-submission=%.2fms avg eglSwapBuffers=%.2fms "
+               "(swap = GPU flush/present%s)",
+               s_profile_frame_count, avg_cpu_ms, avg_swap_ms,
+#ifdef DISABLE_VSYNC
+               ", no vblank wait -- DISABLE_VSYNC is on"
+#else
+               " + vblank wait"
+#endif
+        );
+        s_cpu_us_total = 0;
+        s_swap_us_total = 0;
+        s_profile_frame_count = 0;
+    }
+#endif
 }
+
+#ifdef DUMP_COMPILED_SHADERS
+// Shader binary disk cache -- this CMake option previously did something
+// completely different (dumped raw GLSL/CG SOURCE TEXT to disk for offline
+// analysis, e.g. the glsl_dump/*.glsl files already in this repo) and had NO
+// consuming code left anywhere in source/ (verified by grep) by the time
+// this was re-examined (2026-08-09) -- flipping it "on" alone did nothing.
+// Repurposed for its CMake description's actual promise ("cache compiled
+// shaders on disk"): caches whole LINKED PROGRAM BINARIES via the
+// GL_OES_get_program_binary extension, keyed by a hash of the attached
+// shaders' source text, so a program seen in an earlier run can skip real
+// glLinkProgram (and, on the PowerVR SGX driver this project targets, very
+// likely most of the GLSL front-end compile cost too) entirely.
+//
+// This engine only has a handful of distinct shader program permutations in
+// total (glsl_dump/ has 7 files from a past capture session) -- the ceiling
+// on how much this can help is real but modest; it exists to remove a
+// startup/loading-screen cost, not a per-frame one. GL_OES_get_program_binary
+// support on this specific PVR_PSP2 build is UNCONFIRMED -- every entry point
+// below checks for it at runtime (extension string + eglGetProcAddress) and
+// falls back to the exact original compile/link path with zero behavior
+// change if it's missing, so this is safe to ship even if the extension
+// turns out to be unsupported. Gated behind this same opt-in flag (default
+// OFF in the normal build, see CMakeLists.txt/build.sh) until hardware-
+// tested, same convention as DISABLE_VSYNC/DOWNSAMPLE_RENDER/PROFILE_FRAME_TIME.
+typedef void (GL_APIENTRY *PFNGLGETPROGRAMBINARYOESN)(GLuint program, GLsizei bufSize, GLsizei *length, GLenum *binaryFormat, void *binary);
+typedef void (GL_APIENTRY *PFNGLPROGRAMBINARYOESN)(GLuint program, GLenum binaryFormat, const void *binary, GLsizei length);
+#ifndef GL_PROGRAM_BINARY_LENGTH_OES
+#define GL_PROGRAM_BINARY_LENGTH_OES 0x8741
+#endif
+
+static PFNGLGETPROGRAMBINARYOESN p_glGetProgramBinaryOES = NULL;
+static PFNGLPROGRAMBINARYOESN p_glProgramBinaryOES = NULL;
+static int s_shader_cache_supported = 0;
+#define SHADER_CACHE_MAX_BINARY (64 * 1024)
+static unsigned char s_shader_cache_buf[SHADER_CACHE_MAX_BINARY];
+
+static void shader_cache_init(void) {
+    const char *ext = (const char *) glGetString(GL_EXTENSIONS);
+    if (!ext || !strstr(ext, "GL_OES_get_program_binary")) {
+        l_error("[shader_cache] GL_OES_get_program_binary not advertised by this driver -- "
+                "disabled, every shader compiles/links normally (no behavior change)");
+        return;
+    }
+    p_glGetProgramBinaryOES = (PFNGLGETPROGRAMBINARYOESN) eglGetProcAddress("glGetProgramBinaryOES");
+    p_glProgramBinaryOES = (PFNGLPROGRAMBINARYOESN) eglGetProcAddress("glProgramBinaryOES");
+    if (!p_glGetProgramBinaryOES || !p_glProgramBinaryOES) {
+        l_error("[shader_cache] extension string present but eglGetProcAddress returned NULL -- disabled");
+        return;
+    }
+    sceIoMkdir(DATA_PATH "shader_cache", 0777);
+    s_shader_cache_supported = 1;
+    l_success("[shader_cache] GL_OES_get_program_binary available -- disk cache enabled at "
+              DATA_PATH "shader_cache/");
+}
+
+// FNV-1a -- a collision here would only ever cause a stale-looking binary to
+// be tried against glProgramBinaryOES, which still gets independently
+// verified via GL_LINK_STATUS below before being trusted, so it can't
+// silently corrupt anything; not worth a stronger hash for ~7 distinct
+// shaders total in this engine.
+static uint32_t fnv1a(uint32_t hash, const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *) data;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= p[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+#define MAX_SHADER_CACHE_SHADERS 64
+#define MAX_SHADER_CACHE_PROGRAMS 32
+typedef struct { GLuint shader; uint32_t hash; } CachedShaderHash;
+static CachedShaderHash s_shader_hashes[MAX_SHADER_CACHE_SHADERS];
+static int s_shader_hash_count = 0;
+
+typedef struct { GLuint program; uint32_t combined_hash; int shader_count; } CachedProgramShaders;
+static CachedProgramShaders s_program_shaders[MAX_SHADER_CACHE_PROGRAMS];
+static int s_program_shaders_count = 0;
+
+static void shader_cache_record_source(GLuint shader, GLsizei count, const GLchar *const *string) {
+    uint32_t hash = 2166136261u;
+    for (GLsizei i = 0; i < count; i++) {
+        if (string[i]) hash = fnv1a(hash, string[i], strlen(string[i]));
+    }
+    for (int i = 0; i < s_shader_hash_count; i++) {
+        if (s_shader_hashes[i].shader == shader) {
+            s_shader_hashes[i].hash = hash; // re-glShaderSource on the same object
+            return;
+        }
+    }
+    if (s_shader_hash_count >= MAX_SHADER_CACHE_SHADERS) return;
+    s_shader_hashes[s_shader_hash_count].shader = shader;
+    s_shader_hashes[s_shader_hash_count].hash = hash;
+    s_shader_hash_count++;
+}
+
+static CachedProgramShaders *shader_cache_find_or_track_program(GLuint program) {
+    for (int i = 0; i < s_program_shaders_count; i++) {
+        if (s_program_shaders[i].program == program) return &s_program_shaders[i];
+    }
+    if (s_program_shaders_count >= MAX_SHADER_CACHE_PROGRAMS) return NULL;
+    CachedProgramShaders *p = &s_program_shaders[s_program_shaders_count++];
+    p->program = program;
+    p->combined_hash = 2166136261u;
+    p->shader_count = 0;
+    return p;
+}
+
+static void shader_cache_record_attach(GLuint program, GLuint shader) {
+    CachedProgramShaders *p = shader_cache_find_or_track_program(program);
+    if (!p) return;
+    uint32_t shash = 0;
+    for (int i = 0; i < s_shader_hash_count; i++) {
+        if (s_shader_hashes[i].shader == shader) { shash = s_shader_hashes[i].hash; break; }
+    }
+    // Order-independent combine -- vertex/fragment can attach in either
+    // order, the cache key must land the same regardless.
+    p->combined_hash ^= (shash + 0x9e3779b9u + (p->shader_count << 6) + (p->shader_count >> 2));
+    p->shader_count++;
+}
+
+static void shader_cache_path(uint32_t hash, char *out, size_t outsz) {
+    snprintf(out, outsz, DATA_PATH "shader_cache/%08x.bin", hash);
+}
+
+// Returns 1 only if a cached binary existed AND the driver's own
+// GL_LINK_STATUS confirms it linked successfully -- any other outcome (file
+// missing, read error, driver rejects the binary as stale/incompatible) is
+// treated as a plain cache miss and the caller falls through to a real,
+// normal glLinkProgram with zero side effects from this attempt.
+static int shader_cache_try_load(GLuint program, uint32_t hash) {
+    char path[160];
+    shader_cache_path(hash, path, sizeof(path));
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    GLenum format = 0;
+    size_t got = fread(&format, sizeof(format), 1, f);
+    size_t len = got == 1 ? fread(s_shader_cache_buf, 1, sizeof(s_shader_cache_buf), f) : 0;
+    fclose(f);
+    if (got != 1 || len == 0) return 0;
+
+    p_glProgramBinaryOES(program, format, s_shader_cache_buf, (GLsizei) len);
+    GLint status = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &status);
+    if (status == GL_TRUE) {
+        l_success("[shader_cache] program=%u loaded from %s (%zu bytes) -- real glLinkProgram skipped",
+                  program, path, len);
+        return 1;
+    }
+    l_error("[shader_cache] program=%u cached binary REJECTED by driver (format=0x%x, %zu bytes) -- "
+            "falling back to a normal link", program, format, len);
+    return 0;
+}
+
+static void shader_cache_store(GLuint program, uint32_t hash) {
+    GLint binLen = 0;
+    glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH_OES, &binLen);
+    if (binLen <= 0 || binLen > SHADER_CACHE_MAX_BINARY) return;
+    GLenum format = 0;
+    GLsizei outLen = 0;
+    p_glGetProgramBinaryOES(program, binLen, &outLen, &format, s_shader_cache_buf);
+    if (outLen <= 0) return;
+    char path[160];
+    shader_cache_path(hash, path, sizeof(path));
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(&format, sizeof(format), 1, f);
+    fwrite(s_shader_cache_buf, 1, (size_t) outLen, f);
+    fclose(f);
+    l_success("[shader_cache] program=%u saved to %s (%d bytes, format=0x%x)", program, path, outLen, format);
+}
+#endif // DUMP_COMPILED_SHADERS
 
 void glCompileShader_soloader(GLuint shader) {
     glCompileShader(shader);
@@ -435,6 +664,14 @@ void glCompileShader_soloader(GLuint shader) {
 }
 
 void glLinkProgram_soloader(GLuint program) {
+#ifdef DUMP_COMPILED_SHADERS
+    if (s_shader_cache_supported) {
+        CachedProgramShaders *p = shader_cache_find_or_track_program(program);
+        if (p && shader_cache_try_load(program, p->combined_hash)) {
+            return; // cache hit, driver-verified -- real glLinkProgram intentionally skipped
+        }
+    }
+#endif
     glLinkProgram(program);
 
     GLint status = GL_FALSE;
@@ -445,11 +682,20 @@ void glLinkProgram_soloader(GLuint program) {
         glGetProgramInfoLog(program, sizeof(log), &len, log);
         l_error("glLinkProgram(%u) FAILED: %s", program, log);
     }
+#ifdef DUMP_COMPILED_SHADERS
+    else if (s_shader_cache_supported) {
+        CachedProgramShaders *p = shader_cache_find_or_track_program(program);
+        if (p) shader_cache_store(program, p->combined_hash);
+    }
+#endif
 }
 
 void glShaderSource_soloader(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
 #ifdef DEBUG_SOLOADER
     record_shader_variant(shader, count, string);
+#endif
+#ifdef DUMP_COMPILED_SHADERS
+    if (s_shader_cache_supported) shader_cache_record_source(shader, count, string);
 #endif
     glShaderSource(shader, count, (const GLchar **) string, length);
 }
@@ -461,6 +707,9 @@ void glAttachShader_soloader(GLuint program, GLuint shader) {
         TrackedProgram *p = find_or_track_program(program);
         if (p) p->alpha_map = 1;
     }
+#endif
+#ifdef DUMP_COMPILED_SHADERS
+    if (s_shader_cache_supported) shader_cache_record_attach(program, shader);
 #endif
     glAttachShader(program, shader);
 }
@@ -839,6 +1088,20 @@ void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transp
 // property investigation (CharProperties::PROPS_GetOpacity, confirmed
 // always 1.0) would ever have caught if this tint is applied via a
 // completely separate uniform rather than that property.
+// log_112.txt (2026-08-07): this diagnostic was shipped unthrottled and hit
+// 7,568 log lines / a GL pipeline-stalling glGetIntegerv() call EACH time in
+// a single session that only reached frame ~1229 -- FPS collapsed from a
+// steady ~14 to under 1 the moment this started firing repeatedly (same
+// location/program pair, called many times within one logical frame, most
+// likely a per-particle or per-instance tint uniform that's legitimately set
+// often). Same class of self-inflicted perf bug already learned once for
+// _GetProperty (see PORTING_PLAN.md Phase 12.2) -- throttled the same way:
+// dedupe by location, log only the first few hits per distinct location, and
+// skip the glGetIntegerv() GPU sync entirely once that location's budget is
+// spent, so a hot uniform stops costing anything past the first few frames.
+#define MAX_TRACKED_UNIFORM4_LOCATIONS 64
+#define MAX_LOGS_PER_UNIFORM4_LOCATION 3
+
 void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) {
 #ifdef DEBUG_SOLOADER
     for (GLsizei i = 0; i < count; i++) {
@@ -855,17 +1118,139 @@ void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) 
         int looks_like_color = v[0] >= 0.0f && v[0] <= 1.0f && v[1] >= 0.0f && v[1] <= 1.0f &&
                                 v[2] >= 0.0f && v[2] <= 1.0f && v[3] >= 0.0f && v[3] <= 1.0f;
         int near_zero_alpha = looks_like_color && v[3] < 0.05f;
-        if (has_nan_or_inf || near_zero_alpha) {
+        if (!has_nan_or_inf && !near_zero_alpha) {
+            continue;
+        }
+
+        static struct { GLint location; int log_count; } s_seen[MAX_TRACKED_UNIFORM4_LOCATIONS];
+        static int s_distinct_count;
+        static int s_overflowed;
+
+        int slot = -1;
+        for (int k = 0; k < s_distinct_count; k++) {
+            if (s_seen[k].location == location) {
+                slot = k;
+                break;
+            }
+        }
+        if (slot < 0) {
+            if (s_distinct_count < MAX_TRACKED_UNIFORM4_LOCATIONS) {
+                slot = s_distinct_count++;
+                s_seen[slot].location = location;
+                s_seen[slot].log_count = 0;
+            } else if (!s_overflowed) {
+                s_overflowed = 1;
+                l_warn("[gl_diag_uniform4] MAX_TRACKED_UNIFORM4_LOCATIONS (%d) hit -- further distinct "
+                       "locations not logged", MAX_TRACKED_UNIFORM4_LOCATIONS);
+                continue;
+            } else {
+                continue;
+            }
+        }
+        if (s_seen[slot].log_count < MAX_LOGS_PER_UNIFORM4_LOCATION) {
+            s_seen[slot].log_count++;
             GLint program = -1;
             glGetIntegerv(GL_CURRENT_PROGRAM, &program);
             l_warn("[gl_diag_uniform4] glUniform4fv(location=%d, vec %d/%d)=(%.3f,%.3f,%.3f,%.3f) program=%u "
-                   "frame=%d%s%s",
+                   "frame=%d%s%s (logged %d/%d for this location)",
                    location, i + 1, count, v[0], v[1], v[2], v[3], (GLuint) program, s_frame_counter,
-                   has_nan_or_inf ? " NAN_OR_INF" : "", near_zero_alpha ? " NEAR_ZERO_ALPHA" : "");
+                   has_nan_or_inf ? " NAN_OR_INF" : "", near_zero_alpha ? " NEAR_ZERO_ALPHA" : "",
+                   s_seen[slot].log_count, MAX_LOGS_PER_UNIFORM4_LOCATION);
         }
     }
 #endif
     glUniform4fv(location, count, value);
+}
+
+// New lead (2026-08-08, log_120.txt + user screenshot: enemies AND player
+// characters "casi transparentes", not fully invisible). A real dumped
+// fragment shader (glsl_dump/A6673032....glsl) does:
+//   color = texture2D(TextureSampler, vTexCoord0) + DiffuseColor;
+//   color *= vColor0;
+//   color.rgb *= color.a;
+//   gl_FragColor = color;
+// DiffuseColor is ADDITIVE -- its usual (0,0,0,0) is the neutral default, so
+// every NEAR_ZERO_ALPHA hit glUniform4fv_soloader above has logged on it is a
+// red herring, not this bug. vColor0 (fed by the Color0 vertex attribute) is
+// what actually gates final alpha via "color.rgb *= color.a" -- the opposite
+// of an older assumption in this file ("vertex alpha hardcoded to 1.0", true
+// for a different shader variant, not this one). When the engine has no
+// per-vertex color array bound, GLES convention is to fall back to a CONSTANT
+// value via glVertexAttrib4f/4fv (glVertexAttribPointer's own per-vertex path
+// isn't practically interceptable the same way -- it just points at a VBO).
+// If that constant fallback ever comes back (0,0,0,0) instead of the expected
+// opaque-white (1,1,1,1) -- same class of corrupted/uninitialized read
+// already confirmed once for CharProperties -- this reproduces "draws, zero
+// GL error, nearly invisible" exactly. Same throttled near-zero-alpha
+// heuristic as glUniform4fv_soloader above, keyed by attribute index instead
+// of uniform location.
+#define MAX_TRACKED_VERTEX_ATTRIBS 16
+#define MAX_LOGS_PER_VERTEX_ATTRIB 3
+
+#ifdef DEBUG_SOLOADER
+static void check_vertex_attrib4(GLuint index, const GLfloat *v) {
+    int has_nan_or_inf = 0;
+    for (int j = 0; j < 4; j++) {
+        if (isnan(v[j]) || isinf(v[j])) has_nan_or_inf = 1;
+    }
+    int looks_like_color = v[0] >= 0.0f && v[0] <= 1.0f && v[1] >= 0.0f && v[1] <= 1.0f &&
+                            v[2] >= 0.0f && v[2] <= 1.0f && v[3] >= 0.0f && v[3] <= 1.0f;
+    int near_zero_alpha = looks_like_color && v[3] < 0.05f;
+    if (!has_nan_or_inf && !near_zero_alpha) {
+        return;
+    }
+
+    static struct { GLuint index; int log_count; } s_seen[MAX_TRACKED_VERTEX_ATTRIBS];
+    static int s_distinct_count;
+    static int s_overflowed;
+
+    int slot = -1;
+    for (int k = 0; k < s_distinct_count; k++) {
+        if (s_seen[k].index == index) {
+            slot = k;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (s_distinct_count < MAX_TRACKED_VERTEX_ATTRIBS) {
+            slot = s_distinct_count++;
+            s_seen[slot].index = index;
+            s_seen[slot].log_count = 0;
+        } else if (!s_overflowed) {
+            s_overflowed = 1;
+            l_warn("[gl_diag_vattrib4] MAX_TRACKED_VERTEX_ATTRIBS (%d) hit -- further distinct "
+                   "attribute indices not logged", MAX_TRACKED_VERTEX_ATTRIBS);
+            return;
+        } else {
+            return;
+        }
+    }
+    if (s_seen[slot].log_count < MAX_LOGS_PER_VERTEX_ATTRIB) {
+        s_seen[slot].log_count++;
+        GLint program = -1;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+        l_warn("[gl_diag_vattrib4] glVertexAttrib4f(index=%u)=(%.3f,%.3f,%.3f,%.3f) program=%u frame=%d%s%s "
+               "(logged %d/%d for this index)",
+               index, v[0], v[1], v[2], v[3], (GLuint) program, s_frame_counter,
+               has_nan_or_inf ? " NAN_OR_INF" : "", near_zero_alpha ? " NEAR_ZERO_ALPHA" : "",
+               s_seen[slot].log_count, MAX_LOGS_PER_VERTEX_ATTRIB);
+    }
+}
+#endif
+
+void glVertexAttrib4f_soloader(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
+#ifdef DEBUG_SOLOADER
+    const GLfloat v[4] = {x, y, z, w};
+    check_vertex_attrib4(index, v);
+#endif
+    glVertexAttrib4f(index, x, y, z, w);
+}
+
+void glVertexAttrib4fv_soloader(GLuint index, const GLfloat *v) {
+#ifdef DEBUG_SOLOADER
+    check_vertex_attrib4(index, v);
+#endif
+    glVertexAttrib4fv(index, v);
 }
 
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,

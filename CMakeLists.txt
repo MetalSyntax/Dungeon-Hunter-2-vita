@@ -96,6 +96,23 @@ if (DOWNSAMPLE_RENDER)
   add_definitions(-DDOWNSAMPLE_RENDER -DDS_NUM=${DS_NUM} -DDS_DEN=${DS_DEN})
 endif()
 
+# User confirmed DOWNSAMPLE_RENDER made no measurable difference -- rules out
+# a fill-rate/pixel-shading bottleneck (fewer pixels to shade should have
+# helped if that were it). DISABLE_VSYNC alone isn't enough to tell CPU-bound
+# apart from GPU-bound either -- a capped eglSwapBuffers() could be waiting on
+# vblank OR just waiting for the GPU to finish real work. This splits gl_swap()
+# into two measured halves so which one actually dominates a slow frame is
+# visible directly instead of guessed at (e.g. a hypothesized "weird NEON
+# conversion" running every frame): time elapsed since the previous gl_swap()
+# call returned (all game logic + every GL call this frame, i.e. CPU-side
+# submission cost) vs. time spent inside eglSwapBuffers() itself (GPU
+# flush/present + vblank wait, if any). Combine with DISABLE_VSYNC to strip
+# the vblank wait out of the second number too.
+option(PROFILE_FRAME_TIME "Diagnostic: log the CPU-submission vs eglSwapBuffers() time split every ~60 frames" OFF)
+if (PROFILE_FRAME_TIME)
+  add_definitions(-DPROFILE_FRAME_TIME)
+endif()
+
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
@@ -108,6 +125,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/java.c
                source/patch.c
                source/video.cpp
+               source/audio.cpp
                source/reimpl/bits/_ctype.c
                source/reimpl/errno.c
                source/reimpl/io.c

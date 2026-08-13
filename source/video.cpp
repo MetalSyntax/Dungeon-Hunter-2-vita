@@ -1,28 +1,9 @@
-// Cutscene playback via the Vita's native SceAvPlayer, wired into
-// GLMediaPlayer_loadMovie (java.c). Ported from the Prince of Persia Classic
-// Vita port's source/video.cpp (same soloader lineage, hardware-confirmed
-// there across several rounds) -- see that project's Fixes_Log.md #16-#19 for
-// the original debugging history. Two things differ here because this
-// project's graphics stack is different:
-//
-//  * No vitaGL: this project renders through the real PVR_PSP2 GLES2 driver
-//    (source/utils/glutil.c), a GLES2-only context with no fixed-function
-//    matrix stack/immediate-mode arrays. draw_video_frame() below is a small
-//    dedicated GLSL ES program (compiled with the same glCompileShader_/
-//    glLinkProgram_soloader status-checking wrappers glutil.c already proves
-//    work against the real on-device GLSL compiler) instead of the
-//    glOrthof/glVertexPointer calls the vitaGL/GLES1 build used. Buffer
-//    presentation goes through this project's own gl_swap() (glutil.h)
-//    instead of vglSwapBuffers().
-//  * SceAvPlayer's memory-allocator/event/file-replacement setup and the NV12
-//    (Y + interleaved UV) -> RGB565 NEON conversion are UNCHANGED: none of
-//    that touches vitaGL/GLES at all (memalign/free, a dedicated
-//    sceKernelAllocMemBlock CDRAM/PHYCONT block per texture allocation +
-//    sceGxmMapMemory, and plain NEON intrinsics), so it carries over as-is.
-//
-// Same never-hangs contract as the original: video_play() always returns
-// (natural end, user skip, or any open/init failure), so the caller can
-// unconditionally poke videoDone afterwards.
+/**
+ * @file video.cpp
+ * @brief Cutscene video playback using SceAvPlayer hardware decoder.
+ * @details Refer to technical documentation in Docs/video_comments.md for details on
+ *          CDRAM/PHYCONT memory allocation, GPU-accelerated NV12 YUV conversion, and GLES2 rendering.
+ */
 
 #include "video.h"
 #include "utils/logger.h"
@@ -53,11 +34,10 @@ static unsigned gRgbBufCap = 0;
 static unsigned char *gYuvScratch = NULL;
 static unsigned gYuvScratchCap = 0;
 
-// --- SceAvPlayer file I/O: plain sceIo, with visibility into how far the
-// player actually got into the file before giving up (see the original
-// project's file-level comment for why this exists instead of leaving
-// fileReplacement unset -- it's the difference between "silent black
-// screen" and a log that shows open/size/read results). ---
+/**
+ * @struct AvFileCtx
+ * @brief Context structure for SceAvPlayer file replacement callbacks.
+ */
 struct AvFileCtx {
     SceUID fd;
     uint64_t total_read;
@@ -101,9 +81,9 @@ static uint64_t av_file_size(void *p) {
     return (uint64_t) end;
 }
 
-// --- SceAvPlayer event callback: the player's own diagnostic channel --
-// every state transition, and (WARNING_ID) the actual error code on a silent
-// abort, arrives here instead of just IsActive flipping to false. ---
+/**
+ * @brief Event and diagnostic callbacks for SceAvPlayer.
+ */
 static const char *av_event_name(int32_t id) {
     switch (id) {
         case 0x01: return "STATE_STOP";
@@ -128,16 +108,6 @@ static void av_event_cb(void *p, int32_t eventId, int32_t sourceId, void *eventD
     }
 }
 
-// --- SceAvPlayer memory: general allocations to the newlib heap (memalign/
-// free -- AvPlayer makes many small internal allocations at startup;
-// backing each with its own kernel memblock exhausts the process's memblock
-// limit before the player finishes activating), texture/frame-buffer
-// allocations to a DEDICATED kernel memblock per allocation (CDRAM, falling
-// back to PHYCONT), sceGxmMapMemory'd -- the pattern proven on real hardware
-// by OpenFMV and carried over unchanged from the Prince of Persia port. This
-// is independent of vitaGL/PVR_PSP2: sceGxm is the shared low-level graphics
-// API underneath either driver, and mapping memory into it doesn't touch
-// whichever GL driver happens to be using it for rendering. ---
 #define AV_FB_ALIGNMENT 0x40000
 #define AV_ALIGN_MEM(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
@@ -157,6 +127,9 @@ static void av_free(void *arg, void *ptr) {
 #define AV_TEX_MAX_BLOCKS 8
 static struct { void *base; SceUID uid; } gAvTexBlocks[AV_TEX_MAX_BLOCKS];
 
+/**
+ * @brief Texture memory allocator targeting CDRAM with automatic fallback to PHYCONT.
+ */
 static void *av_alloc_texture(void *arg, uint32_t alignment, uint32_t size) {
     (void) arg;
     uint32_t req_align = alignment, req_size = size;
@@ -167,14 +140,11 @@ static void *av_alloc_texture(void *arg, uint32_t alignment, uint32_t size) {
     SceKernelAllocMemBlockOpt opt;
     memset(&opt, 0, sizeof(opt));
     opt.size = sizeof(opt);
-    opt.attr = 0x00000004U; // SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT
+    opt.attr = 0x00000004U;
     opt.alignment = alignment;
     SceUID blk = sceKernelAllocMemBlock("av_tex", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, size, &opt);
     SceUID usedType = SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW;
     if (blk < 0) {
-        // Retry once from the PHYCONT partition (a separate physical pool
-        // from CDRAM) before failing for real -- same fallback the source
-        // project needed on real hardware when CDRAM was tight.
         SceUID blk2 = sceKernelAllocMemBlock("av_tex_phycont", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW, size, &opt);
         if (blk2 < 0) {
             l_error("video: texture memblock alloc FAILED on both CDRAM (0x%08X) and PHYCONT (0x%08X) (req align=%u size=%u -> size=%u)",
@@ -220,11 +190,9 @@ static void av_free_texture(void *arg, void *ptr) {
     l_warn("video: texture free for unknown ptr %p (leaking it)", ptr);
 }
 
-// --- NV12 (Y plane + interleaved U/V, each subsampled 2x2) -> RGB565, BT.601,
-// NEON-vectorized -- unchanged from the source project (pure C/NEON, no GL
-// dependency at all). See that project's video.cpp for the derivation notes;
-// kept verbatim here since it's already proven correct on real hardware. ---
-
+/**
+ * @brief NV12 (YUV420p) to RGB565 color conversion using ARM NEON intrinsics.
+ */
 static int CV_R[256];
 static int CV_G[256];
 static int CU_G[256];
@@ -352,32 +320,6 @@ static void yuv420p_to_rgb565(const unsigned char *src, unsigned w, unsigned h, 
     }
 }
 
-// --- GLES2 fullscreen-quad draw (replaces the vitaGL/GLES1 immediate-mode
-// path: no glMatrixMode/glOrthof/glVertexPointer in a GLES2-only context).
-// Same shader-compile/link idiom as source/utils/glutil.c's DOWNSAMPLE_RENDER
-// blit program (glCompileShader_soloader/glLinkProgram_soloader, already
-// proven against the real on-device GLSL ES compiler by this project's own
-// shaders), just with a video-appropriate quad recomputed per (w,h). ---
-
-// Perf fix (log_106/107/108.txt): yuv420p_to_rgb565's CPU NEON conversion
-// measured at 228ms/frame for a 1280x720 cutscene (84% of total elapsed
-// time) -- confirmed NOT a Debug-vs-Release artifact (CMakeLists.txt applies
-// -O3 unconditionally to both build types; CMAKE_BUILD_TYPE only toggles the
-// DEBUG_SOLOADER log macro), so the CPU conversion itself is the genuine
-// bottleneck on real hardware. Standard fix for exactly this: skip the CPU
-// color conversion entirely and let the GPU's texture sampler + a few ALU
-// ops in the fragment shader do it -- upload the Y plane as a GL_LUMINANCE
-// texture and the interleaved NV12 UV plane as a GL_LUMINANCE_ALPHA texture
-// at half resolution (each (L,A) texel IS one (U,V) byte pair, no repacking
-// needed), then compute BT.601 RGB per-pixel in the fragment shader using
-// the exact same coefficients (91881/116130/22554/46802, all /65536) the CPU
-// path already used -- same math, same visual output, just running on the
-// GPU's fixed-function texture units instead of NEON. Bonus: sampling the
-// half-res UV texture with GL_LINEAR gives smooth bilinear chroma upsampling
-// for free, an improvement over the CPU path's nearest-block replication.
-// Gated behind a compile-time flag (not a runtime check) so a hardware
-// regression (wrong colors, black screen) has a one-line revert instead of
-// needing another round trip to re-add the proven CPU path.
 #define VIDEO_GPU_YUV_CONVERT 1
 
 static GLuint gVideoProgram = 0;
@@ -469,39 +411,12 @@ static bool gFirstDrawLogged = false;
 #define FIRST_DRAW_LOG(...) do { if (!gFirstDrawLogged) l_info(__VA_ARGS__); } while (0)
 
 #if VIDEO_GPU_YUV_CONVERT
-// Perf follow-up (log_109.txt): the GPU YUV conversion already took the
-// intro from 2.6 to 13.9 avg fps (45.6ms/frame total, down from 318ms), and
-// the user asked to push toward 25fps (needs ~40ms/frame). Rather than
-// guess at which of texture-upload/glDrawArrays/gl_swap (vsync wait) is the
-// remaining cost, split all three explicitly -- accumulated here and read
-// by video_play()'s per-loop summary line, same pattern as
-// convert_us_total/draw_us_total already use.
 uint64_t gVideoUploadUsTotal = 0;
 uint64_t gVideoGlDrawUsTotal = 0;
 uint64_t gVideoSwapUsTotal = 0;
-// log_125.txt: tex_upload stayed the dominant cost again (39.2ms/frame, ~75%
-// of the whole convert+draw budget) with no visibility into whether the
-// 4x-larger Y plane or the UV plane is actually responsible -- split the two
-// glTexSubImage2D calls' timing separately so the next log can confirm
-// whether this is proportional to bytes uploaded (bandwidth/twiddle-bound,
-// making a downsampled-texture experiment worthwhile) or dominated by fixed
-// per-call overhead instead (which downsampling wouldn't fix).
 uint64_t gVideoUploadYUsTotal = 0;
 uint64_t gVideoUploadUVUsTotal = 0;
 
-// log_126.txt confirmed the hypothesis above with real numbers: Y=24.2ms/frame
-// vs UV=11.5ms/frame is a 2.10x ratio, matching the 2.00x ratio of raw bytes
-// uploaded (1280x720 Y vs 640x360 UV) almost exactly -- this cost is
-// bandwidth/twiddle-bound, not fixed per-call driver overhead, so uploading
-// fewer bytes should give a near-linear win. The display already downscales
-// this 1280x720 source into a <=960x544 letterboxed quad (see REAL_SCREEN_W/H
-// below), so real detail is being thrown away at draw time regardless --
-// halving the uploaded resolution loses comparatively little of what's
-// actually visible. Downsamples via simple nearest-neighbor decimation (pick
-// every other sample, no averaging) rather than a box filter: this is a
-// cutscene on a CPU-bound port (Phase 14), and a strided copy is the cheapest
-// possible way to shrink the upload without adding meaningful CPU cost back.
-// One-line revert: set to 0.
 #define VIDEO_DOWNSAMPLE_UPLOAD 1
 
 #if VIDEO_DOWNSAMPLE_UPLOAD
@@ -509,8 +424,6 @@ static unsigned char *gVideoDsY = NULL;
 static unsigned char *gVideoDsUV = NULL;
 static unsigned gVideoDsYCap = 0, gVideoDsUVCap = 0;
 
-// src is a plain 8-bit luminance plane (srcW*srcH bytes) -- picks one sample
-// per 2x2 block (top-left) into a (srcW/2)x(srcH/2) destination.
 static void downsample2x_luminance(const unsigned char *src, unsigned srcW,
                                     unsigned char *dst, unsigned dstW, unsigned dstH) {
     for (unsigned y = 0; y < dstH; y++) {
@@ -522,9 +435,6 @@ static void downsample2x_luminance(const unsigned char *src, unsigned srcW,
     }
 }
 
-// src is interleaved (L,A) byte pairs (NV12's (U,V) read as GL_LUMINANCE_ALPHA,
-// srcW*srcH pairs) -- same 2x2-block top-left pick, applied per-pair so both
-// U and V come from the same source texel.
 static void downsample2x_luminance_alpha(const unsigned char *src, unsigned srcW,
                                           unsigned char *dst, unsigned dstW, unsigned dstH) {
     for (unsigned y = 0; y < dstH; y++) {
@@ -540,10 +450,9 @@ static void downsample2x_luminance_alpha(const unsigned char *src, unsigned srcW
 #endif
 
 #if VIDEO_GPU_YUV_CONVERT
-// yuvData layout matches gYuvScratch: w*h Y-plane bytes followed by the NV12
-// interleaved UV plane (w*h/2 bytes, (w/2)x(h/2) U/V byte pairs) -- exactly
-// what av_alloc_texture/the AVC decoder already produces, so this uploads it
-// straight through with no CPU-side repacking at all.
+/**
+ * @brief Renders video frames on GPU using custom YUV GLSL ES shaders.
+ */
 static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned h) {
     FIRST_DRAW_LOG("video: draw_video_frame ENTER (%ux%u, GPU YUV convert)", w, h);
     ensure_video_program();
@@ -554,9 +463,6 @@ static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned 
     unsigned uvW = w / 2, uvH = h / 2;
 
 #if VIDEO_DOWNSAMPLE_UPLOAD
-    // Only downsample when the source is big enough to halve cleanly -- a
-    // cutscene's resolution is fixed for its whole playback, so this either
-    // never triggers (tiny/odd source) or always does, no per-frame flapping.
     int canDownsample = (w >= 4 && h >= 4 && uvW >= 2 && uvH >= 2);
     unsigned texW = canDownsample ? w / 2 : w;
     unsigned texH = canDownsample ? h / 2 : h;
@@ -638,17 +544,10 @@ static void draw_video_frame(const unsigned char *yuvData, unsigned w, unsigned 
     gVideoUploadUsTotal += sceKernelGetProcessTimeWide() - uploadStart;
 #else
 static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned h) {
-    // Fine-grained, first-frame-only tracing: this is new code (no vitaGL
-    // equivalent proven on this driver yet), so if it ever hangs again the
-    // next log needs to show exactly which GL call never returned instead of
-    // just going silent after "GLES2 program ready".
     FIRST_DRAW_LOG("video: draw_video_frame ENTER (%ux%u)", w, h);
     ensure_video_program();
     FIRST_DRAW_LOG("video: ensure_video_program() returned");
 
-    // Allocate the texture's storage once per (w,h) -- a cutscene's
-    // resolution never changes mid-playback, and reallocating storage every
-    // frame (glTexImage2D) is a known stall source on embedded GL drivers.
     if (!gVideoTex || gVideoTexW != w || gVideoTexH != h) {
         FIRST_DRAW_LOG("video: creating texture storage...");
         if (!gVideoTex) glGenTextures(1, &gVideoTex);
@@ -669,11 +568,6 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     FIRST_DRAW_LOG("video: glTexSubImage2D returned (err=0x%04x)", glGetError());
 #endif
 
-    // Letterbox against the REAL physical 960x544 screen -- on real Android
-    // the cutscene plays in its own separate fullscreen Activity/View, with
-    // no relationship to this engine's internal 960x640 logical canvas (see
-    // glutil.c's compute_letterbox_rect), so this deliberately does NOT use
-    // that same letterbox.
     float srcAspect = (float) w / (float) h;
     float dstAspect = (float) REAL_SCREEN_W / (float) REAL_SCREEN_H;
     float qx0 = 0, qy0 = 0, qx1 = REAL_SCREEN_W, qy1 = REAL_SCREEN_H;
@@ -687,15 +581,11 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
         qx1 = qx0 + qw;
     }
 
-    // Pixel space (y=0 top) -> NDC (y=+1 top): x' = x/W*2-1, y' = 1 - y/H*2.
     float nx0 = qx0 / REAL_SCREEN_W * 2.0f - 1.0f;
     float nx1 = qx1 / REAL_SCREEN_W * 2.0f - 1.0f;
-    float ny0 = 1.0f - qy0 / REAL_SCREEN_H * 2.0f; // top edge
-    float ny1 = 1.0f - qy1 / REAL_SCREEN_H * 2.0f; // bottom edge
+    float ny0 = 1.0f - qy0 / REAL_SCREEN_H * 2.0f;
+    float ny1 = 1.0f - qy1 / REAL_SCREEN_H * 2.0f;
 
-    // Triangle strip: top-left, top-right, bottom-left, bottom-right.
-    // UV (0,0) at top-left matches row 0 of the CPU buffer being the
-    // frame's top scanline (yuv420p_to_rgb565 writes top-to-bottom).
     const GLfloat verts[8] = {
         nx0, ny0,  nx1, ny0,  nx0, ny1,  nx1, ny1,
     };
@@ -713,15 +603,6 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     GLint savedProgram = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &savedProgram);
 #if VIDEO_GPU_YUV_CONVERT
-    // Two sampler units now (Y on unit 0, UV on unit 1) -- DH2's own
-    // alpha_map(AL/AT) shader variant already uses BOTH texture units for
-    // its own diffuse+alpha-mask sampling (see glutil.c's
-    // [gl_diag_alphamap] diagnostic), so a LATER cutscene mid-game can very
-    // plausibly find unit 1 already bound to something real. Save/restore
-    // both units' bindings (and the active-unit pointer itself) explicitly,
-    // same rigor as glutil.c's own alphamap probe uses for this exact
-    // situation -- anything less risks the same class of "silently wrong
-    // texture bound" bug the GL_ARRAY_BUFFER fix above already closed once.
     GLint savedActiveTexture = 0;
     glGetIntegerv(GL_ACTIVE_TEXTURE, &savedActiveTexture);
     glActiveTexture(GL_TEXTURE0);
@@ -735,18 +616,6 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     GLint savedTex = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTex);
 #endif
-    // DH2's own 3D rendering is real VBO-based GLES2 (unlike the GLES1
-    // fixed-function immediate-mode path this file was ported from), so by
-    // the time a LATER cutscene plays mid-game, GL_ARRAY_BUFFER is very
-    // likely left bound to one of the engine's own vertex buffers. If it is,
-    // glVertexAttribPointer's last argument stops meaning "a client-side
-    // pointer to `verts`/`uvs`" and instead means "a byte offset into
-    // whatever buffer is bound" -- a classic GLES2 footgun that produces
-    // garbage/degenerate geometry (or nothing visible) with zero GL error,
-    // exactly the "everything reports success, still nothing draws" shape of
-    // this bug. Unbinding it here costs nothing on the intro video (nothing
-    // has bound a buffer yet at boot) and closes off this failure mode for
-    // every subsequent cutscene.
     GLint savedArrayBuffer = 0;
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &savedArrayBuffer);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -796,17 +665,6 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     gVideoGlDrawUsTotal += sceKernelGetProcessTimeWide() - glDrawStart;
 #endif
 
-    // Diagnostic for the "audio plays, screen stays black" report: reads
-    // back the actual framebuffer content right after our draw, before
-    // anything else touches it or the swap happens. If this is real,
-    // varying color data, the draw genuinely put a visible image in the
-    // color buffer and the black screen has to come from something AFTER
-    // this point (the swap/present path, or a later redraw clobbering it
-    // before the display scans it out). If it reads back solid black, the
-    // draw/upload itself is the dead end -- combined with the [video_diag]
-    // Y-plane scan above (which tells the DECODE side), between the two
-    // this settles which half of the pipeline is actually at fault instead
-    // of guessing.
     if (!gFirstDrawLogged) {
         unsigned char pixel[4] = {0, 0, 0, 0};
         glReadPixels(REAL_SCREEN_W / 2, REAL_SCREEN_H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
@@ -843,13 +701,9 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
     gFirstDrawLogged = true;
 }
 
-// --- cutscene audio: dedicated output thread, unchanged from the source
-// project -- decoupling the blocking sceAudioOutOutput() call from the same
-// loop that pays for the YUV conversion above, so a slow video frame can't
-// delay the next audio block (and vice versa). Uses only a mutex + short poll
-// for the producer/consumer handshake (no pthread_cond_t): this project's own
-// pthread port (source/reimpl/pthr.c) is the same lineage the source project
-// found crashes a statically-initialized cond var on first use. ---
+/**
+ * @brief Dedicated cutscene audio output thread using sceAudioOut (VOICE port).
+ */
 static pthread_mutex_t gCutAudioLock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned char *gCutAudioBuf[2] = { NULL, NULL };
 static unsigned gCutAudioBufCap = 0;
@@ -957,6 +811,10 @@ void video_shutdown() {
     }
 }
 
+/**
+ * @brief Plays a video file using SceAvPlayer.
+ * @param name File name or relative path of the video cutscene to play.
+ */
 void video_play(const char *name) {
     if (!gModuleLoaded) {
         l_warn("video: AVPLAYER module not loaded, skipping cutscene request \"%s\"", name ? name : "(null)");
@@ -967,13 +825,6 @@ void video_play(const char *name) {
         return;
     }
 
-    // Try DATA_PATH root first: log_095 showed every other asset in this
-    // port (shaders.pak, *.savegame, data/...) staged flat under DATA_PATH,
-    // not under a "files/" subfolder -- that subfolder only exists on real
-    // Android's own app-private storage layout (getSDFolder() + name), which
-    // doesn't apply to how this port's own assets got laid out on the memory
-    // card. Still try "files/<name>" as a second candidate in case that
-    // subfolder does get used for this file specifically.
     char path[512];
     bool found = false;
     SceIoStat st;
@@ -1035,18 +886,10 @@ void video_play(const char *name) {
 
     int wait_count = 0;
     while (!sceAvPlayerIsActive(handle) && wait_count < 500) {
-        sceKernelDelayThread(10000); // 10ms
+        sceKernelDelayThread(10000);
         wait_count++;
     }
 
-    // Sample the pad AFTER the activation wait (which can take up to 5s),
-    // not before it -- otherwise a button already released/re-pressed by the
-    // user during that wait (e.g. finishing a tap on the previous screen)
-    // reads as a fresh edge the instant this loop starts, producing an
-    // instantaneous false "skip" that looks identical to a real user skip
-    // in the log (see the [video_diag] investigation: log_101.txt showed
-    // exactly this -- a skip 0.10s after "loop starting" that the user says
-    // did not happen on their end).
     SceCtrlData pad_start;
     sceCtrlPeekBufferPositive(0, &pad_start, 1);
     uint32_t old_pad_buttons = pad_start.buttons;
@@ -1059,32 +902,9 @@ void video_play(const char *name) {
     int video_frames = 0, audio_frames = 0;
     bool audioOpenAttempted = false;
 
-    // Perf investigation (user-reported, log_104/105.txt: intro now decodes
-    // and draws real frames, confirmed on hardware, but only at ~2.6-2.7 avg
-    // fps for a 1280x720 cutscene). "loop exited" only ever reported the
-    // OUTCOME (video_frames over elapsed_sec) with no way to tell whether our
-    // own CPU work (NV12->RGB565 NEON conversion + glTexSubImage2D upload +
-    // draw + gl_swap) is the bottleneck vs. the hardware AVC decoder itself
-    // simply not producing frames faster than this for a 720p source --
-    // those need completely different fixes (optimize our code vs. nothing
-    // to optimize here at all). Timed separately per successful video frame,
-    // summed, and reported as a fraction of total elapsed time in the final
-    // summary line -- e.g. "convert+draw=3.1s (14% of 21.1s)" means the
-    // decoder itself, not our path, owns the other 86%.
-    //
-    // log_106.txt answered that question: convert+draw was 84% of elapsed
-    // (318.8ms/frame) -- so it's OUR code, not the hardware decoder, eating
-    // the time. Split the single bucket in two (yuv420p_to_rgb565's NEON
-    // CPU work vs. draw_video_frame's texture upload+GL draw+gl_swap) so the
-    // next log says which half is actually slow instead of guessing at an
-    // optimization blind.
     uint64_t convert_us_total = 0;
     uint64_t draw_us_total = 0;
 #if VIDEO_GPU_YUV_CONVERT
-    // draw_video_frame() accumulates into these file-scope globals (it has
-    // no other channel back to this function's summary line) -- reset here
-    // since a second video_play() call in the same process run (a later
-    // cutscene) must not carry over the previous one's totals.
     gVideoUploadUsTotal = 0;
     gVideoGlDrawUsTotal = 0;
     gVideoSwapUsTotal = 0;
@@ -1123,7 +943,7 @@ void video_play(const char *name) {
                 gRgbBufCap = gRgbBuf ? need : 0;
             }
 #endif
-            unsigned yuvNeed = w * h + w * h / 2; // NV12: Y plane + half-res interleaved UV
+            unsigned yuvNeed = w * h + w * h / 2;
             if (yuvNeed > gYuvScratchCap) {
                 free(gYuvScratch);
                 gYuvScratch = (unsigned char *) malloc(yuvNeed);
@@ -1134,28 +954,8 @@ void video_play(const char *name) {
 #else
             if (gRgbBuf && gRgbBufCap >= need && gYuvScratch && gYuvScratchCap >= yuvNeed) {
 #endif
-                // Drain the CDRAM/PHYCONT source with one sequential memcpy
-                // before the per-pixel conversion math (which reads it many
-                // times over) -- CPU reads from that memory are far slower
-                // than RAM on this hardware.
                 memcpy(gYuvScratch, video.pData, yuvNeed);
 
-                // Diagnostic for the "audio plays, screen stays black"
-                // report: the NV12->RGB565 conversion and GL upload/draw
-                // path below is ported verbatim from the Prince of Persia
-                // Vita port (proven working on real hardware there), so if
-                // the screen is still black despite that, the most likely
-                // divergence is upstream of all of it -- the CDRAM/PHYCONT
-                // memblock av_alloc_texture hands the hardware AVC decoder
-                // (source/video.cpp above) never actually getting written
-                // with real decoded pixels for this project's specific
-                // driver/init sequence (PVR_PSP2, not vitaGL). An
-                // all-zero Y plane converts to solid black through this
-                // exact math (Y=0 with U=V=128-bias-zero clips to (0,0,0)),
-                // which would look identical to a real GL/upload bug but
-                // has a completely different fix. Scanning only once
-                // (first video frame of the whole cutscene) is enough to
-                // answer the question either way.
                 if (video_frames == 1) {
                     unsigned char y_min = 255, y_max = 0;
                     bool y_all_same = true;
@@ -1174,10 +974,6 @@ void video_play(const char *name) {
 
                 uint64_t t0 = sceKernelGetProcessTimeWide();
 #if VIDEO_GPU_YUV_CONVERT
-                // No CPU color conversion step anymore -- draw_video_frame
-                // uploads the Y/UV planes as-is and the fragment shader does
-                // the YUV->RGB math. convert_us_total stays 0 so the summary
-                // line makes the shift obvious at a glance.
                 draw_video_frame(gYuvScratch, w, h);
                 uint64_t t2 = sceKernelGetProcessTimeWide();
                 draw_us_total += t2 - t0;
@@ -1205,10 +1001,6 @@ void video_play(const char *name) {
                 audioFrameLen = audio.details.audio.size / (audioChannels * sizeof(int16_t));
                 l_info("video: cutscene audio port: %u frames/channel (size=%u bytes, ch=%u)",
                        audioFrameLen, (unsigned) audio.details.audio.size, audioChannels);
-                // VOICE, not MAIN: MAIN requires exactly 48000Hz; VOICE has
-                // no such restriction and is a distinct port type from
-                // whatever this project's own (not yet implemented) BGM/SFX
-                // mixer will use later, so it can't collide with it either.
                 audioPort = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_VOICE, audioFrameLen,
                                                 (int) audio.details.audio.sampleRate, mode);
                 if (audioPort < 0) {
@@ -1243,7 +1035,7 @@ void video_play(const char *name) {
             l_info("video: successfully completed first loop iteration!");
         }
 
-        sceKernelDelayThread(1000); // avoid a tight spin when neither frame type is ready yet
+        sceKernelDelayThread(1000);
     }
 
     uint64_t play_end_time = sceKernelGetProcessTimeWide();

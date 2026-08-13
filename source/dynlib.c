@@ -9,7 +9,9 @@
 
 /**
  * @file  dynlib.c
- * @brief Resolving dynamic imports of the .so.
+ * @brief Resolving dynamic imports of libDungeonHunter2.so.
+ * @details Refer to technical documentation in Docs/dynlib_comments.md for details on
+ *          I/O wrappers, uname stub, and full symbol table mappings.
  */
 
 #include <psp2/kernel/clib.h>
@@ -71,8 +73,10 @@ extern void * __cxa_free_exception;
 extern void * __cxa_rethrow;
 extern void * __cxa_throw;
 extern void * __gxx_personality_v0;
-// Already provided by crtbegin.o -- declare, don't (re)define, or the linker
-// sees a duplicate symbol.
+
+/**
+ * @note C++ runtime symbols provided by crtbegin.o (extern declaration without redefinition).
+ */
 extern void *__dso_handle;
 extern void *_ZNSt8bad_castD1Ev;
 extern void *_ZTISt8bad_cast;
@@ -151,25 +155,25 @@ extern const short *BIONIC_toupper_tab_;
 
 static FILE __sF_fake[3];
 
-// Android's assert(3) with an extra message argument (bionic-specific,
-// signature: void __assert2(const char *file, int line, const char *func,
-// const char *msg)). Only libDungeonHunter2.so's asserts should ever reach
-// this -- treat it like any other assertion failure.
+/**
+ * @brief Replacement for Android Bionic assert(3) (__assert2).
+ */
 void __assert2(const char *file, int line, const char *func, const char *msg) {
     l_fatal("assert2: %s:%d (%s): %s", file ? file : "?", line, func ? func : "?", msg ? msg : "?");
     fatal_error("Assertion failed: %s:%d (%s): %s", file ? file : "?", line, func ? func : "?", msg ? msg : "?");
 }
 
-// Bionic/BSD extension, not in vitasdk's newlib -- equivalent to isfinite()
-// for float, just with Android's naming.
+/**
+ * @brief Bionic __isfinitef extension.
+ */
 int __isfinitef(float f) {
     return isfinite(f) ? 1 : 0;
 }
 
-// uname(2) -- some NDK builds call this just to log build info, not to
-// branch on the result content. Returns a plausible Linux/ARM identity
-// rather than failing, since some engines may treat a non-zero syscall
-// result as an actual error path.
+/**
+ * @struct fake_utsname
+ * @brief Simulated uname(2) system call structure for Android ARMv7 environment.
+ */
 struct fake_utsname {
     char sysname[65];
     char nodename[65];
@@ -187,24 +191,19 @@ int uname(struct fake_utsname *buf) {
     return 0;
 }
 
-// Data symbol import (not a function) -- confirmed via `objdump -T
-// libDungeonHunter2.so | grep UND` (see decompiled/libDungeonHunter2_armeabi-v7a/symbols.txt)
-// but its real size/consumer is not confirmed yet (Phase 3 TODO: cross-reference
-// against decompiled/libDungeonHunter2_armeabi-v7a/ghidra/out_ghidra.c for who
-// reads this and how many entries it expects). Zero-initialized placeholder
-// buffer large enough that an out-of-bounds read/write here doesn't immediately
-// fault -- resize once the real consumer is identified.
+/**
+ * @brief Reserved data buffer for imported JAVA_SOUNDS symbol.
+ */
 char JAVA_SOUNDS[4096];
 
 void *dlsym_soloader(void * handle, const char * symbol) {
-    // Usage example:
-    // if (strcmp("AMotionEvent_getAxisValue", symbol) == 0)
-    //    return &AMotionEvent_getAxisValue;
-
     l_error("dlsym: Unknown symbol \"%s\".", symbol);
     return NULL;
 }
 
+/**
+ * @brief Global dynamic symbol lookup mapping table (default_dynlib).
+ */
 so_default_dynlib default_dynlib[] = {
         // Common C/C++ internals
         { "_ZNSt8bad_castD1Ev", (uintptr_t)&_ZNSt8bad_castD1Ev },
@@ -447,15 +446,9 @@ so_default_dynlib default_dynlib[] = {
         { "stat", (uintptr_t)&stat_soloader },
         { "utime", (uintptr_t)&utime },
 
-        // feof/ferror/fflush/fgetc/fgets/fileno/fputc/fputs/fread/fseek/ftell/
-        // fwrite/getc/putc/setvbuf/ungetc all route through this project's
-        // own _soloader wrappers (source/reimpl/io.c) regardless of
-        // USE_SCELIBC_IO -- every one of them can receive either a real
-        // FILE* or a small-file-cache handle from fopen_soloader, and only
-        // the _soloader wrappers know how to safely tell the two apart. The
-        // wrappers themselves still call the real sceLibcBridge_*/plain
-        // variant internally for genuine FILE* handles, so behavior for
-        // uncached files is completely unchanged either way.
+        /**
+         * @note I/O functions routed to _soloader wrappers (source/reimpl/io.c).
+         */
         #ifdef USE_SCELIBC_IO
             { "fdopen", (uintptr_t)&sceLibcBridge_fdopen },
             { "fgetpos", (uintptr_t)&sceLibcBridge_fgetpos },
@@ -1033,8 +1026,8 @@ so_default_dynlib default_dynlib[] = {
 
 
         // Jmp
-        { "setjmp", (uintptr_t)&setjmp }, // TODO: May have different struct size?
-        { "longjmp", (uintptr_t)&longjmp }, // TODO: May have different struct size?
+        { "setjmp", (uintptr_t)&setjmp },
+        { "longjmp", (uintptr_t)&longjmp },
 
 
         // Signals
@@ -1068,9 +1061,9 @@ so_default_dynlib default_dynlib[] = {
         { "uncompress", (uintptr_t)&uncompress },
 
 
-        // Dungeon Hunter 2 -- gaps confirmed against the real import list in
-        // decompiled/libDungeonHunter2_armeabi-v7a/symbols.txt (see
-        // PORTING_PLAN.md Phase 2) that this generic table didn't already cover.
+        /**
+         * @note Specific imports required by libDungeonHunter2.so.
+         */
         { "_ZSt7nothrow", (uintptr_t)&_ZSt7nothrow },
         { "_ZnajRKSt9nothrow_t", (uintptr_t)&_ZnajRKSt9nothrow_t },
         { "__aeabi_d2f", (uintptr_t)&__aeabi_d2f },
@@ -1107,6 +1100,9 @@ so_default_dynlib default_dynlib[] = {
         { "JAVA_SOUNDS", (uintptr_t)&JAVA_SOUNDS },
 };
 
+/**
+ * @brief Resolves static and dynamic symbol imports for so_mod module.
+ */
 void resolve_imports(so_module* mod) {
     __sF_fake[0] = *stdin;
     __sF_fake[1] = *stdout;

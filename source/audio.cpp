@@ -1,28 +1,9 @@
-// See audio.h for the full picture. Summary: a small sceAudioOut mixer
-// (architecture proven by the sibling Prince-of-Persia-vita port, adapted
-// here for plain/IMA-ADPCM WAV instead of mp3) backing GLMediaPlayer's
-// previously-all-stub sound bridge in java.c.
-//
-// Catalog is shared between "Sound" (small, pooled, one-shot -- playSound
-// has no loop argument, confirmed against java.c's existing, previously-
-// verified stub signature) and "SoundBig" (long tracks, playSoundBig DOES
-// take a loop flag) -- both draw from the SAME Sounddefs[] id space, so one
-// cache indexed by sndId serves both.
-//
-// Scope deliberately NOT covered this pass (left as safe no-ops, matching
-// their pre-existing behavior in java.c, since their real argument lists
-// were never verified against the decompiled .so the way loadSound/
-// playSound's were -- see java.c's own top-of-file methodology note):
-// unloadSound/unloadSoundBig, pauseSound(Big), resumeSound(Big),
-// stopSound(Big) (single-instance stop by id), setVolume(Big), setPitch,
-// resetSound, destroySoundPool, initSoundPoolArray. Guessing a wrong
-// va_arg() type/count here reads garbage off the real stack (see PoP's own
-// Cocos2dxSound_playEffect fix comment for exactly this failure mode) --
-// worth doing once someone can cross-reference the real nativeInit call
-// sites in out_ghidra.c properly, not worth the crash risk to guess now.
-// playSoundBig's "fadeIn" argument is consumed (so the vararg stack stays
-// aligned for nothing after it) but not actually implemented as a ramp --
-// starts at full target volume immediately.
+/**
+ * @file audio.cpp
+ * @brief Implementation of sceAudioOut audio mixing subsystem and AudioTrack shim.
+ * @details Refer to technical documentation in Docs/audio_comments.md for details on
+ *          WAV/IMA-ADPCM decoding, VoxN container parser, and Vita audio architecture.
+ */
 
 #include "audio.h"
 #include "utils/logger.h"
@@ -40,15 +21,13 @@
 #include <math.h>
 
 #define MIX_RATE   44100
-// Frames per sceAudioOutOutput block (~46ms), same size proven on this
-// project's other Vita audio references -- gives the mixer thread (12-voice
-// resample + mix, not just a memcpy) slack before the hardware needs the
-// next block.
 #define MIX_GRAIN  2048
 #define MAX_VOICES 12
 
-// ---- WAV decode (self-contained, no external library) ----------------
-
+/**
+ * @struct SfxSample
+ * @brief Internal structure for decoded PCM audio sample storage.
+ */
 struct SfxSample {
     short *pcm;        // interleaved, native channel count, malloc'd
     unsigned frames;
@@ -56,9 +35,9 @@ struct SfxSample {
     int rate;
 };
 
-// Standard ITU/IMA ADPCM step and index-adjustment tables (the same public
-// tables used by every MS-IMA-ADPCM decoder -- this is a documented codec,
-// not reverse-engineered).
+/**
+ * @brief ITU/IMA-ADPCM standard lookup tables for step sizes and index shifts.
+ */
 static const short kImaStepTable[89] = {
         7,     8,     9,     10,    11,    12,    13,    14,    16,    17,
         19,    21,    23,    25,    28,    31,    34,    37,    41,    45,
@@ -94,9 +73,9 @@ static inline short ima_decode_nibble(ImaState *st, int nibble) {
     return (short) st->predictor;
 }
 
-// One block layout (Microsoft IMA-ADPCM, mono): 4-byte header (int16
-// predictor, uint8 step index, uint8 reserved) then (blockAlign-4)*2 nibbles
-// decoded sequentially -- samplesPerBlock total including the header sample.
+/**
+ * @brief Mono IMA-ADPCM block decoder.
+ */
 static void decode_ima_block_mono(const unsigned char *block, int blockAlign, short *out, int samplesPerBlock) {
     ImaState st;
     st.predictor = (short) (block[0] | (block[1] << 8));
@@ -111,9 +90,9 @@ static void decode_ima_block_mono(const unsigned char *block, int blockAlign, sh
     }
 }
 
-// Stereo block layout: an 8-byte header (4 bytes L, then 4 bytes R), then
-// alternating 4-byte (8-nibble) groups -- one group of 8 L samples, one
-// group of 8 R samples, repeating -- interleaved into `out` as it decodes.
+/**
+ * @brief Stereo IMA-ADPCM block decoder.
+ */
 static void decode_ima_block_stereo(const unsigned char *block, int blockAlign, short *out, int samplesPerBlock) {
     ImaState stL, stR;
     stL.predictor = (short) (block[0] | (block[1] << 8));
@@ -166,10 +145,9 @@ static bool decode_ima_adpcm(const unsigned char *raw, unsigned dataSize, int ch
     return true;
 }
 
-// Generic RIFF chunk walk -- does NOT assume "fmt " is immediately followed
-// by "data" (real files here have "fact" and a Gameloft-specific "voxu"
-// metadata chunk in between for the IMA-ADPCM ones), so unknown chunks are
-// skipped by their own declared size instead.
+/**
+ * @brief Generic RIFF/WAVE chunk parser for .wav files (PCM and IMA-ADPCM).
+ */
 static bool decode_wav_file(const char *path, SfxSample *out) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -210,7 +188,7 @@ static bool decode_wav_file(const char *path, SfxSample *out) {
             dataSize = chunkSize;
             haveData = true;
         } else {
-            fseek(f, (long) (chunkSize + (chunkSize & 1)), SEEK_CUR); // RIFF pads odd chunks to even
+            fseek(f, (long) (chunkSize + (chunkSize & 1)), SEEK_CUR);
         }
     }
 
@@ -259,16 +237,9 @@ static bool decode_wav_file(const char *path, SfxSample *out) {
     return ok;
 }
 
-// ---- VoxN container decode (data/sounds/m_level_*.vxn) -----------------
-//
-// A plain chunked container, structurally identical in spirit to RIFF/WAV:
-// [4-byte ASCII tag][4-byte LE length][length bytes of payload], repeated.
-// Verified generically across 3 different files -- see audio.h. Only "Afmt"
-// (same 3 fields as WAV's fmt: format tag/channels/rate, no block-align
-// field though, so samplesPerBlock is computed the same standard way as for
-// the .wav IMA-ADPCM files) and "Data" (the raw payload) are read; every
-// other chunk (adaptive-music metadata: loop segments, transition rules,
-// groups) is skipped by its own self-declared length, unparsed.
+/**
+ * @brief Decoder for VoxN (.vxn) audio container files.
+ */
 static bool decode_vxn_file(const char *path, SfxSample *out) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
@@ -280,22 +251,18 @@ static bool decode_vxn_file(const char *path, SfxSample *out) {
     }
     unsigned topLen = (unsigned) hdr[4] | ((unsigned) hdr[5] << 8) | ((unsigned) hdr[6] << 16) |
                       ((unsigned) hdr[7] << 24);
-    fseek(f, (long) topLen, SEEK_CUR); // version string + reserved bytes, not needed
+    fseek(f, (long) topLen, SEEK_CUR);
 
     int channels = 0, rate = 0, formatTag = 0;
     bool haveFmt = false, haveData = false;
     long dataOffset = 0;
     unsigned dataSize = 0;
 
-    // Same defensive cap as the WAV parser's chunk walk: a real file only
-    // ever has ~8 metadata chunks before "Data" (confirmed by inspection),
-    // so this only ever protects against a corrupt/foreign file with no
-    // "Data" tag from looping until EOF one 8-byte read at a time.
     for (int guard = 0; guard < 64 && !haveData; guard++) {
         unsigned char chdr[8];
         if (fread(chdr, 1, 8, f) != 8) break;
         for (int i = 0; i < 4; i++) {
-            if (chdr[i] < 0x20 || chdr[i] > 0x7e) { haveData = false; goto done; } // not ASCII -> not a chunk tag
+            if (chdr[i] < 0x20 || chdr[i] > 0x7e) { haveData = false; goto done; }
         }
         unsigned len = (unsigned) chdr[4] | ((unsigned) chdr[5] << 8) | ((unsigned) chdr[6] << 16) |
                        ((unsigned) chdr[7] << 24);
@@ -322,11 +289,6 @@ done:
         return false;
     }
 
-    // blockAlign isn't stored in Afmt (unlike WAV's extended fmt chunk) --
-    // every sample file inspected uses 1024, the standard block size this
-    // engine's own tools default to for 32kHz stereo IMA-ADPCM (matches the
-    // .wav music tracks exactly). samplesPerBlock is then the same fixed
-    // function of channels/blockAlign as everywhere else in this file.
     const int blockAlign = 1024;
     const int samplesPerBlock = (channels == 2) ? (((blockAlign - 8) / 8) * 8 + 1) : (((blockAlign - 4) * 2) + 1);
 
@@ -352,15 +314,11 @@ done:
     return ok;
 }
 
-// ---- catalog cache, shared by "Sound" and "SoundBig" (same Sounddefs id space) ----
-
+/**
+ * @brief Shared sound sample cache indexed by sound ID.
+ */
 static SfxSample *gCache[SOUNDDEFS_COUNT];
 
-// Sounddefs[] stores names with a ".ogg" extension left over from the
-// Android build (confirmed stale: the real files on the memory card, staged
-// verbatim from the extracted app data, are .wav -- see audio.h). Swap
-// whatever extension is there for .wav, same "trust the disk, not the old
-// name" approach as replacing a data file's assumed format outright.
 static void sound_path_for(int sndId, const char *ext, char *out, size_t outSize) {
     const char *name = Sounddefs[sndId];
     const char *dot = strrchr(name, '.');
@@ -379,8 +337,6 @@ static SfxSample *sfx_get(int sndId) {
     sound_path_for(sndId, "wav", path, sizeof(path));
     bool ok = decode_wav_file(path, s);
     if (!ok) {
-        // The 17 zone-ambience tracks have no .wav on disk at all -- try the
-        // VoxN container instead before giving up.
         sound_path_for(sndId, "vxn", path, sizeof(path));
         ok = decode_vxn_file(path, s);
     }
@@ -388,7 +344,7 @@ static SfxSample *sfx_get(int sndId) {
         l_warn("[audio] could not load sound %d (%s) from %s -- staying silent for this id",
                sndId, Sounddefs[sndId], path);
         free(s);
-        gCache[sndId] = (SfxSample *) -1; // sentinel: "tried, failed" vs "never tried"
+        gCache[sndId] = (SfxSample *) -1;
         return NULL;
     }
     gCache[sndId] = s;
@@ -401,25 +357,24 @@ static inline SfxSample *sfx_cached_or_null(int sndId) {
     return (s == (SfxSample *) -1) ? NULL : s;
 }
 
-// ---- mixer (own thread, gLock protects everything it reads) ----------
-
+/**
+ * @struct Voice
+ * @brief Polyphonic voice instance for sceAudioOut mixer.
+ */
 struct Voice {
-    SfxSample *smp; // NULL = free slot
+    SfxSample *smp;
     double pos;
-    double step;      // pitch * (src_rate / MIX_RATE)
-    float gain;        // current output gain, ramps toward targetGain over fadeFramesLeft
+    double step;
+    float gain;
     float targetGain;
-    float gainStep;    // per-mixed-frame delta; 0 when not fading
+    float gainStep;
     int fadeFramesLeft;
     bool loop;
     bool paused;
-    int sndId;    // GLMediaPlayer.playSound's id/instance, for pause/resume/stop/setVolume/
-    int instance; // setPitch lookups by (sndId, instance) -- verified signatures, see audio.h
+    int sndId;
+    int instance;
 };
 
-// Starts (or retargets) a linear gain ramp on a voice -- shared by
-// playSoundBig's fadeIn and setVolume(Big)'s own fade argument. fadeMs <= 0
-// means "apply immediately", matching the pre-fade behavior exactly.
 static void voice_fade_to(Voice *v, float target, int fadeMs) {
     if (target < 0.0f) target = 0.0f;
     if (target > 1.0f) target = 1.0f;
@@ -443,14 +398,14 @@ static volatile int gQuit = 0;
 static int gPort = -1;
 static SceUID gThread = -1;
 
-static Voice gVoices[MAX_VOICES]; // pooled one-shot "Sound"
-static Voice gBig;                // single slot for "SoundBig" (BGM/long loops)
+static Voice gVoices[MAX_VOICES];
+static Voice gBig;
 
 #define SOFT_CLIP_THRESHOLD 0.92f
 
-// Identity below threshold (normal single/dual-voice playback never reaches
-// it); above it, compress smoothly toward but never past full scale instead
-// of hard-clipping when several loud voices sum (BGM + a couple of SFX).
+/**
+ * @brief Soft-clipping compression using tanhf to prevent distortion when mixing voices.
+ */
 static inline short soft_clip16(int v) {
     const float full = 32768.0f;
     float x = (float) v / full;
@@ -479,7 +434,7 @@ static void mix_voice(Voice *v, int *acc, int frames) {
                 if (v->pos < 0.0) v->pos = 0.0;
                 idx = (unsigned) v->pos;
             } else {
-                v->smp = NULL; // finished
+                v->smp = NULL;
                 return;
             }
         }
@@ -496,7 +451,7 @@ static void mix_voice(Voice *v, int *acc, int frames) {
         }
         if (v->fadeFramesLeft > 0) {
             v->gain += v->gainStep;
-            if (--v->fadeFramesLeft == 0) v->gain = v->targetGain; // snap, avoid float drift
+            if (--v->fadeFramesLeft == 0) v->gain = v->targetGain;
         }
         acc[i * 2] += (int) (l * v->gain);
         acc[i * 2 + 1] += (int) (r * v->gain);
@@ -504,13 +459,11 @@ static void mix_voice(Voice *v, int *acc, int frames) {
     }
 }
 
-// Drains up to `frames` stereo frames queued by Misc_AudioTrackWrite (the
-// real active audio path -- see this file's AudioTrack section below) and
-// sums them into the SAME accumulator the GLMediaPlayer voices mix into, so
-// both sources share the one hardware port opened by audio_init() instead of
-// each wanting their own (see log_124.txt / PORT_FULL fix note below).
 static void drain_audiotrack_into(int *acc, int frames);
 
+/**
+ * @brief Main mixer thread processing active voices and draining AudioTrack FIFO buffer.
+ */
 static int mixer_thread(SceSize args, void *argp) {
     (void) args;
     (void) argp;
@@ -533,7 +486,7 @@ static int mixer_thread(SceSize args, void *argp) {
         for (int i = 0; i < MIX_GRAIN * 2; i++) {
             out[bufId][i] = soft_clip16(acc[i]);
         }
-        sceAudioOutOutput(gPort, out[bufId]); // blocks until queued
+        sceAudioOutOutput(gPort, out[bufId]);
         bufId ^= 1;
     }
     return 0;
@@ -583,12 +536,13 @@ void audio_shutdown(void) {
     memset(gCache, 0, sizeof(gCache));
 }
 
-// ---- GLMediaPlayer JNI surface -----------------------------------------
-
+/**
+ * @brief Implementation of GLMediaPlayer JNI functions.
+ */
 jint GLMediaPlayer_isSoundLoaded(jmethodID id, va_list args) {
     (void) id;
     int sndId = va_arg(args, jint);
-    (void) va_arg(args, jint); // instance -- cache is per-sndId, not per-instance
+    (void) va_arg(args, jint);
     return sfx_cached_or_null(sndId) ? 1 : 0;
 }
 
@@ -601,7 +555,7 @@ jint GLMediaPlayer_isSoundLoadedBig(jmethodID id, va_list args) {
 void GLMediaPlayer_loadSound(jmethodID id, va_list args) {
     (void) id;
     int sndId = va_arg(args, jint);
-    (void) va_arg(args, jint); // instance
+    (void) va_arg(args, jint);
     if (!gAudioReady) return;
     if (sndId >= 0 && sndId < SOUNDDEFS_COUNT) sfx_get(sndId);
 }
@@ -616,8 +570,8 @@ void GLMediaPlayer_loadSoundBig(jmethodID id, va_list args) {
 void GLMediaPlayer_playSound(jmethodID id, va_list args) {
     (void) id;
     int sndId = va_arg(args, jint);
-    int instance = va_arg(args, jint); // now tracked -- pauseSound/resumeSound/stopSound/setVolume/setPitch look voices up by (sndId, instance)
-    float vol = (float) va_arg(args, double); // floats promote to double through varargs
+    int instance = va_arg(args, jint);
+    float vol = (float) va_arg(args, double);
     if (!gAudioReady || sndId < 0 || sndId >= SOUNDDEFS_COUNT) return;
 
     SfxSample *s = sfx_get(sndId);
@@ -637,19 +591,17 @@ void GLMediaPlayer_playSound(jmethodID id, va_list args) {
         v->gain = v->targetGain = vol;
         v->fadeFramesLeft = 0;
         v->gainStep = 0.0f;
-        v->loop = false; // playSound has no loop argument -- confirmed signature, see audio.h
+        v->loop = false;
         v->paused = false;
         v->sndId = sndId;
         v->instance = instance;
-        v->smp = s;      // set last: marks the slot in-use for the mixer thread
+        v->smp = s;
     }
     pthread_mutex_unlock(&gLock);
 }
 
 void GLMediaPlayer_playSoundBig(jmethodID id, va_list args) {
     (void) id;
-    // Verified real signature "(IFII)V" (out_ghidra.c, GLMediaPlayer_nativeInit's
-    // own GetMethodID call) -- (int sndId, float vol, int loop, int fadeIn).
     int sndId = va_arg(args, jint);
     float vol = (float) va_arg(args, double);
     int loop = va_arg(args, jint);
@@ -670,10 +622,10 @@ void GLMediaPlayer_playSoundBig(jmethodID id, va_list args) {
     gBig.sndId = sndId;
     gBig.instance = -1;
     if (fadeInMs > 0) {
-        gBig.gain = 0.0f; // ramp up from silence instead of starting at full volume
+        gBig.gain = 0.0f;
         voice_fade_to(&gBig, vol, fadeInMs);
     } else {
-        voice_fade_to(&gBig, vol, 0); // applies immediately, same as before
+        voice_fade_to(&gBig, vol, 0);
     }
     gBig.smp = s;
     pthread_mutex_unlock(&gLock);
@@ -687,11 +639,6 @@ static Voice *find_voice_locked(int sndId, int instance) {
     }
     return NULL;
 }
-
-// pauseSound/resumeSound/stopSound/setVolume/setPitch: all verified real
-// signatures from out_ghidra.c's GLMediaPlayer_nativeInit (GetMethodID with
-// explicit signature strings, not guessed) -- "(II)V" for pause/resume/stop
-// (sndId, instance), "(IIF)V" for setVolume/setPitch (sndId, instance, value).
 
 void GLMediaPlayer_pauseSound(jmethodID id, va_list args) {
     (void) id;
@@ -734,7 +681,7 @@ void GLMediaPlayer_setVolume(jmethodID id, va_list args) {
     if (!gAudioReady) return;
     pthread_mutex_lock(&gLock);
     Voice *v = find_voice_locked(sndId, instance);
-    if (v) voice_fade_to(v, vol, 0); // setVolume itself carries no fade argument -- instant, matches signature
+    if (v) voice_fade_to(v, vol, 0);
     pthread_mutex_unlock(&gLock);
 }
 
@@ -744,21 +691,13 @@ void GLMediaPlayer_setPitch(jmethodID id, va_list args) {
     int instance = va_arg(args, jint);
     float pitch = (float) va_arg(args, double);
     if (!gAudioReady) return;
-    if (pitch < 0.25f) pitch = 0.25f; // sane clamp -- same range PoP's own SFX pitch uses
+    if (pitch < 0.25f) pitch = 0.25f;
     if (pitch > 4.0f) pitch = 4.0f;
     pthread_mutex_lock(&gLock);
     Voice *v = find_voice_locked(sndId, instance);
     if (v && v->smp) v->step = (double) pitch * ((double) v->smp->rate / (double) MIX_RATE);
     pthread_mutex_unlock(&gLock);
 }
-
-// pauseSoundBig/resumeSoundBig/stopSoundBig: verified single-int "(I)V"
-// signature (out_ghidra.c reuses the exact same signature-string constant,
-// DAT_008ecf40, already confirmed correct for loadSoundBig's own (int sndId)
-// shape) -- only one "Big" slot exists so the id itself isn't needed to
-// disambiguate, just consumed to keep the vararg stack aligned for nothing
-// after it (there is nothing after it, but this matches the pattern used
-// everywhere else in this file).
 
 void GLMediaPlayer_pauseSoundBig(jmethodID id, va_list args) {
     (void) id;
@@ -789,11 +728,7 @@ void GLMediaPlayer_stopSoundBig(jmethodID id, va_list args) {
 
 void GLMediaPlayer_setVolumeBig(jmethodID id, va_list args) {
     (void) id;
-    // Verified real signature "(IFI)V" (sndId, vol, fadeMs) -- the trailing
-    // int mirrors playSoundBig's own fadeIn, both confirmed real params on
-    // that method, so treating it the same way here is a direct, evidenced
-    // extrapolation rather than a blind guess.
-    (void) va_arg(args, jint); // sndId -- only one big slot, no need to match
+    (void) va_arg(args, jint);
     float vol = (float) va_arg(args, double);
     int fadeMs = va_arg(args, jint);
     if (!gAudioReady) return;
@@ -824,77 +759,27 @@ void GLMediaPlayer_stopAllBig(jmethodID id, va_list args) {
     pthread_mutex_unlock(&gLock);
 }
 
-// ---- android/media/AudioTrack shim -------------------------------------
-//
-// log_122.txt: audio_init() succeeded and the mixer thread ran, but
-// GLMediaPlayer.loadSound/playSound were never called even once in a full
-// session that reached real combat (confirmed by their total absence from
-// the log, while data/sounds/*.wav files WERE being fopen'd the whole time).
-// Traced the real path in out_ghidra.c: this engine embeds its own native
-// audio middleware, "vox::DriverAndroid" (matches the ".vxn"/"VoxN"
-// container name from audio.h's own notes) -- it decodes and mixes
-// everything itself in native code (explaining the direct fopen() calls),
-// confirmed running at 44100Hz stereo 16-bit PCM (SetDriverSampleRate(0xac44)
-// and a getMinBufferSize(44100, CHANNEL_OUT_STEREO=12, ENCODING_PCM_16BIT=2)
-// call, both in vox::DriverAndroid::_InitAT), and only touches Java at all
-// to push the final mixed buffer out via android.media.AudioTrack.write() --
-// which java.c's Misc_AudioTrackWrite stub has always read correctly (3 args:
-// byte[] data, int offset, int sizeInBytes) but then just returned
-// sizeInBytes without touching the actual bytes. THIS was the real silent
-// culprit the whole time, not GLMediaPlayer -- that JNI surface (audio.cpp's
-// GLMediaPlayer_* functions above) is very likely dead/legacy code in this
-// particular build and is kept only in case something else does call it.
-//
-// log_124.txt update: the first version of this shim opened its OWN second
-// sceAudioOut BGM port (audiotrack_ensure_port() below, now removed) and hit
-// SCE_AUDIO_OUT_ERROR_PORT_FULL (0x80260005) on every single call, forever --
-// audio_init()'s own mixer port above already holds one BGM port, and this
-// device's sceAudioOut BGM-port budget doesn't stretch to a second one for
-// this build/firmware combination (confirmed 100% reproducible on hardware).
-// Since this write() path is the REAL active audio (per the note above) and
-// GLMediaPlayer's own mixer is very likely dead code, the fix is to stop
-// asking for a second port at all: this shim now just fills gATFifo, and
-// mixer_thread's existing single sceAudioOutOutput(gPort, ...) call (the one
-// serving the GLMediaPlayer voices) drains and sums it in every grain --
-// ONE hardware port, ONE output thread, two input sources.
-//
-// write() is called repeatedly from Vox's own dedicated audio thread
-// (vox::DriverAndroid::UpdateThreadedAT) with MODE_STREAM semantics (the
-// real Android AudioTrack.write() blocks until there's room) -- mirrored
-// here by blocking (briefly sleeping, not spinning) while the FIFO is full
-// instead of silently dropping audio, so backpressure matches what Vox's own
-// thread expects.
-#define AT_FIFO_BYTES (MIX_GRAIN * 2 /* stereo */ * 2 /* bytes/sample */ * 4) // ~4 mixer grains' slack
+/**
+ * @file audio.cpp (AudioTrack Shim)
+ * @brief Interceptor for android.media.AudioTrack.write() calls from Vox middleware.
+ */
+#define AT_FIFO_BYTES (MIX_GRAIN * 2 * 2 * 4)
 
 static unsigned char gATFifo[AT_FIFO_BYTES];
 static int gATFifoLen = 0;
 static pthread_mutex_t gATLock = PTHREAD_MUTEX_INITIALIZER;
 
-// log_125.txt had ZERO log lines under any audiotrack-related tag -- the
-// PORT_FULL fix above (log_124.txt) removed the only diagnostic this path
-// ever had along with the code that caused it, so the very first real test
-// of Vox's actual output path (see the big comment above) produced no
-// evidence either way that write()/drain_audiotrack_into() ever ran. These
-// counters + throttled logging close that blind spot for the next session:
-// a first-call marker (confirms Vox is calling write() at all), a periodic
-// summary (confirms bytes keep flowing and the FIFO stays healthy), and a
-// throttled warning when the bounded wait below actually times out (the one
-// failure mode that would produce audible crackle/dropouts: Vox pushing
-// data faster than mixer_thread's ~46ms grain can drain it).
 static unsigned gATCallCount = 0;
 static unsigned long long gATBytesTotal = 0;
 static unsigned gATTimeoutCount = 0;
 static unsigned long long gATFramesDrained = 0;
 #define AT_LOG_EVERY_N_CALLS 500
 
-// Called only from mixer_thread, once per MIX_GRAIN-frame iteration -- sums
-// up to `frames` stereo frames out of gATFifo into `acc` (same accumulator
-// gBig/gVoices already mixed into) and slides any leftover bytes down.
 static void drain_audiotrack_into(int *acc, int frames) {
     pthread_mutex_lock(&gATLock);
     int wantBytes = frames * 2 * 2;
     int copyBytes = gATFifoLen < wantBytes ? gATFifoLen : wantBytes;
-    copyBytes -= copyBytes % 4; // whole stereo frames only
+    copyBytes -= copyBytes % 4;
     if (copyBytes > 0) {
         const short *src = (const short *) gATFifo;
         int n = copyBytes / 2;
@@ -914,7 +799,7 @@ jint Misc_AudioTrackWrite(jmethodID id, va_list args) {
     jint sizeInBytes = va_arg(args, jint);
 
     if (!jda || !jda->array || sizeInBytes <= 0) return sizeInBytes;
-    if (!gAudioReady) return sizeInBytes; // no output device -- still report success, matches prior stub contract
+    if (!gAudioReady) return sizeInBytes;
 
     gATCallCount++;
     if (gATCallCount == 1) {
@@ -925,10 +810,6 @@ jint Misc_AudioTrackWrite(jmethodID id, va_list args) {
     const unsigned char *src = (const unsigned char *) jda->array + offset;
     int remaining = (int) sizeInBytes;
 
-    // Bounded wait for room instead of an unbounded spin -- mixer_thread
-    // drains a full grain (~46ms) every iteration, so a few retries is
-    // always enough in practice; the bound just prevents a hang if the
-    // mixer thread ever isn't running.
     int guard = 0;
     while (remaining > 0 && guard < 2000) {
         pthread_mutex_lock(&gATLock);
@@ -942,17 +823,13 @@ jint Misc_AudioTrackWrite(jmethodID id, va_list args) {
         }
         pthread_mutex_unlock(&gATLock);
         if (remaining > 0) {
-            sceKernelDelayThread(1000); // 1ms -- let mixer_thread drain some
+            sceKernelDelayThread(1000);
             guard++;
         }
     }
 
     gATBytesTotal += (unsigned long long) (sizeInBytes - remaining);
     if (remaining > 0) {
-        // FIFO stayed full for the whole 2s guard window -- mixer_thread
-        // isn't keeping up, and these bytes are silently dropped (not
-        // written). This is the one path that would produce audible
-        // crackle/dropouts rather than just silence.
         gATTimeoutCount++;
         if (gATTimeoutCount <= 5) {
             l_warn("[audiotrack] write() timed out waiting for FIFO room -- dropped %d/%d bytes (timeout #%u)",

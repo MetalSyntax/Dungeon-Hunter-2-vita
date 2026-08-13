@@ -1,48 +1,14 @@
 /*
  * java.c
  *
- * "Java-side" native method handlers that libDungeonHunter2.so calls back
- * into via FalsoJNI (GetStaticMethodID + CallStaticObjectMethod/
- * CallStaticIntMethod/CallStaticVoidMethod/etc). Everything registered here
- * was found by cross-referencing THREE sources, not guessed from the
- * decompiled Java alone (see PORTING_PLAN.md Phase 3 and AI_WORKFLOW.md's
- * "verify on the actual artifact" rule):
- *
- *   1. decompiled/apk_jadx/sources/.../GLResLoader.java, GLMediaPlayer.java,
- *      Musicplayer.java, DungeonHunter2.java -- which static methods exist
- *      and what they do on real Android.
- *   2. `strings` on the real libDungeonHunter2.so -- every method the engine
- *      actually calls back caches its jmethodID in a variable named either
- *      mMethod<Name> (DungeonHunter2, Musicplayer) or <name>ID
- *      (GLResLoader, GLMediaPlayer), found via
- *      `strings libDungeonHunter2.so | grep -E '^mMethod|ID$'`.
- *   3. decompiled/libDungeonHunter2_armeabi-v7a/ghidra/out_ghidra.c -- the
- *      four *_nativeInit functions (search "GetStaticMethodID" callers) give
- *      the exact name + JNI signature string passed to GetStaticMethodID,
- *      and the wrapper functions (nativeXxx) confirm both the invocation
- *      function used (CallStatic{Void,Int,Object}Method) and the real
- *      argument count/order -- this caught real mismatches against the
- *      jadx-decompiled Java (e.g. GLResLoader.getResourceFull/getResourceBytes/
- *      getResourceLength are the ONLY 3 asset methods actually invoked from
- *      native, out of the ~10 static methods GLResLoader.java declares; the
- *      rest -- getResourceOpen/Read/Close/Skip, getRawResource,
- *      copyResourceFromAssets, copyMovieFileFromAssetsToTMP, getString --
- *      are Java-internal helpers never called back from native).
- *
- * FalsoJNI resolves methods purely by name (see
- * lib/falso_jni/FalsoJNI_ImplBridge.c getMethodIdByName) -- it does not
- * check the class or the signature string, so method names below must be
- * (and are, confirmed) unique across all 4 classes.
- *
- * Two failure classes matter here, same as documented in every sibling
- * port's port_progress.md (see AI_WORKFLOW.md §2): an unregistered
- * int/boolean-returning method silently returns FalsoJNI's "not found"
- * sentinel, which can be misread as a valid (even a dangerously "true"/large)
- * value by engine code that doesn't check the methodID for NULL first. Every
- * numeric method below is therefore registered with an explicit, sane
- * default even where the real behavior (audio, movies, Gameloft Live) isn't
- * implemented yet -- only the void/Object callbacks that are genuinely inert
- * right now are left as plain no-ops.
+ * "Java-side" native method handlers for FalsoJNI.
+ */
+
+/**
+ * @file  java.c
+ * @brief Native C/C++ static Java method handlers intercepted by FalsoJNI.
+ * @details Refer to technical documentation in Docs/java_comments.md for details on
+ *          GLResLoader, GLMediaPlayer, Musicplayer, DungeonHunter2, and Verizon billing stubs (VZ*).
  */
 
 #include <falso_jni/FalsoJNI_Impl.h>
@@ -65,24 +31,18 @@
 #include "sounddefs.h"
 #include "audio.h"
 
-/*
- * GLResLoader: asset bridge
- *
- * Files are expected under DATA_PATH"assets/<name>", the same convention
- * used by source/reimpl/asset_manager.cpp (the NDK AAssetManager
- * reimplementation this binary doesn't actually import -- see
- * PORTING_PLAN.md Phase 2 point 3 -- kept consistent anyway since Phase 8
- * will need to decide on ONE asset layout, not two). Actual asset
- * packaging/staging is Phase 8; until then these correctly report
- * "not found" instead of returning a stale/garbage sentinel.
+/**
+ * @brief Resolves relative asset file path under DATA_PATH"assets/<name>".
  */
-
 static int dh2_resolve_asset_path(const char *name, char *out, size_t out_size) {
     if (!name) return 0;
     snprintf(out, out_size, DATA_PATH "assets/%s", name);
     return access(out, F_OK) == 0;
 }
 
+/**
+ * @brief GLResLoader JNI method implementations.
+ */
 jobject GLResLoader_getResourceFull(jmethodID id, va_list args) {
     const char *name = (const char *) va_arg(args, jstring);
     char path[512];
@@ -154,21 +114,9 @@ jobject GLResLoader_getResourceBytes(jmethodID id, va_list args) {
     return (jobject) jda;
 }
 
-/*
- * GLMediaPlayer: sound bridge
- *
- * isSoundLoaded(Big)/loadSound(Big)/playSound(Big)/pause/resume/stop(Big)/
- * setVolume(Big)/setPitch/stopAll{Sounds,Pool,Big} are real now -- see
- * audio.cpp/audio.h (a sceAudioOut mixer backing this bridge). pause/resume/
- * stop/setVolume/setPitch's signatures were cross-referenced directly
- * against out_ghidra.c's GLMediaPlayer_nativeInit GetMethodID calls (real
- * signature strings: "(II)V" for pause/resume/stop, "(IIF)V" for setVolume/
- * setPitch) -- not guessed. unloadSound(Big)/resetSound/destroySoundPool/
- * initSoundPoolArray remain safe no-ops: lower-value lifecycle hints whose
- * exact semantics (does unload evict a still-in-use cache entry? does reset
- * mean something beyond stop?) weren't worth the same risk/effort tradeoff.
+/**
+ * @brief GLMediaPlayer JNI method implementations.
  */
-
 void GLMediaPlayer_unloadSound(jmethodID id, va_list args) { (void) args; }
 void GLMediaPlayer_unloadSoundBig(jmethodID id, va_list args) { (void) args; }
 void GLMediaPlayer_resetSound(jmethodID id, va_list args) { (void) args; }
@@ -180,14 +128,6 @@ jint GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
     (void) va_arg(args, jint);
     l_info("[Java] GLMediaPlayer.loadMovie(%s): playing via SceAvPlayer", name ? name : "(null)");
 
-    // Real Android backgrounds the app into a separate video Activity
-    // (MyVideoView) and its onResume() is what sets the engine's own
-    // "videoDone" flag to 1 once that Activity finishes -- GSInit::Update
-    // polls that same flag every frame while "waiting for the intro movie"
-    // and never advances past it otherwise. video_play() is synchronous
-    // (blocks until the video ends, is skipped, or fails to open/init) and
-    // always returns, so poking the flag right after it -- regardless of
-    // outcome -- reproduces that same never-hangs contract.
     if (name) {
         video_play(name);
     }
@@ -205,7 +145,7 @@ jint GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
 
 jint GLMediaPlayer_getWidth(jmethodID id, va_list args) {
     (void) args;
-    return 960; // Vita screen width -- matches GameGLSurfaceView sizing in main.c
+    return 960;
 }
 
 jint GLMediaPlayer_isMediaPlaying(jmethodID id, va_list args) {
@@ -215,24 +155,17 @@ jint GLMediaPlayer_isMediaPlaying(jmethodID id, va_list args) {
 
 jint GLMediaPlayer_detectPhoneLang(jmethodID id, va_list args) {
     (void) args;
-    return 0; // 0 = English, see GLMediaPlayer.detectPhoneLang()
+    return 0;
 }
 
 jobject GLMediaPlayer_getSDFolder(jmethodID id, va_list args) {
     (void) args;
-    return (jobject) DATA_PATH; // jstring is a raw char* in FalsoJNI, see FalsoJNI.c NewStringUTF
+    return (jobject) DATA_PATH;
 }
 
-/*
- * Musicplayer: background music playlist bridge
- *
- * No real playlist backend yet (Phase 7). Reporting zero playlists is
- * safe: DungeonHunter2.onCreate() calls Musicplayer.initMediaList() ->
- * nativeInitplayer() unconditionally, and the GetNumPlaylists()==0 path is
- * already handled gracefully by GetNumSongs()/GetSongName() in
- * Musicplayer.java (both bail out early on that case).
+/**
+ * @brief Musicplayer JNI method implementations.
  */
-
 jint Musicplayer_GetNumPlaylists(jmethodID id, va_list args) {
     (void) args;
     return 0;
@@ -255,23 +188,9 @@ jint Musicplayer_Getisplaying(jmethodID id, va_list args) {
     return 0;
 }
 
-/*
- * DungeonHunter2: misc engine -> Java callbacks
- *
- * Two groups get different treatment:
- *
- *  - VZ* (9 methods): a Verizon-carrier-specific IAP/billing flow
- *    (DungeonHunter2.java delegates these to a separate VZBilling class).
- *    This is a network/billing trap the same way ALicenseCheck is
- *    (PORTING_PLAN.md §1) -- never implemented for real, just reported as
- *    "never in progress / already errored" so the engine can't get stuck
- *    waiting on it or retry it.
- *  - Everything else: either a safe neutral default taken from what the
- *    real Java does on a fresh install / unrecognized device (see
- *    DungeonHunter2.java), or a plain no-op for UI hooks (Gameloft Live,
- *    IGP cross-promo, trophies) this port doesn't implement.
+/**
+ * @brief DungeonHunter2 JNI method implementations and network/billing stubs.
  */
-
 void DungeonHunter2_sendAppToBackground(jmethodID id, va_list args) {
     (void) args;
     l_info("[Java] DungeonHunter2.sendAppToBackground() (no-op)");
@@ -294,17 +213,17 @@ void DungeonHunter2_NotifyTrophy(jmethodID id, va_list args) {
 
 jint DungeonHunter2_Get_PhoneLanguage(jmethodID id, va_list args) {
     (void) args;
-    return 0; // English -- see DungeonHunter2.Get_PhoneLanguage() default branch
+    return 0;
 }
 
 jint DungeonHunter2_Get_PhoneManufacturer(jmethodID id, va_list args) {
     (void) args;
-    return 1; // "other" -- see DungeonHunter2.Get_PhoneManufacturer() default branch
+    return 1;
 }
 
 jint DungeonHunter2_Get_PhoneModel(jmethodID id, va_list args) {
     (void) args;
-    return 0; // default/unrecognized model
+    return 0;
 }
 
 void DungeonHunter2_Exit(jmethodID id, va_list args) {
@@ -315,12 +234,12 @@ void DungeonHunter2_Exit(jmethodID id, va_list args) {
 
 jint DungeonHunter2_isWifiAlive(jmethodID id, va_list args) {
     (void) args;
-    return 0; // no wifi -- keep the engine off any online path
+    return 0;
 }
 
 jint DungeonHunter2_isSupportMM(jmethodID id, va_list args) {
     (void) args;
-    return -1; // matches the real Java, which always returns -1 (dead code, see isSupportMM())
+    return -1;
 }
 
 void DungeonHunter2_openBrowser(jmethodID id, va_list args) {
@@ -330,26 +249,26 @@ void DungeonHunter2_openBrowser(jmethodID id, va_list args) {
 
 jint DungeonHunter2_unlockDemo(jmethodID id, va_list args) {
     (void) args;
-    return 0; // matches the real Java's return value
+    return 0;
 }
 
 void DungeonHunter2_lockDemo(jmethodID id, va_list args) { (void) args; }
 
 jint DungeonHunter2_DisableLaunchGame(jmethodID id, va_list args) {
     (void) args;
-    return 0; // f < 5 on a fresh install -- see DungeonHunter2.DisableLaunchGame()
+    return 0;
 }
 
 void DungeonHunter2_IncreaseLaunchTimes(jmethodID id, va_list args) { (void) args; }
 
 jint DungeonHunter2_VZIsInProgress(jmethodID id, va_list args) {
     (void) args;
-    return 0; // never in progress -- Verizon billing is never started, see note above
+    return 0;
 }
 
 jint DungeonHunter2_VZIsErrorOcurred(jmethodID id, va_list args) {
     (void) args;
-    return 1; // report an immediate error so any caller gives up cleanly instead of retrying
+    return 1;
 }
 
 void DungeonHunter2_VZRequestLogin(jmethodID id, va_list args) {
@@ -370,13 +289,13 @@ void DungeonHunter2_VZInitMobileNetwork(jmethodID id, va_list args) { (void) arg
 
 jint DungeonHunter2_VZIsMobileNetworkReady(jmethodID id, va_list args) {
     (void) args;
-    return 0; // never ready -- see note above
+    return 0;
 }
 
 void DungeonHunter2_VZRestoreNetworkState(jmethodID id, va_list args) { (void) args; }
 
-/*
- * Misc / Obfuscated methods missing in logs
+/**
+ * @brief Miscellaneous auxiliary and dummy Java methods.
  */
 jobject Misc_DummyByteArray(jmethodID id, va_list args) {
     (void) args;
@@ -389,7 +308,7 @@ jobject Misc_DummyByteArray(jmethodID id, va_list args) {
 
 jint Misc_IsWifiEnable(jmethodID id, va_list args) {
     (void) args;
-    return 0; // no wifi
+    return 0;
 }
 
 void Misc_DummyVoidInt(jmethodID id, va_list args) {
@@ -398,7 +317,7 @@ void Misc_DummyVoidInt(jmethodID id, va_list args) {
 
 jobject Misc_DummyAudioTrack(jmethodID id, va_list args) {
     (void) args;
-    return (jobject) 0x12345678; // Dummy object
+    return (jobject) 0x12345678;
 }
 
 jint Misc_GetMinBufferSize(jmethodID id, va_list args) {
@@ -406,18 +325,13 @@ jint Misc_GetMinBufferSize(jmethodID id, va_list args) {
     return 16384;
 }
 
-// Misc_AudioTrackWrite is implemented for real in audio.cpp now -- see its
-// own comment there for why this turned out to be the actual silent-audio
-// culprit (the engine's native Vox audio middleware, not GLMediaPlayer).
-
 void Misc_DummyVoid(jmethodID id, va_list args) {
     (void) args;
 }
 
-/*
- * JNI Methods
+/**
+ * @brief FalsoJNI method ID enumeration.
  */
-
 enum {
     M_getResourceFull = 1,
     M_getResourceBytes,
@@ -506,6 +420,9 @@ enum {
     M_AudioTrack_release,
 };
 
+/**
+ * @brief Mapping table of Java method names to FalsoJNI IDs (nameToMethodId).
+ */
 NameToMethodID nameToMethodId[] = {
         { M_getResourceFull,          "getResourceFull",         METHOD_TYPE_OBJECT },
         { M_getResourceBytes,         "getResourceBytes",        METHOD_TYPE_OBJECT },
@@ -691,17 +608,11 @@ MethodsVoid methodsVoid[] = {
         { M_AudioTrack_release,     Misc_AudioTrackRelease },
 };
 
-/*
- * JNI Fields
+/**
+ * @brief FalsoJNI field definitions (nameToFieldId).
  */
-
-// System-wide constant that applications sometimes request
-// https://developer.android.com/reference/android/content/Context.html#WINDOW_SERVICE
 char WINDOW_SERVICE[] = "window";
 
-// System-wide constant that's often used to determine Android version
-// https://developer.android.com/reference/android/os/Build.VERSION.html#SDK_INT
-// Possible values: https://developer.android.com/reference/android/os/Build.VERSION_CODES
 const int SDK_INT = 19; // Android 4.4 / KitKat
 
 NameToFieldID nameToFieldId[] = {

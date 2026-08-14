@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
 #include <gpu_es4/psp2_pvr_hint.h>
 
 static EGLDisplay display;
@@ -61,7 +62,6 @@ static int s_seen_textures_count = 0;
 // than N and we stopped counting", which the old code couldn't tell apart.
 static int s_seen_textures_overflowed = 0;
 
-#ifdef DEBUG_SOLOADER
 // "Enemigos invisibles" investigation: GL_Diffuse_L1_iPhone_FS/VS.glsl (the
 // shared lit-character shader template, see shaders.pak) hardcodes vertex
 // alpha to 1.0 and derives final alpha from the diffuse texture's own alpha
@@ -142,7 +142,6 @@ static TrackedProgram *find_or_track_program(GLuint program) {
     p->logged = 0;
     return p;
 }
-#endif // DEBUG_SOLOADER
 
 // Real physical Vita screen -- shared by glViewport_soloader's letterbox
 // math and (when DOWNSAMPLE_RENDER is on) the final upscale blit's target
@@ -337,28 +336,48 @@ void gl_init() {
     if (eglInitialize(display, NULL, NULL) != EGL_TRUE) { l_error("eglInitialize failed"); sceKernelExitProcess(0); }
 
     EGLConfig config;
-    EGLint num_config;
+    EGLint num_config = 0;
+    // Request 8-bit Stencil buffer for GameSWF Flash masks (HUD clipping)
     EGLint attrib_list[] = {
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
         EGL_ALPHA_SIZE, 8,
-        EGL_DEPTH_SIZE, 16,
-        EGL_STENCIL_SIZE, 0,
+        EGL_DEPTH_SIZE, 24,
+        EGL_STENCIL_SIZE, 8,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_NONE
     };
 
     if (eglChooseConfig(display, attrib_list, &config, 1, &num_config) != EGL_TRUE || num_config == 0) {
-        l_error("eglChooseConfig failed with error 0x%x", eglGetError());
-        sceKernelExitProcess(0);
+        EGLint attrib_list_fallback[] = {
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, 16,
+            EGL_STENCIL_SIZE, 8,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_NONE
+        };
+        if (eglChooseConfig(display, attrib_list_fallback, &config, 1, &num_config) != EGL_TRUE || num_config == 0) {
+            EGLint attrib_list_basic[] = {
+                EGL_DEPTH_SIZE, 16,
+                EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+                EGL_NONE
+            };
+            if (eglChooseConfig(display, attrib_list_basic, &config, 1, &num_config) != EGL_TRUE || num_config == 0) {
+                l_error("eglChooseConfig failed with error 0x%x", eglGetError());
+                sceKernelExitProcess(0);
+            }
+        }
     }
 
     {
         EGLint depth_bits = -1, stencil_bits = -1;
         eglGetConfigAttrib(display, config, EGL_DEPTH_SIZE, &depth_bits);
         eglGetConfigAttrib(display, config, EGL_STENCIL_SIZE, &stencil_bits);
-        l_success("EGL config: depth=%d stencil=%d (requested depth=16)", depth_bits, stencil_bits);
+        l_success("EGL config: depth=%d stencil=%d (requested stencil=8)", depth_bits, stencil_bits);
     }
 
     EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
@@ -372,6 +391,13 @@ void gl_init() {
         l_error("eglMakeCurrent failed with error 0x%x", eglGetError());
         sceKernelExitProcess(0);
     }
+
+    // Initialize all generic vertex attributes to (1.0, 1.0, 1.0, 1.0) so unbound attributes do not multiply color by zero
+    for (GLuint i = 0; i < 16; i++) {
+        glVertexAttrib4f(i, 1.0f, 1.0f, 1.0f, 1.0f);
+    }
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     l_success("PVR_PSP2 EGL context created.");
 
@@ -691,9 +717,7 @@ void glLinkProgram_soloader(GLuint program) {
 }
 
 void glShaderSource_soloader(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length) {
-#ifdef DEBUG_SOLOADER
     record_shader_variant(shader, count, string);
-#endif
 #ifdef DUMP_COMPILED_SHADERS
     if (s_shader_cache_supported) shader_cache_record_source(shader, count, string);
 #endif
@@ -701,13 +725,11 @@ void glShaderSource_soloader(GLuint shader, GLsizei count, const GLchar *const *
 }
 
 void glAttachShader_soloader(GLuint program, GLuint shader) {
-#ifdef DEBUG_SOLOADER
     int alpha_map = shader_has_alpha_map(shader);
     if (alpha_map == 1) {
         TrackedProgram *p = find_or_track_program(program);
         if (p) p->alpha_map = 1;
     }
-#endif
 #ifdef DUMP_COMPILED_SHADERS
     if (s_shader_cache_supported) shader_cache_record_attach(program, shader);
 #endif
@@ -715,13 +737,11 @@ void glAttachShader_soloader(GLuint program, GLuint shader) {
 }
 
 void glUseProgram_soloader(GLuint program) {
-#ifdef DEBUG_SOLOADER
     TrackedProgram *p = find_or_track_program(program);
     if (p && !p->logged) {
         p->logged = 1;
         l_info("[gl_shader_variant] program=%u alpha_map(AL/AT)=%d", program, p->alpha_map);
     }
-#endif
     glUseProgram(program);
 }
 
@@ -729,6 +749,12 @@ void glClearColor_soloader(GLclampf red, GLclampf green, GLclampf blue, GLclampf
     l_debug("glClearColor requested (%.2f, %.2f, %.2f, %.2f), forcing black",
             red, green, blue, alpha);
     glClearColor(0.0f, 0.0f, 0.0f, alpha);
+}
+
+void glClearColorx_soloader(GLclampx red, GLclampx green, GLclampx blue, GLclampx alpha) {
+    l_debug("glClearColorx requested (%d, %d, %d, %d), forcing black",
+            (int)red, (int)green, (int)blue, (int)alpha);
+    glClearColor(0.0f, 0.0f, 0.0f, (float)alpha / 65536.0f);
 }
 
 void gl_log_render_diag(int frame) {
@@ -902,30 +928,13 @@ static void log_first_draw_state(const char *call) {
 }
 
 void glEnable_soloader(GLenum cap) {
-    if (cap == GL_DEPTH_TEST) {
-        l_debug("glEnable(GL_DEPTH_TEST) at frame %d", s_frame_counter);
-    }
-    if (cap == GL_SCISSOR_TEST) {
-        // Diagnostic for the repeating-icon-column HUD bug: gl_diag2's
-        // periodic sampling never once caught scissor test enabled all of
-        // log_090.txt, but that's a sampling-timing gap, not proof the
-        // engine never enables it -- this logs every real toggle instead.
-        l_debug("glEnable(GL_SCISSOR_TEST) at frame %d", s_frame_counter);
-    }
     glEnable(cap);
 }
 
 void glDisable_soloader(GLenum cap) {
-    if (cap == GL_DEPTH_TEST) {
-        l_debug("glDisable(GL_DEPTH_TEST) at frame %d", s_frame_counter);
-    }
-    if (cap == GL_SCISSOR_TEST) {
-        l_debug("glDisable(GL_SCISSOR_TEST) at frame %d", s_frame_counter);
-    }
     glDisable(cap);
 }
 
-#ifdef DEBUG_SOLOADER
 static void track_seen_texture(void) {
     GLint tex = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
@@ -946,17 +955,6 @@ static void track_seen_texture(void) {
     s_seen_texture_programs[s_seen_textures_count] = program;
     s_seen_textures[s_seen_textures_count++] = (GLuint) tex;
 
-    // log_089 confirmed some combat-only (enemy) textures ARE drawn through
-    // an alpha_map==1 (AL/AT) program at least some of the time -- if that
-    // program's separate AlphaSampler unit (conventionally unit 1, DiffuseSampler
-    // being unit 0) isn't actually bound to a real texture for this draw,
-    // GLES2's defined behavior for sampling an unbound unit (texture object 0)
-    // is to return (0,0,0,0) -- exactly the "draws happen, alpha is silently
-    // zero" symptom this whole investigation is chasing. One-shot probe per
-    // newly-seen (texture, alpha-map program) pair, not every draw -- reads
-    // GL_ACTIVE_TEXTURE/GL_TEXTURE_BINDING_2D on units 0 and 1 and restores
-    // the active unit exactly afterward, so this is read-only and changes
-    // nothing the engine would ever observe.
     TrackedProgram *tp = find_or_track_program((GLuint) program);
     if (tp && tp->alpha_map == 1) {
         GLint prev_active = -1;
@@ -971,9 +969,7 @@ static void track_seen_texture(void) {
                (GLuint) tex, (GLuint) program, unit0_tex, unit1_tex);
     }
 }
-#endif
 
-#ifdef DEBUG_SOLOADER
 // Per-render-call geometry/texture attribution for the invisible-enemy
 // investigation -- see glutil.h's gl_diag_reset_render_track() comment.
 // Updated by every real draw call unconditionally (cheap: one branch, one
@@ -1010,29 +1006,24 @@ static void track_render_call(GLsizei count) {
     s_node_state.last_depth_test_enabled = glIsEnabled(GL_DEPTH_TEST);
     glGetBooleanv(GL_DEPTH_WRITEMASK, &s_node_state.last_depth_write_mask);
 }
-#endif
 
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
-#ifdef DEBUG_SOLOADER
     if (s_draw_calls_since_diag == 0) {
         log_first_draw_state("glDrawArrays");
     }
     s_draw_calls_since_diag++;
     track_seen_texture();
     track_render_call(count);
-#endif
     glDrawArrays(mode, first, count);
 }
 
 void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void *indices) {
-#ifdef DEBUG_SOLOADER
     if (s_draw_calls_since_diag == 0) {
         log_first_draw_state("glDrawElements");
     }
     s_draw_calls_since_diag++;
     track_seen_texture();
     track_render_call(count);
-#endif
     glDrawElements(mode, count, type, indices);
 }
 
@@ -1047,15 +1038,6 @@ void glDepthRangef_soloader(GLclampf n, GLclampf f) {
 }
 
 void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-#ifdef DEBUG_SOLOADER
-    // Sanity check for "draws happen, nothing appears" with no GL error: an
-    // all-zero or NaN/Inf matrix uploaded as a camera/projection/model uniform
-    // would collapse or fling geometry out of the clip volume silently. Only
-    // logs when actually degenerate, so this stays quiet on every normal frame.
-    // Gated behind DEBUG_SOLOADER, not just the log macro -- this scans 16
-    // floats on EVERY uniform upload (potentially several per draw call,
-    // thousands of draws/sec once the game is running), real CPU work that a
-    // no-op l_warn alone wouldn't have removed in Release.
     for (GLsizei i = 0; i < count; i++) {
         const GLfloat *m = value + (size_t) i * 16;
         int all_zero = 1;
@@ -1069,52 +1051,19 @@ void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transp
                    location, i + 1, count, s_frame_counter, all_zero, has_nan_or_inf);
         }
     }
-#endif
     glUniformMatrix4fv(location, count, transpose, value);
 }
 
-// Invisible-enemy investigation, next candidate after render()'s own
-// draw-call/texture/blend/depth state all came back clean in log_110.txt
-// (0 zero-draw-calls, valid nonzero textures, only 3 SUSPICIOUS blend/depth
-// hits in a full session with a reported invisible-then-visible enemy
-// transition) -- the geometry pipeline itself isn't showing the anomaly, so
-// the next most likely silent-invisibility mechanism is a plain vec4
-// uniform (a tint/color multiply, common in mobile shaders for exactly this
-// kind of per-instance opacity/fade effect) rather than the 4x4 matrices
-// glUniformMatrix4fv_soloader above already watches. A vec4 with a
-// near-zero 4th (alpha) component multiplied into the fragment color would
-// produce a fully invisible-but-successfully-drawn character with zero GL
-// error -- exactly the shape of this bug, and NOT something the opacity
-// property investigation (CharProperties::PROPS_GetOpacity, confirmed
-// always 1.0) would ever have caught if this tint is applied via a
-// completely separate uniform rather than that property.
-// log_112.txt (2026-08-07): this diagnostic was shipped unthrottled and hit
-// 7,568 log lines / a GL pipeline-stalling glGetIntegerv() call EACH time in
-// a single session that only reached frame ~1229 -- FPS collapsed from a
-// steady ~14 to under 1 the moment this started firing repeatedly (same
-// location/program pair, called many times within one logical frame, most
-// likely a per-particle or per-instance tint uniform that's legitimately set
-// often). Same class of self-inflicted perf bug already learned once for
-// _GetProperty (see PORTING_PLAN.md Phase 12.2) -- throttled the same way:
-// dedupe by location, log only the first few hits per distinct location, and
-// skip the glGetIntegerv() GPU sync entirely once that location's budget is
-// spent, so a hot uniform stops costing anything past the first few frames.
 #define MAX_TRACKED_UNIFORM4_LOCATIONS 64
 #define MAX_LOGS_PER_UNIFORM4_LOCATION 3
 
 void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) {
-#ifdef DEBUG_SOLOADER
     for (GLsizei i = 0; i < count; i++) {
         const GLfloat *v = value + (size_t) i * 4;
         int has_nan_or_inf = 0;
         for (int j = 0; j < 4; j++) {
             if (isnan(v[j]) || isinf(v[j])) has_nan_or_inf = 1;
         }
-        // Plausible tint/color range check, not a hard rule (this uniform
-        // could legitimately be something unrelated to color, e.g. a light
-        // position/params vec4) -- only flags the specific "looks like a
-        // color, alpha is near zero" shape rather than every low value, to
-        // stay quiet on the overwhelmingly common unrelated-uniform case.
         int looks_like_color = v[0] >= 0.0f && v[0] <= 1.0f && v[1] >= 0.0f && v[1] <= 1.0f &&
                                 v[2] >= 0.0f && v[2] <= 1.0f && v[3] >= 0.0f && v[3] <= 1.0f;
         int near_zero_alpha = looks_like_color && v[3] < 0.05f;
@@ -1158,36 +1107,12 @@ void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) 
                    s_seen[slot].log_count, MAX_LOGS_PER_UNIFORM4_LOCATION);
         }
     }
-#endif
     glUniform4fv(location, count, value);
 }
 
-// New lead (2026-08-08, log_120.txt + user screenshot: enemies AND player
-// characters "casi transparentes", not fully invisible). A real dumped
-// fragment shader (glsl_dump/A6673032....glsl) does:
-//   color = texture2D(TextureSampler, vTexCoord0) + DiffuseColor;
-//   color *= vColor0;
-//   color.rgb *= color.a;
-//   gl_FragColor = color;
-// DiffuseColor is ADDITIVE -- its usual (0,0,0,0) is the neutral default, so
-// every NEAR_ZERO_ALPHA hit glUniform4fv_soloader above has logged on it is a
-// red herring, not this bug. vColor0 (fed by the Color0 vertex attribute) is
-// what actually gates final alpha via "color.rgb *= color.a" -- the opposite
-// of an older assumption in this file ("vertex alpha hardcoded to 1.0", true
-// for a different shader variant, not this one). When the engine has no
-// per-vertex color array bound, GLES convention is to fall back to a CONSTANT
-// value via glVertexAttrib4f/4fv (glVertexAttribPointer's own per-vertex path
-// isn't practically interceptable the same way -- it just points at a VBO).
-// If that constant fallback ever comes back (0,0,0,0) instead of the expected
-// opaque-white (1,1,1,1) -- same class of corrupted/uninitialized read
-// already confirmed once for CharProperties -- this reproduces "draws, zero
-// GL error, nearly invisible" exactly. Same throttled near-zero-alpha
-// heuristic as glUniform4fv_soloader above, keyed by attribute index instead
-// of uniform location.
 #define MAX_TRACKED_VERTEX_ATTRIBS 16
 #define MAX_LOGS_PER_VERTEX_ATTRIB 3
 
-#ifdef DEBUG_SOLOADER
 static void check_vertex_attrib4(GLuint index, const GLfloat *v) {
     int has_nan_or_inf = 0;
     for (int j = 0; j < 4; j++) {
@@ -1236,27 +1161,37 @@ static void check_vertex_attrib4(GLuint index, const GLfloat *v) {
                s_seen[slot].log_count, MAX_LOGS_PER_VERTEX_ATTRIB);
     }
 }
-#endif
 
 void glVertexAttrib4f_soloader(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
-#ifdef DEBUG_SOLOADER
     const GLfloat v[4] = {x, y, z, w};
     check_vertex_attrib4(index, v);
-#endif
+    // If all components are zero or if w==0 on white RGB, fallback to opaque white
+    if ((x == 0.0f && y == 0.0f && z == 0.0f && w == 0.0f) ||
+        (x == 1.0f && y == 1.0f && z == 1.0f && w == 0.0f)) {
+        x = 1.0f;
+        y = 1.0f;
+        z = 1.0f;
+        w = 1.0f;
+    }
     glVertexAttrib4f(index, x, y, z, w);
 }
 
 void glVertexAttrib4fv_soloader(GLuint index, const GLfloat *v) {
-#ifdef DEBUG_SOLOADER
-    check_vertex_attrib4(index, v);
-#endif
+    if (v) {
+        check_vertex_attrib4(index, v);
+        if ((v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f && v[3] == 0.0f) ||
+            (v[0] == 1.0f && v[1] == 1.0f && v[2] == 1.0f && v[3] == 0.0f)) {
+            const GLfloat white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+            glVertexAttrib4fv(index, white);
+            return;
+        }
+    }
     glVertexAttrib4fv(index, v);
 }
 
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
                                       GLsizei width, GLsizei height, GLint border,
                                       GLsizei imageSize, const void *data) {
-#ifdef DEBUG_SOLOADER
     GLint tex = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
 
@@ -1270,10 +1205,6 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
         default: break;
     }
 
-    // Cheapest possible corruption signal without a full PVRTC block decoder:
-    // a compressed blob where every single byte is identical (0x00 most
-    // tellingly) cannot encode real image variation no matter the format --
-    // flag it before anyone attempts real block-level decode work.
     int degenerate = 0;
     if (data && imageSize > 1) {
         const unsigned char *bytes = (const unsigned char *) data;
@@ -1284,21 +1215,14 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
         }
     }
 
-    l_debug("[gl_diag_pvrtc] texture=%d level=%d format=0x%04x(%s alpha=%d) %dx%d imageSize=%d%s",
-            tex, level, internalformat, fmt_name, has_alpha, width, height, imageSize,
-            degenerate ? " <-- DEGENERATE (every byte identical)" : "");
-#endif
+    l_debug("[gl_diag_pvrtc] upload tex=%d fmt=%s (0x%04x has_alpha=%d) %dx%d size=%d frame=%d%s",
+            tex, fmt_name, internalformat, has_alpha, width, height, imageSize, s_frame_counter,
+            degenerate ? " DEGENERATE_ALL_BYTES_EQUAL" : "");
+
     glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 }
 
 void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
-    // DH2's logical canvas for a 960-wide screen (see glutil.h for how this
-    // was confirmed) vs. the target this actually renders to -- REAL_W/REAL_H
-    // must match SCREEN_W/SCREEN_H in main.c UNLESS DOWNSAMPLE_RENDER is on,
-    // in which case every glViewport call happens while our reduced-res FBO
-    // is bound (see glBindFramebuffer_soloader) and must be scaled into ITS
-    // dimensions instead -- gl_swap()'s upscale blit is what maps the result
-    // back onto the true 960x544 screen afterwards.
 #ifdef DOWNSAMPLE_RENDER
     const int REAL_W = REAL_SCREEN_W * DS_NUM / DS_DEN;
     const int REAL_H = REAL_SCREEN_H * DS_NUM / DS_DEN;
@@ -1307,21 +1231,16 @@ void glViewport_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
     const int REAL_H = REAL_SCREEN_H;
 #endif
 
-    const float scale = (float) REAL_H / (float) LOGICAL_H;
-    const int scaled_w = (int) (LOGICAL_W * scale + 0.5f);
-    const int x_offset = (REAL_W - scaled_w) / 2;
+    const float scale_x = (float) REAL_W / (float) LOGICAL_W;
+    const float scale_y = (float) REAL_H / (float) LOGICAL_H;
 
-    glViewport(x_offset + (int) (x * scale + 0.5f),
-               (int) (y * scale + 0.5f),
-               (int) (width * scale + 0.5f),
-               (int) (height * scale + 0.5f));
+    glViewport((int) (x * scale_x + 0.5f),
+               (int) (y * scale_y + 0.5f),
+               (int) (width * scale_x + 0.5f),
+               (int) (height * scale_y + 0.5f));
 }
 
 void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
-    // Identical remap math to glViewport_soloader -- see glutil.h for why:
-    // the engine's glScissor calls live in the same assumed 960x640 logical
-    // canvas as its glViewport calls, so the clip rect needs the same
-    // letterbox scale+offset to line up with the real 960x544 screen.
 #ifdef DOWNSAMPLE_RENDER
     const int REAL_W = REAL_SCREEN_W * DS_NUM / DS_DEN;
     const int REAL_H = REAL_SCREEN_H * DS_NUM / DS_DEN;
@@ -1330,19 +1249,28 @@ void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
     const int REAL_H = REAL_SCREEN_H;
 #endif
 
-    const float scale = (float) REAL_H / (float) LOGICAL_H;
-    const int scaled_w = (int) (LOGICAL_W * scale + 0.5f);
-    const int x_offset = (REAL_W - scaled_w) / 2;
+    const float scale_x = (float) REAL_W / (float) LOGICAL_W;
+    const float scale_y = (float) REAL_H / (float) LOGICAL_H;
 
-    const int out_x = x_offset + (int) (x * scale + 0.5f);
-    const int out_y = (int) (y * scale + 0.5f);
-    const int out_w = (int) (width * scale + 0.5f);
-    const int out_h = (int) (height * scale + 0.5f);
+    int out_x = (int) (x * scale_x + 0.5f);
+    int out_y = (int) (y * scale_y + 0.5f);
+    int out_w = (int) (width * scale_x + 0.5f);
+    int out_h = (int) (height * scale_y + 0.5f);
 
-    // Diagnostic for the repeating-icon-column HUD bug: shows whether the
-    // engine's logical scissor rect (and our remapped physical one) is ever
-    // sane/tight around that panel, since gl_diag2's periodic sampling can't
-    // be correlated to the specific frame the bug is visible on.
+    if (width <= 0 || height <= 0) {
+        out_x = 0;
+        out_y = 0;
+        out_w = 0;
+        out_h = 0;
+    } else {
+        if (out_x < 0) { out_w += out_x; out_x = 0; }
+        if (out_x + out_w > REAL_W) { out_w = REAL_W - out_x; }
+        if (out_y < 0) { out_h += out_y; out_y = 0; }
+        if (out_y + out_h > REAL_H) { out_h = REAL_H - out_y; }
+        if (out_w < 0) out_w = 0;
+        if (out_h < 0) out_h = 0;
+    }
+
     l_debug("glScissor logical=(%d,%d,%d,%d) -> physical=(%d,%d,%d,%d) at frame %d",
             x, y, width, height, out_x, out_y, out_w, out_h, s_frame_counter);
 

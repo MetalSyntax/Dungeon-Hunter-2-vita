@@ -230,10 +230,13 @@ int main() {
     int last_tx = 0, last_ty = 0;
     int pending_key_down = -1, pending_key_up = -1;
 
+    uint64_t last_touch_down_us = 0;
+
     /**
      * @brief Main event handling and rendering loop.
      */
     while (1) {
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
         sceCtrlPeekBufferPositive(0, &pad, 1);
         sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
 
@@ -248,16 +251,22 @@ int main() {
             if (released & btn_map[i].btn) pending_key_up = btn_map[i].keycode;
         }
 
+        SceRtcTick now_tick;
+        sceRtcGetCurrentTick(&now_tick);
+
         for (int i = 0; i < ACTION_BTN_MAP_COUNT; i++) {
             int lx, ly;
             if (!glutil_screen_touch_to_logical(action_btn_map[i].x, action_btn_map[i].y, &lx, &ly)) {
                 lx = action_btn_map[i].x; ly = action_btn_map[i].y;
             }
             if (pressed & action_btn_map[i].btn) {
-                l_debug("action_btn: synthetic touch DOWN (%d,%d)->(%d,%d) ptr=%lld [%s]",
-                        action_btn_map[i].x, action_btn_map[i].y, lx, ly, action_btn_map[i].pointer_id, action_btn_map[i].name);
-                if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, lx, ly,
-                                                  action_btn_map[i].pointer_id, 0, 0);
+                if (now_tick.tick - last_touch_down_us >= 250000) { // 250ms debounce
+                    last_touch_down_us = now_tick.tick;
+                    l_debug("action_btn: synthetic touch DOWN (%d,%d)->(%d,%d) ptr=%lld [%s]",
+                            action_btn_map[i].x, action_btn_map[i].y, lx, ly, action_btn_map[i].pointer_id, action_btn_map[i].name);
+                    if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, lx, ly,
+                                                      action_btn_map[i].pointer_id, 0, 0);
+                }
             }
             if (released & action_btn_map[i].btn) {
                 l_debug("action_btn: synthetic touch UP (%d,%d)->(%d,%d) ptr=%lld [%s]",
@@ -273,8 +282,11 @@ int main() {
             int x, y;
             if (glutil_screen_touch_to_logical(phys_x, phys_y, &x, &y)) {
                 if (!last_touch) {
-                    if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, x, y, 0, 0, 0);
-                    last_touch = 1;
+                    if (now_tick.tick - last_touch_down_us >= 250000) { // 250ms debounce
+                        last_touch_down_us = now_tick.tick;
+                        if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, x, y, 0, 0, 0);
+                        last_touch = 1;
+                    }
                 } else if (x != last_tx || y != last_ty) {
                     if (nativeOnTouch) nativeOnTouch(&jni, NULL, 2, x, y, 0, 0, 0);
                 }

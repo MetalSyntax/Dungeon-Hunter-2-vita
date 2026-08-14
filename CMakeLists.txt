@@ -63,8 +63,8 @@ endif()
 # Unique debug definition for loader's logging to not interfere with anything
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_definitions(-DDEBUG_SOLOADER)
-  # Uncomment this for verbose FalsoJNI logging:
-  #add_definitions(-DFALSOJNI_DEBUGLEVEL=0)
+else()
+  add_definitions(-DRELEASE_BUILD)
 endif()
 
 # --- Performance-investigation flags (Phase: FPS 8-14 -> target 20-30) -----
@@ -116,7 +116,12 @@ endif()
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated")
+set(CMAKE_C_FLAGS_RELEASE "-O2 -g" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_DEBUG "-O2 -g" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g" CACHE STRING "" FORCE)
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O2 -g -mfloat-abi=softfp -Wno-deprecated")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi")
 
 add_executable(${CMAKE_PROJECT_NAME}

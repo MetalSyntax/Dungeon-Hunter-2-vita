@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <kubridge.h>
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
@@ -133,9 +134,12 @@ jint GLMediaPlayer_loadMovie(jmethodID id, va_list args) {
     }
 
     extern so_module so_mod;
-    uint8_t *videoDone = (uint8_t *) so_symbol(&so_mod, "videoDone");
+    volatile uint8_t *videoDone = (volatile uint8_t *) so_symbol(&so_mod, "videoDone");
     if (videoDone) {
+        __sync_synchronize();
         *videoDone = 1;
+        __sync_synchronize();
+        kuKernelFlushCaches((void *)videoDone, sizeof(uint8_t));
     } else {
         l_warn("[Java] GLMediaPlayer.loadMovie: 'videoDone' symbol not found, GSInit may hang");
     }

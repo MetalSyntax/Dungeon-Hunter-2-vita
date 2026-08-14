@@ -18,6 +18,8 @@
 #include <pthread.h>
 #include <malloc.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/power.h>
 
 #ifdef USE_SCELIBC_IO
 #include <libc_bridge/libc_bridge.h>
@@ -32,65 +34,11 @@
 // void stat_newlib_to_bionic(struct stat * src, stat64_bionic * dst);
 #include "reimpl/bits/_struct_converters.c"
 
-// Small read-only file cache (user-reported, log_110.txt: game takes
-// "several minutes" to load and feels slow throughout; grepping every
-// fopen() in one session showed shaders.pak opened 176 times,
-// prince_idle_shield_02.bdae 103 times, faeries_celeste_walk.bdae 100
-// times, and dozens more animation files opened 20-50+ times each -- real
-// disk I/O every time, not served from any engine-side cache. This engine's
-// own on-demand asset streaming (COnDemandReader, already noted elsewhere
-// in this file) appears to close and re-open small assets constantly
-// rather than keeping them resident, a design that's cheap on Android's
-// internal flash but a real bottleneck against a Vita memory card's
-// per-open filesystem overhead. Caches the full contents of small (<=512KB)
-// read-only opens in RAM after the first real read, and serves every
-// subsequent open of the same path straight from memory -- zero disk I/O
-// after the first hit, this session's worst offenders included.
-//
-// Safety: ONLY plain read-only opens ("r"/"rb") are ever cached -- writes
-// (savegames, settings) always go through the real, unmodified path. A
-// cache "handle" is a pointer into a small fixed array, never on the heap
-// and never overlapping real FILE* addresses, so fcache_is_handle() can
-// always tell the two apart safely. Every stdio entry point this project's
-// dynlib.c import table exposes to the engine (fread/fseek/ftell/feof/
-// ferror/fflush/fgetc/getc/fgets/fileno/fputc/putc/fputs/fwrite/setvbuf/
-// ungetc/rewind/fclose) is wrapped below with a cache-handle check first,
-// specifically so a cache handle can NEVER reach the real libc as if it
-// were a genuine FILE* -- that would corrupt memory or crash instantly.
-// (fprintf/fscanf/vfprintf are deliberately left unwrapped: this engine's
-// own asset readers are byte/stream-offset based, IStreamBase-style, not
-// scanf/printf-based, and a cached file is only ever opened "rb" in the
-// first place, so those three have no real path to ever see a cache
-// handle.) Guarded by a mutex since this engine's on-demand streaming
-// suggests asset loads can happen off the main thread.
-//
-// UNTESTED ON HARDWARE as of 2026-08-08 -- this is the single riskiest
-// change of the whole session (it sits underneath every file read in the
-// entire game). If the next hardware run shows a crash, a missing texture/
-// animation, or any other new symptom that started right after this build,
-// set FCACHE_ENABLED to 0 below and rebuild -- fcache_is_cacheable_mode()
-// then always returns false, so fopen_soloader never creates a single cache
-// handle and every _soloader wrapper's fcache_is_handle() check is always
-// false too, taking every code path below straight back to the exact real
-// I/O behavior from before this change, with zero risk of a stale codepath
-// (no git revert needed for a quick isolate-and-test cycle -- see
-// PORTING_PLAN.md's 2026-08-08 session entry for the full writeup and the
-// git commit boundary if a real revert is what's wanted instead).
-// log_117.txt (2026-08-08): the cache hit its old FCACHE_MAX_ENTRIES (64) cap
-// at just 1.4MB of the 16MB byte budget -- entry #64 was a small pydata file
-// cached during initial boot/loading, before the engine even starts streaming
-// the actually-hot repeated assets (shaders.pak reopened 176x, individual
-// .bdae animations 100+x, per log_110's fopen count) that this cache exists
-// to help. No eviction policy exists once the entry cap is hit (see
-// fcache_populate below), so every single fopen() for the rest of the session
-// -- i.e. essentially all of real gameplay -- got zero caching benefit. Raised
-// the entry cap so the byte budget (still the real, unchanged safety bound)
-// is what actually limits the cache, not an arbitrary low file count.
 #define FCACHE_ENABLED 1
-#define FCACHE_MAX_ENTRIES 512
-#define FCACHE_MAX_FILE_SIZE (512 * 1024)
-#define FCACHE_MAX_TOTAL_BYTES (16 * 1024 * 1024)
-#define FCACHE_MAX_HANDLES 32
+#define FCACHE_MAX_ENTRIES 1024
+#define FCACHE_MAX_FILE_SIZE (256 * 1024)
+#define FCACHE_MAX_TOTAL_BYTES (32 * 1024 * 1024)
+#define FCACHE_MAX_HANDLES 64
 
 typedef struct {
     char path[400];
@@ -183,6 +131,7 @@ static int s_fcache_entry_cap_hit_logged = 0;
 // rewinds the real file handle back to position 0 so the caller's own
 // subsequent reads are completely unaffected by this out-of-band peek.
 static void fcache_populate(const char *path, FILE *real_file) {
+    sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
     pthread_mutex_lock(&s_fcache_lock);
     fcache_init_handles_locked();
     if (s_fcache_entry_count >= FCACHE_MAX_ENTRIES) {
@@ -366,58 +315,23 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
             ret = fopen_soloader(redirected, mode);
             if (ret) return ret;
         } else if (strcmp(base, "char_faerie.tga") == 0 || strcmp(base, "tex_faerie_001.tga") == 0) {
-            // log_125.txt: "tex_faerie_001.tga" -- a sibling request for the same
-            // Faerie companion this redirect already covers under a different
-            // literal filename, also absent from every real app-data dump we
-            // have -- failed to open 40 times in one session (both the plain
-            // path and the engine's own "qata" fallback, same confirmed-genuine
-            // mechanism as char_faerie.tga above), leaving the companion
-            // rendering with no diffuse texture bound for the rest of that draw.
-            // User-reported "purple/wrong-colored effects that didn't exist
-            // before" is consistent with this: a draw call with no texture
-            // re-bound can end up sampling whatever texture unit 0 was LAST
-            // bound to (e.g. a weapon-trail effect drawn just before it in the
-            // same frame), not just a flat placeholder color.
+            // Redirect fairy body to pure white radial texture (white glowing fairy)
             char redirected[512];
-            snprintf(redirected, sizeof(redirected), "%.*sfx_sparkles_01.tga",
+            snprintf(redirected, sizeof(redirected), "%.*sfx_radial_white.tga",
                      (int) (base - filename), filename);
             ret = fopen_soloader(redirected, mode);
             if (ret) return ret;
         } else if (strcmp(base, "fx_spark.tga") == 0) {
+            // Redirect fairy sparkles/aura to golden/yellow lens flare
             char redirected[512];
-            snprintf(redirected, sizeof(redirected), "%.*sfx_spark_01.tga",
+            snprintf(redirected, sizeof(redirected), "%.*sfx_magic_lenz_flares_002.tga",
                      (int) (base - filename), filename);
             ret = fopen_soloader(redirected, mode);
             if (ret) return ret;
         }
     }
 
-#ifdef DEBUG_SOLOADER
-    // Stat corruption investigation (user screenshot, 2026-08-07: HP
-    // -4067229, MP -667370, Defense rating -8898, Damage reduction -20187 --
-    // the character's BASE stats, not just combat damage math). User
-    // reports these were correct before "certain changes" broke them, and
-    // CharProperties::_GetProperty's callers pull straight from a table
-    // populated once at boot by Arrays::CharacterTable::read(), fed by
-    // exactly these *_pyarray.bin files -- so a truncated/corrupted/wrong-
-    // version copy of one of them, staged onto the Vita's memory card by
-    // hand at some point (same mechanism already confirmed for
-    // DebugSwitches.savegame), would explain stats reading garbage WITHOUT
-    // any code regression at all. This project's own reference copy of
-    // these files (com.gameloft.android.GAND.GloftD2SS/files/data/pydata/)
-    // gives a known-good size to compare against -- logging the real
-    // on-device file's size here is a direct, zero-guesswork way to confirm
-    // or rule this out on the next hardware run, before chasing a code bug
-    // that might not exist.
     if (ret && strstr(filename, "pydata") && strstr(filename, "_pyarray.bin")) {
-        // CORRECTION (log_111.txt): every single one of these logged
-        // size=-1 -- not "file missing/corrupted", a bug in THIS
-        // diagnostic. `ret` came from sceLibcBridge_fopen() (USE_SCELIBC_IO
-        // is on by default in this project), but this code called the
-        // PLAIN newlib fseek/ftell on it -- two different libc's FILE*
-        // representations, so the seek silently failed. Exactly the kind
-        // of mismatch the small-file-cache work right above this had to be
-        // careful about; missed it here since this code predates that.
 #ifdef USE_SCELIBC_IO
         long pos = sceLibcBridge_ftell(ret);
         sceLibcBridge_fseek(ret, 0, SEEK_END);
@@ -433,7 +347,6 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
                "com.gameloft.android.GAND.GloftD2SS/files/data/pydata/ if stats still read wrong",
                filename, size);
     }
-#endif
 
     if (ret && fcache_is_cacheable_mode(mode)) {
         fcache_populate(filename, ret);

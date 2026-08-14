@@ -586,7 +586,7 @@ so_default_dynlib default_dynlib[] = {
         { "glCheckFramebufferStatusOES", (uintptr_t)&glCheckFramebufferStatus },
         { "glClear", (uintptr_t)&glClear },
         { "glClearColor", (uintptr_t)&glClearColor_soloader },
-        { "glClearColorx", (uintptr_t)&glClearColorx },
+        { "glClearColorx", (uintptr_t)&glClearColorx_soloader },
         { "glClearDepthf", (uintptr_t)&glClearDepthf },
         { "glClearDepthx", (uintptr_t)&glClearDepthx },
         { "glClearStencil", (uintptr_t)&glClearStencil },

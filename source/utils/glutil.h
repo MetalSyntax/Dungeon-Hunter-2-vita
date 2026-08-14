@@ -42,6 +42,7 @@ void glUseProgram_soloader(GLuint program);
 // the same "nothing here yet" background. Wired into dynlib.c in place of
 // the raw glClearColor entry point.
 void glClearColor_soloader(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha);
+void glClearColorx_soloader(GLclampx red, GLclampx green, GLclampx blue, GLclampx alpha);
 
 // DH2's appInit() (out_ghidra.c) picks a hardcoded logical rendering-canvas
 // size purely from the screen width it's told about -- for our real width

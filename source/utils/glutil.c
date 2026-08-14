@@ -151,7 +151,7 @@ static TrackedProgram *find_or_track_program(GLuint program) {
 
 // Native PS Vita logical screen resolution (960x544)
 #define LOGICAL_W 960
-#define LOGICAL_H 544
+#define LOGICAL_H 640
 
 static void compute_letterbox_rect(int *out_x, int *out_y, int *out_w, int *out_h) {
     *out_x = 0;
@@ -164,8 +164,8 @@ int glutil_screen_touch_to_logical(int screen_x, int screen_y, int *out_x, int *
     if (screen_x < 0 || screen_x >= REAL_SCREEN_W || screen_y < 0 || screen_y >= REAL_SCREEN_H) {
         return 0;
     }
-    *out_x = screen_x;
-    *out_y = screen_y;
+    *out_x = screen_x * LOGICAL_W / REAL_SCREEN_W;
+    *out_y = screen_y * LOGICAL_H / REAL_SCREEN_H;
     return 1;
 }
 

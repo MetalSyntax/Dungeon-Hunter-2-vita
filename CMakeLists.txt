@@ -61,10 +61,12 @@ if (DUMP_COMPILED_SHADERS)
 endif()
 
 # Unique debug definition for loader's logging to not interfere with anything
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-  add_definitions(-DDEBUG_SOLOADER)
+if (DEFINED LOG_LEVEL)
+  add_definitions(-DACTIVE_LOG_LEVEL=${LOG_LEVEL})
+elseif (CMAKE_BUILD_TYPE STREQUAL "Debug")
+  add_definitions(-DDEBUG_SOLOADER -DACTIVE_LOG_LEVEL=2)
 else()
-  add_definitions(-DRELEASE_BUILD)
+  add_definitions(-DRELEASE_BUILD -DACTIVE_LOG_LEVEL=1)
 endif()
 
 # --- Performance-investigation flags (Phase: FPS 8-14 -> target 20-30) -----

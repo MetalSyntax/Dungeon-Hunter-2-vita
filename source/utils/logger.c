@@ -38,9 +38,6 @@ static char buffer_c[2048];
 static char buffer_d[2048];
 
 void _log_print(int t, const char* fmt, ...) {
-#ifdef RELEASE_BUILD
-    return;
-#endif
     if (!atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
         int ret = sceKernelCreateLwMutex(&_log_mutex, "log_lock", 0, 0, NULL);
         if (ret < 0) {

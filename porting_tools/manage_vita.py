@@ -131,17 +131,22 @@ def list_local_vpks():
 
 
 def choose_vpk():
-    """Si hay un solo VPK lo usa directo; si hay varios, muestra un menu
-    (tamano + fecha de modificacion para distinguir variantes de un vistazo)
-    y deja elegir -- Enter usa el mas reciente."""
+    """Si hay un solo VPK pregunta confirmación para subir o cancelar;
+    si hay varios, muestra un menú con la opción 0 para regresar al menú principal."""
     vpks = list_local_vpks()
     if not vpks:
         print(f"[-] No se encontró ningún .vpk en '{BUILD_DIR}/'. Compilá el proyecto primero "
-              f"(build.sh o build_and_install.sh, opción 5 de este menú).")
+              f"(build.sh o build_and_install.sh, opción 6 de este menú).")
         return None
 
     if len(vpks) == 1:
-        print(f"[*] Un solo VPK encontrado: {os.path.basename(vpks[0])}")
+        size_mb = os.path.getsize(vpks[0]) / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(vpks[0])))
+        print(f"[*] VPK encontrado: {os.path.basename(vpks[0])} ({size_mb:.2f} MB, {mtime})")
+        choice = input("¿Deseas subir este VPK a la Vita? [S/n o 0 para cancelar/regresar]: ").strip().lower()
+        if choice in ('0', 'n', 'no', 'q', 'c', 'cancel', 'cancelar', 'volver', 'regresar'):
+            print("[*] Operación cancelada. Regresando al menú principal...")
+            return None
         return vpks[0]
 
     print(f"[*] Se encontraron {len(vpks)} VPKs en '{BUILD_DIR}/' (más reciente primero):")
@@ -149,18 +154,24 @@ def choose_vpk():
         size_mb = os.path.getsize(path) / (1024 * 1024)
         mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
         print(f"  {i}. {os.path.basename(path):<40} {size_mb:6.2f} MB   {mtime}")
-    print()
+    print("  0. Regresar al menú principal\n")
 
-    choice = input(f"Elegí el VPK a subir [1-{len(vpks)}] (Enter = el más reciente): ").strip()
+    choice = input(f"Elegí el VPK a subir [1-{len(vpks)}, 0 para regresar] (Enter = el más reciente): ").strip()
     if not choice:
         return vpks[0]
+    if choice in ('0', 'q', 'c', 'cancel', 'cancelar', 'volver', 'regresar'):
+        print("[*] Operación cancelada. Regresando al menú principal...")
+        return None
     try:
         idx = int(choice)
+        if idx == 0:
+            print("[*] Operación cancelada. Regresando al menú principal...")
+            return None
         if 1 <= idx <= len(vpks):
             return vpks[idx - 1]
     except ValueError:
         pass
-    print("[-] Opción inválida.")
+    print("[-] Opción inválida. Regresando al menú principal...")
     return None
 
 
@@ -211,14 +222,24 @@ def list_local_ebootbins():
 
 
 def choose_eboot():
-    """Mismo patron que choose_vpk() -- si hay un solo eboot*.bin lo usa
-    directo, si hay varios (build normal + variantes de perf) deja elegir en
-    vez de asumir cual es el que se quiere subir."""
+    """Mismo patron que choose_vpk() -- si hay un solo eboot*.bin pide confirmación;
+    si hay varios, muestra el menú con opción 0 para regresar al menú principal."""
     ebootbins = list_local_ebootbins()
     if not ebootbins:
+        project_root = os.path.dirname(BASE_DIR)
+        fallback_path = os.path.join(project_root, BUILD_DIR, "eboot.bin")
+        print(f"[-] No se encontró ningún eboot*.bin en '{BUILD_DIR}/' (ej. '{fallback_path}'). "
+              f"Asegúrate de haber compilado el proyecto.")
         return None
+
     if len(ebootbins) == 1:
-        print(f"[*] Un solo eboot.bin encontrado: {os.path.basename(ebootbins[0])}")
+        size_mb = os.path.getsize(ebootbins[0]) / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(ebootbins[0])))
+        print(f"[*] eboot.bin encontrado: {os.path.basename(ebootbins[0])} ({size_mb:.2f} MB, {mtime})")
+        choice = input("¿Deseas subir este eboot.bin a la Vita? [S/n o 0 para cancelar/regresar]: ").strip().lower()
+        if choice in ('0', 'n', 'no', 'q', 'c', 'cancel', 'cancelar', 'volver', 'regresar'):
+            print("[*] Operación cancelada. Regresando al menú principal...")
+            return None
         return ebootbins[0]
 
     print(f"[*] Se encontraron {len(ebootbins)} eboot*.bin en '{BUILD_DIR}/' (más reciente primero):")
@@ -226,29 +247,30 @@ def choose_eboot():
         size_mb = os.path.getsize(path) / (1024 * 1024)
         mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
         print(f"  {i}. {os.path.basename(path):<40} {size_mb:6.2f} MB   {mtime}")
-    print()
+    print("  0. Regresar al menú principal\n")
 
-    choice = input(f"Elegí el eboot.bin a subir [1-{len(ebootbins)}] (Enter = el más reciente): ").strip()
+    choice = input(f"Elegí el eboot.bin a subir [1-{len(ebootbins)}, 0 para regresar] (Enter = el más reciente): ").strip()
     if not choice:
         return ebootbins[0]
+    if choice in ('0', 'q', 'c', 'cancel', 'cancelar', 'volver', 'regresar'):
+        print("[*] Operación cancelada. Regresando al menú principal...")
+        return None
     try:
         idx = int(choice)
+        if idx == 0:
+            print("[*] Operación cancelada. Regresando al menú principal...")
+            return None
         if 1 <= idx <= len(ebootbins):
             return ebootbins[idx - 1]
     except ValueError:
         pass
-    print("[-] Opción inválida.")
+    print("[-] Opción inválida. Regresando al menú principal...")
     return None
 
 
 def upload_eboot():
     local_eboot_path = choose_eboot()
-
     if not local_eboot_path:
-        project_root = os.path.dirname(BASE_DIR)
-        fallback_path = os.path.join(project_root, BUILD_DIR, "eboot.bin")
-        print(f"[-] No se encontró ningún eboot*.bin en '{BUILD_DIR}/' (ej. '{fallback_path}'). "
-              f"Asegúrate de haber compilado el proyecto.")
         return
 
     disconnect_proton_vpn()
@@ -276,14 +298,17 @@ def upload_eboot():
             pass
 
 def download_latest_debug_files():
+    descargar_dmp = input("¿Deseas descargar el último crash dump (DMP) si existe? [S/n o 0 para cancelar/regresar]: ").strip().lower()
+    if descargar_dmp in ('0', 'q', 'c', 'cancel', 'cancelar', 'volver', 'regresar'):
+        print("[*] Operación cancelada. Regresando al menú principal...")
+        return
+
     disconnect_proton_vpn()
     ftp = connect_ftp()
     if not ftp:
         return
-
-    descargar_dmp = input("¿Deseas descargar el último crash dump (DMP)? (s/n): ").strip().lower()
     
-    if descargar_dmp in ['s', 'y', 'si', 'yes']:
+    if descargar_dmp not in ('n', 'no'):
         print("[*] Buscando el último crash dump (.dmp / psp2core) en ux0:/data...")
         latest_dmp = None
         latest_dmp_time = 0

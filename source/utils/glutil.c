@@ -149,31 +149,23 @@ static TrackedProgram *find_or_track_program(GLuint program) {
 #define REAL_SCREEN_W 960
 #define REAL_SCREEN_H 544
 
-// Letterboxed sub-rect of the TRUE physical screen (960x544) that the game's
-// assumed 960x640 logical canvas maps into, aspect-correct, centered --
-// same math as glViewport_soloader, factored out so DOWNSAMPLE_RENDER's
-// final blit targets exactly the same rect instead of a second hardcoded
-// copy that could drift out of sync.
+// Native PS Vita logical screen resolution (960x544)
 #define LOGICAL_W 960
-#define LOGICAL_H 640
+#define LOGICAL_H 544
 
 static void compute_letterbox_rect(int *out_x, int *out_y, int *out_w, int *out_h) {
-    const float scale = (float) REAL_SCREEN_H / (float) LOGICAL_H;
-    const int scaled_w = (int) (LOGICAL_W * scale + 0.5f);
-    *out_x = (REAL_SCREEN_W - scaled_w) / 2;
+    *out_x = 0;
     *out_y = 0;
-    *out_w = scaled_w;
+    *out_w = REAL_SCREEN_W;
     *out_h = REAL_SCREEN_H;
 }
 
 int glutil_screen_touch_to_logical(int screen_x, int screen_y, int *out_x, int *out_y) {
-    int lb_x, lb_y, lb_w, lb_h;
-    compute_letterbox_rect(&lb_x, &lb_y, &lb_w, &lb_h);
-    if (screen_x < lb_x || screen_x >= lb_x + lb_w || screen_y < lb_y || screen_y >= lb_y + lb_h) {
+    if (screen_x < 0 || screen_x >= REAL_SCREEN_W || screen_y < 0 || screen_y >= REAL_SCREEN_H) {
         return 0;
     }
-    *out_x = (screen_x - lb_x) * LOGICAL_W / lb_w;
-    *out_y = (screen_y - lb_y) * LOGICAL_H / lb_h;
+    *out_x = screen_x;
+    *out_y = screen_y;
     return 1;
 }
 
@@ -758,13 +750,10 @@ void glClearColorx_soloader(GLclampx red, GLclampx green, GLclampx blue, GLclamp
 }
 
 void gl_log_render_diag(int frame) {
+    s_seen_textures_count = 0;
+    s_seen_textures_overflowed = 0;
+    s_draw_calls_since_diag = 0;
 #ifndef DEBUG_SOLOADER
-    // All of this was diagnostic instrumentation for the "3D world invisible"
-    // investigation (now resolved, log_076 onward renders correctly) -- every
-    // call here was a real glGet*() driver round-trip that ran unconditionally
-    // even in Release, since only the l_info/l_debug macros themselves were
-    // ever compiled out, not the work computed for them. Skip all of it
-    // outside debug builds now that it's done its job.
     (void) frame;
     return;
 #else

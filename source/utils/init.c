@@ -26,12 +26,17 @@
 #include <so_util/so_util.h>
 #include <fios/fios.h>
 
+#include <psp2/io/stat.h>
+
 // Base address for the Android .so to be loaded at
 #define LOAD_ADDRESS 0x98000000
 
 extern so_module so_mod;
 
 void soloader_init_all() {
+    sceIoMkdir("ux0:data/dungeon-hunter-2", 0777);
+    sceIoMkdir("ux0:data/dungeon-hunter-2/logs", 0777);
+
 	// Launch `app0:configurator.bin` on `-config` init param
     sceAppUtilInit(&(SceAppUtilInitParam){}, &(SceAppUtilBootParam){});
     SceAppUtilAppEventParam eventParam;

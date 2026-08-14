@@ -107,11 +107,11 @@ static const struct { unsigned int btn; int keycode; } btn_map[] = {
  * @brief Mapping physical action buttons to synthetic touch presses on HUD.
  */
 static const struct { unsigned int btn; int x; int y; long long pointer_id; const char *name; } action_btn_map[] = {
-    { SCE_CTRL_CROSS,    180, 445, 1, "plain red sphere, bottom-left (likely: primary attack)" },
-    { SCE_CTRL_SQUARE,   683, 373, 2, "sword+flame icon (likely: block/heavy attack)" },
-    { SCE_CTRL_TRIANGLE, 760, 453, 3, "sword+helmet icon, bottom-right corner, biggest (likely: dodge/special)" },
-    { SCE_CTRL_L1,       810, 273, 4, "gold rune-wheel icon, mid-right (UNCONFIRMED -- not clearly a skill slot)" },
-    { SCE_CTRL_R1,       820,  50, 5, "health potion quick-use icon, top-right (stopgap, not a combat 'power')" },
+    { SCE_CTRL_CROSS,    850, 450, 1, "Primary attack (sword icon, bottom-right)" },
+    { SCE_CTRL_SQUARE,   740, 350, 2, "Skill 1 (frost snowflake icon, middle-right)" },
+    { SCE_CTRL_TRIANGLE, 905, 240, 3, "Skill 2 (golden lightning wheel icon, upper-right)" },
+    { SCE_CTRL_R1,       905,  60, 4, "Health potion (red flask icon, top-right)" },
+    { SCE_CTRL_L1,        75, 160, 5, "Pause button (left below portrait)" },
 };
 #define ACTION_BTN_MAP_COUNT (sizeof(action_btn_map) / sizeof(action_btn_map[0]))
 

@@ -22,6 +22,7 @@
 
 #include <GLES2/gl2.h>
 
+#include <kubridge.h>
 #include <arm_neon.h>
 #include <malloc.h>
 #include <pthread.h>
@@ -954,6 +955,7 @@ void video_play(const char *name) {
 #else
             if (gRgbBuf && gRgbBufCap >= need && gYuvScratch && gYuvScratchCap >= yuvNeed) {
 #endif
+                kuKernelFlushCaches((void *) video.pData, yuvNeed);
                 memcpy(gYuvScratch, video.pData, yuvNeed);
 
                 if (video_frames == 1) {

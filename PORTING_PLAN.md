@@ -732,6 +732,194 @@ User asked to triage a large generic list of "PS Vita 3D port optimization" advi
 - **`DUMP_COMPILED_SHADERS` corrected and actually implemented (`source/utils/glutil.c`)**: earlier in this same conversation this flag was assumed to already be a working "cache compiled shaders" feature based only on its CMake description -- re-checking found **zero consuming code anywhere in `source/`**, confirming it was a leftover from an earlier, different, since-removed use (dumping raw GLSL/CG *source text* to disk, which is how `glsl_dump/*.glsl` in this repo was originally produced). That earlier claim was wrong and is corrected here. **Implemented for real**, repurposing the same flag for what its description actually promises: caches whole linked program binaries via `GL_OES_get_program_binary`, keyed by an FNV-1a hash of the attached shaders' source text (tracked through the existing `glShaderSource_soloader`/`glAttachShader_soloader` hook points, no new interception surface). On a cache hit (verified via the driver's own `GL_LINK_STATUS`, not just "the file existed"), `glLinkProgram_soloader` calls `glProgramBinaryOES` instead of the real `glLinkProgram`, skipping it entirely; on a miss, compiles/links normally and saves the binary for next time. **Whether `GL_OES_get_program_binary` is even supported by this specific PVR_PSP2 build is unconfirmed** -- checked via extension string + `eglGetProcAddress` at `gl_init()` time; if either is missing, the whole cache silently disables itself and every shader compiles/links exactly as before, zero behavior change. This engine only has a handful of distinct shader permutations total (`glsl_dump/` has 7 captured files), so the ceiling on this is real but modest -- it targets loading-screen/level-transition cost, not per-frame combat FPS. Gated behind the existing `DUMP_COMPILED_SHADERS` CMake option, default OFF in the normal build (`build.sh` now explicitly sets `-DDUMP_COMPILED_SHADERS=OFF` in every existing variant, per the script's own "never leave a flag unmentioned" rule) with a new `--shader-cache-test` variant to test it in isolation. **Not yet hardware-tested, and the extension-support question is the single biggest unknown.**
 - **FCACHE (`source/reimpl/io.c`): instrumented, not resized yet, per explicit user request** ("con valores reales" -- real values, not another guess). Two gaps closed: (1) the byte-budget-full and entry-cap-full paths in `fcache_populate()` previously failed completely silently -- Phase 19's "the byte budget is the binding constraint" conclusion was inferred indirectly (entry count plateauing in the log) rather than observed directly. Both paths now log once on first hit, plus a periodic running total of files/bytes rejected purely for being over budget (throttled every 50 rejections, same dedup discipline as every other diagnostic in this project). (2) The first byte-cap-hit log also snapshots `mallinfo().uordblks` against `_newlib_heap_size_user` (256MB, `source/main.c`) -- the real missing piece for sizing a bump safely: raising `FCACHE_MAX_TOTAL_BYTES` is only actually safe if there's heap headroom left at the moment the game needs it most (mid-gameplay, not at boot), and this is the first time that's been measured rather than assumed. **Next session's log should have everything needed to pick a real new byte budget instead of guessing one.**
 
+### Phase 23 — Performance: 5-6 FPS -> ~20-25 FPS in gameplay / ~60 in menus (2026-09-02)
+
+Sustained-combat FPS went from **5-6** to **~20-25**, with menus and light scenes reaching **~60**.
+Measured distribution over the 201 `[fps]` samples of `log_010.log`: 40% of samples in the 20-30 FPS
+band (gameplay), 28% in 45-60 (menus/light), 16% in 10-20 (heavy combat), 7% under 10 (loading
+stalls). **The honest headline number is ~20-25 FPS in-game, not 60** — an earlier note in this
+session quoted "59.7 sustained" by reading only the tail of that log, which happened to be a menu.
+
+**The GPU was never the bottleneck, and this was the finding that redirected everything.**
+`eglSwapBuffers` costs 0.15-0.27ms per frame throughout, while CPU-submission (everything between
+swaps: the engine tick via `nativeRender()` plus our own loop) ran 120-185ms. Two independent
+experiments confirmed it rather than assuming it: rendering at 480x272 (25% of the pixels,
+hardware-scaled, visually verified correct) changed combat FPS **not at all** (`log_003` vs
+`log_004`), and the same held at 720x408. Every real gain this phase came from CPU-side work.
+
+#### What actually moved the number, in order of measured impact
+
+1. **vitaGL "safe speedhack" build flags** — the single largest win, isolated by controlled test:
+   `MATH_SPEEDHACK=1`, `CIRCULAR_POOL_SPEEDHACK=1`, `NO_TEX_COMBINER=1` on top of the existing
+   `DRAW_SPEEDHACK=2`/`SAMPLERS_SPEEDHACK=1`. Exposed as `build.sh --hack-safe`
+   (`VITAGL_SAFE_SPEEDHACKS`). Selection criterion: **only flags whose effect is cheaper CPU code,
+   never one that changes how the GPU is addressed or how its memory is managed** — a visual glitch
+   is recoverable, a GPU hang is not. `DRAW_SPEEDHACK` is deliberately *kept at 2*, not raised to 1,
+   because 2 is what is proven on hardware and 1 is precisely the one documented as "may cause
+   crashes" in the submission path. A separate `--speedhacks-test` variant carries the aggressive set.
+   `CMakeLists.txt` documents each **excluded** flag with a concrete reason so they are not
+   re-evaluated from scratch; the important one is `DEPTH_STENCIL_HACK`, which would break the real
+   stencil buffer that DH2's entire GameSWF UI depends on (proven on hardware, see item 6).
+2. **Removing our own per-frame logging** — `main.c` was emitting three `[loop_diag]` lines *per
+   frame*, left over from the long-resolved `log_158` hang investigation. They used `l_warn` (active
+   in Release too) and `_log_print()` did a synchronous `fflush()` to `ux0:` on every line: three
+   blocking storage writes per frame, inside the frame budget being optimized. They were **4462 of
+   `log_172.txt`'s 4770 total lines (93%)**. Removing them took 5-6 FPS to 8-9. Same pathology as
+   Asphalt-5-Vita's documented Bug #18 (per-frame small writes -> 1 FPS).
+3. **`isObjectInitialized()` in `source/reimpl/pthr.c`: O(n) under a global lock -> O(1) lock-free.**
+   It was taking a global `LwMutex` (two kernel syscalls) and scanning up to 1024 pointers with no
+   early exit on miss — **on every `pthread_mutex_lock` the engine performs**. Disassembly showed all
+   21 `pthread_mutex_lock` call sites in `libDungeonHunter2.so` are inside STLport's allocators
+   (`__node_alloc_impl::_M_allocate/_M_deallocate`, `_Pthread_alloc_impl::*`, `__malloc_alloc::allocate`),
+   so **every `std::string`/`vector`/`map` allocation** paid it — and GameSWF interprets ActionScript,
+   which allocates constantly. This also explained the previously-unexplained *progressive* FPS decay
+   within a single session (the fuller the registry, the longer the average scan). Now a fixed-size
+   open-addressing hash set read with atomic loads and no lock at all; only writers take the mutex.
+   Asphalt 5's `pthr.c` is essentially identical to ours — its `.so` simply has zero
+   `pthread_mutex_lock` call sites, which is why this was never found there.
+4. **`-O2` -> `-O3 -ffast-math`.** Debug and Release had been compiling with *identical* flags.
+5. **GL diagnostics re-gated behind `DEBUG_SOLOADER`.** `track_seen_texture()` and
+   `track_render_call()` ran on every draw call with ~10 `glGet*`/`glIsEnabled`, and the former even
+   issued real `glActiveTexture` state changes. A regression of the 2026-07-24 fix. Honest magnitude:
+   vitaGL's `glGetIntegerv` is a switch over cached globals with no `sceGxmFinish`, so this is worth
+   ~1-3ms, not 100 — free to fix, but never the answer on its own.
+6. **`DOWNSAMPLE_RENDER` reimplemented, and the conclusion previously drawn from it retracted.** The
+   old implementation rendered into an offscreen FBO and blitted it up, and it never worked: the FBO
+   was never bound (the redirect only fires when the *engine* calls `glBindFramebuffer(0)`, and this
+   engine never calls it at all), `gl_swap()` never rebound it after the blit, the blit called
+   `glVertexAttribPointer` with client arrays without zeroing `GL_ARRAY_BUFFER` (the same footgun
+   already fixed once in `video.cpp`), and the FBO had no stencil attachment — which is fatal here,
+   because DH2's whole UI/HUD is GameSWF Flash clips drawn through stencil masks, so every masked
+   fragment failed the test and **nothing drew at all** while logic and touch kept working perfectly
+   (`log_001.log`). Therefore the old `CMakeLists.txt` note claiming the user had confirmed
+   downsampling "made no measurable difference, ruling out a fill-rate bottleneck" was never a valid
+   inference: that test ran at full resolution and measured nothing. Replaced with the correct
+   approach — pass the reduced size straight to `vglInitWithCustomThreshold()`, letting the Vita's
+   display controller hardware-scale it (vitaGL forwards `DISPLAY_WIDTH/HEIGHT` to
+   `sceDisplaySetFrameBuf`), which keeps the default framebuffer's real depth *and stencil*. Default
+   3/4 = 720x408 (exact on both axes, so the Vita's aspect ratio is preserved exactly). **Lesson: on
+   vitaGL, reduce resolution via `vglInit*`, never by hand-rolling an FBO + upscale blit.**
+
+#### Tried, measured, and rejected — do not repeat without re-measuring
+
+- **Implementing `usleep`/`nanosleep`/`sleep` for real (they are wired to `ret0`). Costs 5x the
+  framerate.** The reasoning was sound in the abstract — the engine *does* import all three
+  (`nm -D --undefined-only`), and with `ret0` any `while (!cond) usleep(x)` becomes a busy-spin — but
+  a controlled test changing only this variable on the same `--hack-safe` build gave **11 FPS**
+  (CPU-submission 59-89ms, `log_011.log`) against 60 FPS / 16.6ms with them at `ret0` (`log_010.log`).
+  This engine sleeps inside its own frame path, and Vita's scheduler quantum is far coarser than the
+  1ms it asks for, so each `usleep(1000)` costs several real ms. Reverted; the implementations are
+  kept in `source/reimpl/sys.c` with this result documented in place.
+- **Restoring the engine's update-side culling (`CULLING_MODE=1`). Halves the framerate.** `patch.c`
+  forces all three culling entry points to constants (`CSceneManager::isCulled` x2 -> `ret0`,
+  `ObjectBase::TestCullingBeforeUpdate` -> `ret1`), added in commit `853ac40` to fix the
+  invisible-enemy bug. Structurally this is real waste — the engine animates and updates the whole
+  level every frame regardless of camera, which is exactly consistent with an idle GPU and with
+  resolution having no effect. But restoring only `TestCullingBeforeUpdate` measured **worse**:
+  12-17 FPS at 63-78ms CPU (`log_008`) against 23-26 FPS at 37-40ms (`log_007`). Computing the
+  culling test (transforming bounding boxes, frustum intersection) per object per frame costs more
+  than the updates it skips, especially with both `isCulled` still forced to 0 so everything draws
+  anyway. Now selectable via `CULLING_MODE` (0 = full bypass, **default and the only
+  visually-confirmed-good mode**; 1 = update-side culling; 2 = stock). The real fix for the
+  underlying waste is the stale/degenerate bounding box that motivated the bypass, not re-enabling
+  culling blind.
+- **Raising the read-only file cache from 256KB/32MB to 16MB/96MB. No measurable FPS gain.** Worth
+  recording because it was sized off real instrumentation rather than guessed: new logging showed
+  **369MB of uncacheable re-reads in a single session** across 100 oversize `fopen()`s, largest file
+  11.7MB, with even `DejaVuSans.ttf` (757KB) re-read every time. The old 32MB budget never filling
+  was misleading — big files were never candidates because of the separate per-file size limit. After
+  raising both, the budget does fill (heap 150MB of 268MB) and still rejects 254MB, but FPS did not
+  move, so raw I/O volume was not the bottleneck either.
+
+#### Correctness fixes found along the way
+
+- **Crash on quitting from inside the game, root-caused and fixed.** The `.psp2dmp` gave prefetch
+  abort `0x30003` with `PC = 0x0` (jump through a null function pointer) on a `pthread` worker, stack
+  full of STLport locale destructors. Cause: `exit_soloader` called newlib's `exit()`, which runs the
+  whole `atexit`/`__cxa_atexit` chain — and since `dynlib.c` wires `__cxa_atexit` to newlib's, that
+  chain holds **every C++ static destructor of the Android `.so`**. Those fault during teardown.
+  `exit_soloader`/`abort_soloader` now go straight to `sceKernelExitProcess`: running those
+  destructors buys nothing, since the process is dying and the kernel reclaims memory, threads, the
+  audio port and the GXM context by itself. Asphalt-5-Vita has the identical `exit_soloader`, so this
+  is a latent bug in the shared SoLoBoP lineage rather than something specific to DH2.
+- **A real race in `pthr.c`**, pre-existing: `real_ptr` was published *before* `pthread_mutex_init()`
+  ran (with an uninitialized stack variable memcpy'd over it). Now published after init. Also,
+  `pthread_mutex_destroy`/`cond_destroy`/`mutex_unlock` no longer dereference a bionic
+  static-initializer constant (`0x4000`/`0x8000`) as if it were a pointer.
+- **Logger**: files are now `log_%03d.log` instead of `.txt`, and `fflush` covers everything except
+  DEBUG/INFO. Narrowing the flush to ERROR/FATAL had been tried and it truncated a real crash log
+  immediately before the lines that would have named the dying step — the saving was never worth
+  losing "the log ends exactly at the last thing that happened", and the real win was deleting the
+  per-frame lines anyway (a whole session is ~330 lines).
+- **CPU affinity**: main thread pinned to `SCE_KERNEL_CPU_MASK_USER_0`, the `audio_mixer` thread to
+  `USER_1` (its `sceKernelCreateThread` affinity argument had been 0, i.e. unrestricted). Modeled on
+  MC2BPegasus-Vita. No isolated measurement of its own contribution.
+
+#### Analog stick mapped to movement
+
+The left stick now drives the character. Two routes were investigated; the second is what shipped.
+
+- **Native, no touch (tried first, did NOT work).** The engine has a full character-command API
+  compiled in, all in `.dynsym`: `NativeGetPlayerChar(int, bool)` (`0x43c388`, a free function that
+  resolves the `Character*` itself), `Character::Ctrl_HeadTowards(const Point3D<float>&)`
+  (`0x3adb60`), `Character::Ctrl_Stop()` (`0x3ad890`), `v2Controller::s_blocked` (`0x9a318b`, the
+  engine's own input gate for cutscenes/menus), and `v2Controller::Cmd_HeadTowards` (`0x405374`).
+  `Ctrl_HeadTowards` takes a **direction vector**, not a destination — proven in the disassembly,
+  which compares `x²+y²+z²` against ~`1e-4` — which is exactly the shape an analog stick has. **This
+  also corrects a standing project conclusion**: "DH2 is 100% touch and there is nothing to map" is
+  true only of `nativeKeyDown`/`appKeyPressed` (still dead, never reads the keycode), not of physical
+  controls in general. On hardware the character nonetheless never moved, and this was neither an
+  axis-mapping nor a symbol-resolution problem: `log_011.log` has zero "Symbol not found" warnings and
+  all four candidate axis mappings were cycled with no effect. Leading hypothesis for a future
+  attempt: the engine's `v2HudController` runs its own `Update()` *inside* `nativeRender()`, reads the
+  Flash joystick (zero) and overwrites our direction with a `Ctrl_Stop` — our call runs before
+  `nativeRender()`, so it always loses. Cheapest next experiments: call *after* `nativeRender()`, or
+  feed `v2Controller::Cmd_HeadTowards` instead of the `Character` (blocked on getting a live
+  `v2Controller*`; it sits at `Character+884` with no public getter).
+- **Synthetic touch on the virtual joystick (shipped).** Same mechanism the action buttons already
+  use. The detail that matters: **the DOWN event goes at the pad's centre**, not at the deflected
+  position — the Flash clip treats its touch-down point as the origin, so a DOWN already offset would
+  yield a null direction — followed by a MOVE every frame while deflected (some GameSWF clips only
+  update on the event and don't hold state between frames), then UP on release. Radial deadzone 0.28
+  rescaled to [0..1] so no travel is wasted; dedicated `pointer_id` 6 (0 is real touch, 1..5 the
+  action buttons). Pad geometry lives in three adjustable defines in `main.c`
+  (`VJOY_CX/CY/R = 115/450/62`, physical 960x544 coords). **Known limitation: this depends on the
+  Flash joystick clip existing, so hiding the HUD will require going back to the native route.**
+
+#### Build/infrastructure
+
+- **vitaGL is now vendored as tracked files** rather than a submodule. The submodule pointed at
+  upstream `Rinnegatamante/vitaGL @ cd3791e`, but a gitlink records only that SHA — and the working
+  tree carries load-bearing local changes: `source/shared.h` adds missing `SCE_GXM_*` defines
+  (**without which vitaGL does not compile** against this vitasdk), `source/egl.c` is deleted to
+  avoid duplicate EGL symbols against our own `source/reimpl/egl.c`, the `Makefile` gets a
+  `git rev-parse` fallback, and `build_vitagl.sh` — invoked by `CMakeLists.txt` — was untracked
+  *inside* the submodule. A fresh clone therefore could not build. Vendored with a diet: `samples/`
+  removed (28MB, only used by a `make samples` target this project never invokes) and build artifacts
+  gitignored; 55MB -> 11MB. `lib/vitagl/VENDORED.md` records the upstream URL and base commit plus
+  the full diff of our modifications, so a future rebase onto newer upstream doesn't have to
+  rediscover what changed.
+- New `build.sh` variants: `--hack-safe`, `--speedhacks-test`, `--culling-test [MODE]`.
+  `--downsample-test` now also forces `PROFILE_FRAME_TIME=ON`, which had been OFF and defeated the
+  purpose of the variant.
+
+#### Where the remaining time goes, for whoever picks this up
+
+Gameplay CPU-submission is ~37-50ms against the 16.6ms a locked 60 FPS needs. The dominant known
+waste is item 6's culling bypass: the engine animates, updates and queues the entire level every
+frame. Re-enabling culling naively is *slower* (measured) and reintroduces the invisible-enemy bug,
+so the real work is fixing the bounding box that made the bypass necessary — the prime suspect is
+`ISceneNode::getTransformedBoundingBox()`'s dirty-bit cache, which only recomputes when a node's own
+transform changes, never on animation/skinning alone. Also still unexploited: Asphalt 5 no-ops the
+engine's own `BaseSoundManager::update`/`stop*` family since it supplies its own mixer, and DH2 has
+its own mixer but still lets `VoxSoundManager` tick every frame.
+
+Ruled out with evidence, to save time: `source/reimpl/mem.c` is byte-identical to Asphalt 5's; the
+`memcpy`/`malloc`/`memset`/`strcmp`/`strlen` wiring is identical in both `dynlib.c` files;
+`gettimeofday` is already cheap here (`fast_gettimeofday`, backed by `sceKernelGetProcessTimeWide`)
+despite 20 call sites; and vsync/`eglSwapInterval` is not a lever (neither Asphalt 5 nor
+MC2BPegasus touch it, and swap costs 0.2ms here regardless).
+
 ## 6. Checklist
 
 - [x] APK and all 4 `.so` files decompiled, one folder per artifact, under `decompiled/`.
@@ -756,4 +944,4 @@ User asked to triage a large generic list of "PS Vita 3D port optimization" advi
 - [x] Audio path understood and implemented.
 - [x] Asset strategy chosen and implemented (one strategy only).
 - [x] `.vpk` installs cleanly on real hardware (LiveArea valid).
-- [x] Playable end-to-end on physical PS Vita (confirmed by the user 2026-07-23: menu, character load, dungeon combat, enemies, effects all render; movement/interaction works via touch). **Not yet fully polished** — see Phase 6 (only 1 of 5 combat action buttons confirmed working, enemies reported invisible in one combat encounter, root cause not found) and Phase 11 (sustained ~8-14 FPS in combat, target 20-30 FPS, two perf experiments built but neither confirmed good on hardware yet).
+- [x] Playable end-to-end on physical PS Vita (confirmed by the user 2026-07-23: menu, character load, dungeon combat, enemies, effects all render; movement/interaction works via touch). **Not yet fully polished** — see Phase 6 (only 1 of 5 combat action buttons confirmed working, enemies reported invisible in one combat encounter, root cause not found) and Phase 11. **Performance target met as of 2026-09-02 (Phase 23): ~20-25 FPS sustained in gameplay and ~60 in menus, up from 5-6 FPS**, entirely via CPU-side work -- the GPU was never the bottleneck (`eglSwapBuffers` costs 0.2ms/frame throughout).

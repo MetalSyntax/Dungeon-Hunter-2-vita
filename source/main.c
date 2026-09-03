@@ -115,6 +115,103 @@ static const struct { unsigned int btn; int x; int y; long long pointer_id; cons
 };
 #define ACTION_BTN_MAP_COUNT (sizeof(action_btn_map) / sizeof(action_btn_map[0]))
 
+// ---------------------------------------------------------------------------
+// Stick analogico -> movimiento del personaje, SIN sintetizar touch.
+//
+// El motor tiene compilada una API de comandos de personaje con movimiento
+// direccional POR VECTOR, que es exactamente la forma que tiene un stick. Los
+// tres simbolos estan en .dynsym, asi que se resuelven con so_symbol():
+//
+//   Character* NativeGetPlayerChar(int idx, bool remote)   -- funcion libre
+//   void Character::Ctrl_HeadTowards(const Point3D<float>&)
+//   void Character::Ctrl_Stop()
+//
+// Ctrl_HeadTowards recibe una DIRECCION, no un destino: internamente compara
+// x²+y²+z² contra ~1e-4 (test de deadzone propio), respeta el estado del
+// personaje (no camina mientras castea, via SM_IsUsingSkill/SM_IsCasting) y
+// normaliza el vector. Por eso la magnitud del stick NO da velocidad variable.
+//
+// Esto es mejor que el touch sintetico que usan los botones de accion
+// (action_btn_map) porque no depende de que el clip de Flash del joystick
+// virtual exista: sigue funcionando cuando se oculte el HUD.
+static void *(* NativeGetPlayerChar)(int idx, int remote);
+static void (* Character_Ctrl_HeadTowards)(void *this_, const float *dir);
+static void (* Character_Ctrl_Stop)(void *this_);
+// v2Controller::s_blocked es el gate que el motor usa para bloquear input en
+// cutscenes, menus y el IGM. Llamar Ctrl_* directo se lo saltea, asi que hay
+// que respetarlo a mano o el personaje camina durante los dialogos.
+static unsigned char *v2Controller_s_blocked;
+
+// La orientacion de los ejes del mundo respecto de la pantalla no se pudo
+// determinar del analisis estatico (la camara es isometrica). En vez de
+// adivinar y hacer varias idas y vueltas a la consola, los modos plausibles se
+// pueden ciclar en vivo con SELECT y cada cambio se loguea con l_error, asi que
+// una sola sesion de prueba resuelve cual es. Una vez confirmado, fijar
+// STICK_MAP_DEFAULT y (si se quiere) sacar el ciclado.
+#define STICK_MAP_COUNT 4
+#ifndef STICK_MAP_DEFAULT
+#define STICK_MAP_DEFAULT 0
+#endif
+static int s_stick_map = STICK_MAP_DEFAULT;
+static const char *kStickMapNames[STICK_MAP_COUNT] = {
+    "0: (x, 0, y)  ejes alineados, mundo Y-up",
+    "1: (x, 0, -y) igual pero Z invertido",
+    "2: (x, y, 0)  plano XY, mundo Z-up",
+    "3: iso 45 deg  ((x-y), 0, (x+y)) * 0.7071",
+};
+
+// Ultimo estado, para llamar Ctrl_Stop una sola vez al soltar en vez de en
+// cada frame.
+static int s_stick_was_active = 0;
+
+static void stick_update(const SceCtrlData *pad) {
+    if (!NativeGetPlayerChar || !Character_Ctrl_HeadTowards || !Character_Ctrl_Stop) {
+        return;
+    }
+    // Devuelve 0 mientras no haya jugador (menus, carga), asi que sirve de
+    // chequeo de "estamos en gameplay" sin ningun trabajo extra.
+    void *player = NativeGetPlayerChar(0, 0);
+    if (!player) {
+        s_stick_was_active = 0;
+        return;
+    }
+    if (v2Controller_s_blocked && *v2Controller_s_blocked) {
+        if (s_stick_was_active) {
+            Character_Ctrl_Stop(player);
+            s_stick_was_active = 0;
+        }
+        return;
+    }
+
+    // Stick de Vita: 0..255 con centro en ~128. sy positivo = ABAJO en pantalla.
+    float sx = ((float) pad->lx - 128.0f) / 128.0f;
+    float sy = ((float) pad->ly - 128.0f) / 128.0f;
+
+    // Deadzone radial (no por eje): los sticks de Vita derivan bastante, y una
+    // deadzone por eje deja pasar diagonales fantasma.
+    const float DEADZONE = 0.28f;
+    float mag2 = sx * sx + sy * sy;
+    if (mag2 < DEADZONE * DEADZONE) {
+        if (s_stick_was_active) {
+            Character_Ctrl_Stop(player);
+            s_stick_was_active = 0;
+        }
+        return;
+    }
+
+    float dir[3] = {0.0f, 0.0f, 0.0f};
+    switch (s_stick_map) {
+        case 0: dir[0] = sx; dir[2] = sy; break;
+        case 1: dir[0] = sx; dir[2] = -sy; break;
+        case 2: dir[0] = sx; dir[1] = sy; break;
+        case 3: dir[0] = (sx - sy) * 0.7071f; dir[2] = (sx + sy) * 0.7071f; break;
+        default: dir[0] = sx; dir[2] = sy; break;
+    }
+
+    Character_Ctrl_HeadTowards(player, dir);
+    s_stick_was_active = 1;
+}
+
 static void *app_singleton_inst;
 static void (* SavegameManager_setLanguage)(void *this_, int lang);
 #define LANGUAGE_FORCE_FRAMES 180
@@ -217,6 +314,15 @@ int main() {
     nativeKeyDown          = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeKeyDown");
     nativeKeyUp            = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeKeyUp");
     nativeOnTouch          = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameGLSurfaceView_nativeOnTouch");
+
+    // Stick analogico -> movimiento (ver el comentario de stick_update()).
+    // Los 4 estan en .dynsym, verificado con `nm -D --defined-only`.
+    NativeGetPlayerChar        = so_sym_or_warn("_Z19NativeGetPlayerCharib");
+    Character_Ctrl_HeadTowards = so_sym_or_warn("_ZN9Character16Ctrl_HeadTowardsERK7Point3DIfE");
+    Character_Ctrl_Stop        = so_sym_or_warn("_ZN9Character9Ctrl_StopEv");
+    v2Controller_s_blocked     = so_sym_or_warn("_ZN12v2Controller9s_blockedE");
+    l_error("[stick] mapeo de ejes inicial -> %s (SELECT cicla entre los %d modos)",
+            kStickMapNames[s_stick_map], STICK_MAP_COUNT);
     nativePause            = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativePause");
     nativeResume           = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeResume");
     nativeCanInterrupt     = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeCanInterrupt");
@@ -348,6 +454,16 @@ int main() {
             if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, last_tx, last_ty, 0, 0, 0);
             last_touch = 0;
         }
+
+        // SELECT solo (sin START, que junto a START es el combo de salida) cicla
+        // el mapeo de ejes del stick, para poder resolver la orientacion en una
+        // sola sesion de consola. Ver stick_update().
+        if ((pressed & SCE_CTRL_SELECT) && !(pad.buttons & SCE_CTRL_START)) {
+            s_stick_map = (s_stick_map + 1) % STICK_MAP_COUNT;
+            l_error("[stick] mapeo de ejes -> %s", kStickMapNames[s_stick_map]);
+        }
+
+        stick_update(&pad);
 
         if (pending_key_down != -1 && nativeKeyDown) { nativeKeyDown(&jni, NULL, pending_key_down); pending_key_down = -1; }
         if (pending_key_up != -1 && nativeKeyUp) { nativeKeyUp(&jni, NULL, pending_key_up); pending_key_up = -1; }

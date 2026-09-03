@@ -22,6 +22,11 @@ set -e
 #                                    o ya estamos genuinamente por debajo de
 #                                    eso?" antes de invertir en algo mas
 #                                    invasivo como --downsample-test.
+#      ./build.sh --hack-safe    -> build con el set SEGURO de speedhacks de
+#                                    vitaGL: solo los que abaratan codigo de
+#                                    CPU, ninguno que cambie como se le habla a
+#                                    la GPU (sin riesgo de cuelgue). Ver
+#                                    VITAGL_SAFE_SPEEDHACKS en CMakeLists.txt.
 #      ./build.sh --culling-test [MODE]
 #                                   -> LA palanca de perf mas grande. MODE 1
 #                                    (default) restaura el culling de update;
@@ -136,6 +141,11 @@ elif [ "$1" = "--culling-test" ]; then
     CULL_M="${2:-1}"
     VPK_OUTPUT_NAME="dungeon_hunter_2_culling_test${CULL_M}"
     CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=ON -DDUMP_COMPILED_SHADERS=OFF -DCULLING_MODE="$CULL_M")
+elif [ "$1" = "--hack-safe" ]; then
+    VPK_OUTPUT_NAME="dungeon_hunter_2_hack_safe"
+    # Set SEGURO: solo speedhacks de CPU, sin tocar el camino a la GPU. Ver el
+    # criterio completo en CMakeLists.txt (VITAGL_SAFE_SPEEDHACKS).
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=ON -DDUMP_COMPILED_SHADERS=OFF -DVITAGL_SAFE_SPEEDHACKS=ON)
 elif [ "$1" = "--speedhacks-test" ]; then
     VPK_OUTPUT_NAME="dungeon_hunter_2_speedhacks_test"
     # Set agresivo de speedhacks de vitaGL, a resolucion NATIVA para que sea

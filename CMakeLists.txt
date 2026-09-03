@@ -207,13 +207,48 @@ target_include_directories(${CMAKE_PROJECT_NAME}
 set(CULLING_MODE "0" CACHE STRING "0=bypass total (default/seguro), 1=culling de update activo, 2=culling stock del motor")
 add_definitions(-DCULLING_MODE=${CULLING_MODE})
 
-option(VITAGL_EXTRA_SPEEDHACKS "Compilar vitaGL con el set agresivo de speedhacks (puede crashear/glitchear)" OFF)
-if (VITAGL_EXTRA_SPEEDHACKS)
-  # DRAW_SPEEDHACK sube de 2 (solo draws con mucha data de vertices) a 1 (todos).
-  set(VITAGL_MAKE_FLAGS_STR "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1 DRAW_SPEEDHACK=1 INDICES_DRAW_SPEEDHACK=1 BUFFERS_SPEEDHACK=1 MATH_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 TEXTURE_UPLOADS_SPEEDHACK=1")
+option(VITAGL_EXTRA_SPEEDHACKS "Compilar vitaGL con el set AGRESIVO de speedhacks (puede crashear/glitchear)" OFF)
+option(VITAGL_SAFE_SPEEDHACKS "Compilar vitaGL con el set SEGURO de speedhacks (solo CPU, sin riesgo de colgar la GPU)" OFF)
+
+set(VITAGL_BASE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1")
+
+if (VITAGL_SAFE_SPEEDHACKS)
+  # SET SEGURO. Criterio: solo flags cuyo efecto es codigo de CPU mas barato y
+  # que NO cambian como se le habla a la GPU ni como se maneja su memoria. Un
+  # glitch visual aca es reversible; un cuelgue de GPU no.
+  #
+  #   MATH_SPEEDHACK=1        matematica de matrices mas rapida. Puro CPU.
+  #   CIRCULAR_POOL_SPEEDHACK=1  un solo buffer en el pool circular interno. El
+  #                           README lo describe como "slightly improves CPU
+  #                           performance". Puro CPU.
+  #   NO_TEX_COMBINER=1       saca el soporte de GL_COMBINE (fixed-function).
+  #                           DH2 es 100% shaders GLSL, no usa el pipeline fijo,
+  #                           asi que aca no se pierde nada.
+  #   DRAW_SPEEDHACK=2        se MANTIENE en 2, no se sube a 1. El 2 ya viene
+  #                           corriendo bien en hardware (los 25 FPS salieron
+  #                           con esto puesto); el 1 amplia el camino rapido a
+  #                           todos los draws y es justamente el que "may cause
+  #                           crashes" en el camino de submision a GPU.
+  set(VITAGL_MAKE_FLAGS_STR "${VITAGL_BASE_FLAGS} DRAW_SPEEDHACK=2 MATH_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 NO_TEX_COMBINER=1")
+elseif (VITAGL_EXTRA_SPEEDHACKS)
+  # SET AGRESIVO. Toca el camino de submision a GPU y de subida de texturas:
+  # aca si puede haber cuelgues. Probar solo como experimento.
+  set(VITAGL_MAKE_FLAGS_STR "${VITAGL_BASE_FLAGS} DRAW_SPEEDHACK=1 INDICES_DRAW_SPEEDHACK=1 BUFFERS_SPEEDHACK=1 MATH_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 TEXTURE_UPLOADS_SPEEDHACK=1 NO_TEX_COMBINER=1")
 else()
-  set(VITAGL_MAKE_FLAGS_STR "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2 SAMPLERS_SPEEDHACK=1 HAVE_GLSL_UBOS=1")
+  set(VITAGL_MAKE_FLAGS_STR "${VITAGL_BASE_FLAGS} DRAW_SPEEDHACK=2")
 endif()
+
+# EXCLUIDOS de los DOS sets, con razon concreta -- no agregarlos sin releer esto:
+#   DEPTH_STENCIL_HACK=1   hace que depth/stencil no cuesten memoria, pero DH2
+#                          depende CRITICAMENTE de un stencil real: toda su
+#                          UI/HUD son clips de GameSWF con mascara de stencil.
+#                          Ya se comprobo en hardware (log_001.log) que sin
+#                          stencil NO SE DIBUJA NADA.
+#   PRIMITIVES_SPEEDHACK=1 glitchea GL_LINES/GL_POINTS, y GameSWF dibuja formas
+#                          vectoriales.
+#   INDICES_SPEEDHACK=1    rompe draws instanciados e indices de 32 bits.
+#   TEXTURES_SPEEDHACK=1   incompatible con HAVE_TEXTURE_CACHE.
+#   READBACKS_SPEEDHACK=1  glitchea glReadPixels, que video.cpp usa de verdad.
 message(STATUS "vitaGL flags: ${VITAGL_MAKE_FLAGS_STR}")
 separate_arguments(VITAGL_MAKE_FLAGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS_STR}")
 set(VITAGL_STAMP "${CMAKE_BINARY_DIR}/vitagl.stamp")

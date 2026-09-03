@@ -68,3 +68,9 @@ vpk_backups/
 dungeon-hunter-2_extract/
 README VITAGL.md
 dump_analysis.txt
+# vitaGL vendorizado (ver lib/vitagl/VENDORED.md): el codigo se trackea, los
+# artefactos de build no -- los regenera build_vitagl.sh + make desde CMake.
+lib/vitagl/**/*.o
+lib/vitagl/*.a
+lib/vitagl/*.smp
+lib/vitagl/*.smpc

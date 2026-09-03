@@ -1,3 +1,4 @@
+extern void *vglGetProcAddress(const char *name);
 /*
  * Copyright (C) 2022-2024 Volodymyr Atamanenko
  *
@@ -279,7 +280,7 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
 }
 
 EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
-                                  void * win, const EGLint *attrib_list) {
+                                  EGLNativeWindowType win, const EGLint *attrib_list) {
     // Just something that is a valid pointer which can be freed later
     return strdup("surface");
 }
@@ -344,4 +345,75 @@ EGLBoolean eglGetConfigs(EGLDisplay display, EGLConfig * configs,
     *num_config = 1;
 
     return EGL_TRUE;
+}
+
+// additions from vitaGL
+#include <psp2/rtc.h>
+
+#define EGL_RET(y) \
+	egl_error = EGL_SUCCESS; \
+	return y;
+#define SET_EGL_ERROR(x, y) \
+	egl_error = x; \
+	return y;
+
+static EGLint egl_error = EGL_SUCCESS;
+static EGLenum rend_api = EGL_OPENGL_ES_API;
+
+extern int vsync_interval;
+EGLBoolean eglSwapInterval(EGLDisplay display, EGLint interval) {
+	vsync_interval = interval;
+	EGL_RET(EGL_TRUE)
+}
+
+extern void vglSwapBuffers(GLboolean vblank);
+EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
+	vglSwapBuffers(GL_FALSE);
+	EGL_RET(EGL_TRUE)
+}
+
+EGLBoolean eglBindAPI(EGLenum api) {
+	switch (api) {
+	case EGL_OPENGL_API:
+	case EGL_OPENGL_ES_API:
+		rend_api = api;
+		egl_error = EGL_SUCCESS;
+		break;
+	default:
+		SET_EGL_ERROR(EGL_BAD_PARAMETER, EGL_FALSE);
+	}
+	
+	EGL_RET(EGL_TRUE)
+}
+
+EGLenum eglQueryAPI(void) {
+	EGL_RET(rend_api)
+}
+
+EGLint eglGetError(void) {
+	EGLint ret = egl_error;
+	EGL_RET(ret)
+}
+
+
+void (*eglGetProcAddress(char const *procname))(void) {
+	EGL_RET((void (*)(void))(void (*)(void))vglGetProcAddress(procname));
+}
+
+EGLDisplay eglGetDisplay(NativeDisplayType native_display) {
+	if (native_display == EGL_DEFAULT_DISPLAY) {
+		EGL_RET((EGLDisplay)3);
+	} else {
+		EGL_RET(EGL_NO_DISPLAY)
+	}
+}
+
+EGLuint64 eglGetSystemTimeFrequencyNV(void) {
+	EGL_RET((EGLuint64)sceRtcGetTickResolution())
+}
+
+EGLuint64 eglGetSystemTimeNV(void) {
+	SceRtcTick t;
+	sceRtcGetCurrentTick(&t);
+	EGL_RET(t.tick)
 }

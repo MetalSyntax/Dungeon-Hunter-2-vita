@@ -36,8 +36,21 @@
 
 #define FCACHE_ENABLED 1
 #define FCACHE_MAX_ENTRIES 1024
-#define FCACHE_MAX_FILE_SIZE (256 * 1024)
-#define FCACHE_MAX_TOTAL_BYTES (32 * 1024 * 1024)
+// Dimensionado con numeros reales medidos (log_000.log / log_001.log,
+// 2026-09-02), no adivinado -- que era justo lo que pedia la nota de abajo:
+//   * 100 fopen() de archivos por encima del limite viejo de 256KB, sumando
+//     368.910.986 bytes (369 MB) releidos del almacenamiento en UNA sola
+//     sesion, ninguno de ellos cacheable.
+//   * archivo mas grande visto: 11.692.544 bytes (11,7 MB).
+//   * hasta la fuente (app0:DejaVuSans.ttf, 757 KB) se releia cada vez.
+// El presupuesto de bytes viejo (32MB) NUNCA se llenaba, y eso era engañoso:
+// no sobraba lugar, era que los archivos grandes ni siquiera eran candidatos.
+// 16MB por archivo deja pasar comodo al mas grande visto; 96MB de presupuesto
+// total deja ~160MB del heap de 256MB (_newlib_heap_size_user, source/main.c)
+// para el juego. El diagnostico de mallinfo() que ya existe abajo se dispara si
+// este techo se llena, y ESE numero es el que debe guiar el proximo ajuste.
+#define FCACHE_MAX_FILE_SIZE (16 * 1024 * 1024)
+#define FCACHE_MAX_TOTAL_BYTES (96 * 1024 * 1024)
 #define FCACHE_MAX_HANDLES 64
 
 typedef struct {
@@ -125,6 +138,12 @@ static int fcache_is_cacheable_mode(const char *mode) {
 
 static int s_fcache_entry_cap_hit_logged = 0;
 
+// Contadores del knob por-archivo (FCACHE_MAX_FILE_SIZE), ver fcache_populate().
+static int s_fcache_oversize_files = 0;
+static long s_fcache_oversize_bytes = 0;
+static long s_fcache_oversize_largest = 0;
+static int s_fcache_oversize_logged = 0;
+
 // Called right after a real fopen() succeeds for a cacheable path not
 // already in the cache -- reads the whole file via the SAME real
 // (non-wrapped) fread/fseek/ftell the rest of this file already uses, then
@@ -163,7 +182,42 @@ static void fcache_populate(const char *path, FILE *real_file) {
     long size = ftell(real_file);
     fseek(real_file, 0, SEEK_SET);
 #endif
-    if (size <= 0 || size > FCACHE_MAX_FILE_SIZE) return;
+    if (size <= 0) return;
+
+    // El OTRO knob (el de la nota de arriba, distinto del presupuesto de bytes):
+    // todo archivo mayor a FCACHE_MAX_FILE_SIZE se descartaba aca en silencio,
+    // sin ninguna linea de log -- por eso log_172.txt no tiene NI UNA linea
+    // [fcache] pese a que el juego relee assets todo el tiempo: el presupuesto
+    // de 32MB nunca llego a llenarse porque los archivos grandes (.bdae, atlas
+    // de texturas, .swf) ni siquiera son candidatos. Sin datos no se puede
+    // dimensionar el bump, asi que se instrumenta igual que el cap de bytes:
+    // l_warn (sobrevive Release), primer hit + total periodico, nunca por
+    // rechazo. Con el proximo log se puede subir FCACHE_MAX_FILE_SIZE con
+    // numeros reales en vez de adivinar una constante mas grande.
+    if (size > FCACHE_MAX_FILE_SIZE) {
+        pthread_mutex_lock(&s_fcache_lock);
+        s_fcache_oversize_files++;
+        s_fcache_oversize_bytes += size;
+        if (size > s_fcache_oversize_largest) s_fcache_oversize_largest = size;
+        int should_log_first = !s_fcache_oversize_logged;
+        if (should_log_first) s_fcache_oversize_logged = 1;
+        int files_snapshot = s_fcache_oversize_files;
+        long bytes_snapshot = s_fcache_oversize_bytes;
+        long largest_snapshot = s_fcache_oversize_largest;
+        pthread_mutex_unlock(&s_fcache_lock);
+
+        if (should_log_first) {
+            l_warn("[fcache] primer archivo por encima del limite por-archivo (%d bytes): %s pesa %ld bytes -- "
+                   "NO se cachea, se relee del almacenamiento cada vez. Usar el total periodico de abajo para "
+                   "dimensionar el proximo FCACHE_MAX_FILE_SIZE",
+                   FCACHE_MAX_FILE_SIZE, path, size);
+        } else if (files_snapshot % FCACHE_REJECT_LOG_EVERY == 0) {
+            l_warn("[fcache] oversize acumulado: %d archivos / %ld bytes rechazados por FCACHE_MAX_FILE_SIZE (%d); "
+                   "el mas grande visto hasta ahora: %ld bytes",
+                   files_snapshot, bytes_snapshot, FCACHE_MAX_FILE_SIZE, largest_snapshot);
+        }
+        return;
+    }
 
     pthread_mutex_lock(&s_fcache_lock);
     if (s_fcache_total_bytes + size > FCACHE_MAX_TOTAL_BYTES) {
@@ -228,6 +282,10 @@ static void fcache_populate(const char *path, FILE *real_file) {
             path, size, total_bytes, FCACHE_MAX_TOTAL_BYTES, total_files);
 }
 
+#define NEG_CACHE_SIZE 2048
+static char s_neg_cache[NEG_CACHE_SIZE][256];
+static int s_neg_cache_count = 0;
+
 FILE * fopen_soloader(const char * filename, const char * mode) {
     // The engine's own on-demand asset streaming (glitch::collada::COnDemandReader,
     // used for .bdae model/character data) sometimes re-resolves an already-absolute
@@ -238,6 +296,17 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     // duplicate prefix instead of letting that second, broken open silently fail.
     if (strncmp(filename, DATA_PATH DATA_PATH, strlen(DATA_PATH DATA_PATH)) == 0) {
         return fopen_soloader(filename + strlen(DATA_PATH), mode);
+    }
+
+    if (strchr(mode, 'r')) {
+        pthread_mutex_lock(&s_fcache_lock);
+        for (int i = 0; i < s_neg_cache_count; i++) {
+            if (strcmp(s_neg_cache[i], filename) == 0) {
+                pthread_mutex_unlock(&s_fcache_lock);
+                return NULL;
+            }
+        }
+        pthread_mutex_unlock(&s_fcache_lock);
     }
 
     if (fcache_is_cacheable_mode(mode)) {
@@ -354,8 +423,18 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 
     if (ret)
         l_debug("fopen(%s, %s): %p", filename, mode, ret);
-    else
+    else {
         l_warn("fopen(%s, %s): %p", filename, mode, ret);
+        if (strchr(mode, 'r')) {
+            pthread_mutex_lock(&s_fcache_lock);
+            if (s_neg_cache_count < NEG_CACHE_SIZE) {
+                strncpy(s_neg_cache[s_neg_cache_count], filename, 255);
+                s_neg_cache[s_neg_cache_count][255] = '\0';
+                s_neg_cache_count++;
+            }
+            pthread_mutex_unlock(&s_fcache_lock);
+        }
+    }
 
     return ret;
 }

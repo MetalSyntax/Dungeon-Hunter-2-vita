@@ -63,7 +63,36 @@ enum {
 
 #define PTHR_INLINE static inline __attribute__((always_inline))
 
-void * initializedObjects[PTHR_MAX_OBJECTS] = {0};
+// Set de punteros con direccionamiento abierto (sondeo lineal) en vez del
+// arreglo lineal que habia antes. El arreglo hacia que CADA
+// pthread_mutex_lock() del motor (via _mutex_t_static_init ->
+// isObjectInitialized) tomara un LwMutex GLOBAL y comparara hasta 1024
+// punteros. Con Box2D + GameSWF + los resource managers del motor bloqueando
+// mutexes miles de veces por frame, eso es trabajo O(n) serializado entre
+// todos los hilos dentro del presupuesto de frame.
+//
+// Ademas explicaba la degradacion progresiva de FPS dentro de una misma
+// sesion (visible en log_000/003/004: arranca en ~8-9 FPS y cae a ~5.6): a
+// medida que se registran mas objetos, el barrido promedio se alarga, y un
+// MISS siempre recorria las 1024 posiciones enteras.
+//
+// Capacidad potencia de 2 y con holgura sobre PTHR_MAX_OBJECTS para que el
+// factor de carga se mantenga bajo y el sondeo sea corto.
+#define PTHR_SET_CAP 8192
+#define PTHR_SET_MASK (PTHR_SET_CAP - 1)
+#define PTHR_TOMBSTONE ((void *) 1)
+
+static void * pthr_set[PTHR_SET_CAP] = {0};
+
+// Los punteros vienen de malloc() o son direcciones de objetos del motor:
+// siempre alineados a >= 4 bytes, asi que descartar los bits bajos y mezclar
+// da una distribucion pareja.
+PTHR_INLINE unsigned pthr_hash(const void *p) {
+    uintptr_t v = (uintptr_t) p >> 3;
+    v ^= v >> 13;
+    v *= 0x9E3779B1u;
+    return (unsigned) (v & PTHR_SET_MASK);
+}
 static SceKernelLwMutexWork pthr_mutex;
 static volatile short int pthr_mutex_inited = 0;
 
@@ -83,39 +112,67 @@ static volatile short int pthr_mutex_inited = 0;
         sceKernelUnlockLwMutex(&pthr_mutex, 1); \
     }
 
+// SIN LOCK a proposito. Lo caro del codigo original no era la tabla: eran los
+// dos syscalls al kernel (sceKernelLockLwMutex/Unlock) y el barrido lineal de
+// 1024 punteros, y eso pasaba en CADA pthread_mutex_lock del motor -- que,
+// segun el desensamblado del .so, son todos los allocators de STLport, o sea
+// CADA std::string/vector/map que el motor alloca.
+//
+// La tabla tiene tamano fijo y nunca rehashea, y cada slot se escribe con un
+// store atomico alineado, asi que un lector concurrente ve o el valor viejo o
+// el nuevo, nunca uno a medias. Los escritores (remember/forget) si toman el
+// lock entre ellos.
 int isObjectInitialized(const void * mut) {
-    PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == mut) {
-            PTHR_UNLOCK
-            return 1;
-        }
+    unsigned i = pthr_hash(mut);
+    for (unsigned probe = 0; probe < PTHR_SET_CAP; ++probe) {
+        void *slot = __atomic_load_n(&pthr_set[i], __ATOMIC_ACQUIRE);
+        if (slot == NULL) return 0;            // hueco real: no esta
+        if (slot == mut) return 1;
+        i = (i + 1) & PTHR_SET_MASK;           // tombstone o colision: seguir
     }
-    PTHR_UNLOCK
     return 0;
 }
 
 int rememberObject(void * mut) {
     PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == 0) {
-            initializedObjects[i] = mut;
+    unsigned i = pthr_hash(mut);
+    int tomb = -1;
+    for (unsigned probe = 0; probe < PTHR_SET_CAP; ++probe) {
+        void *slot = pthr_set[i];
+        if (slot == mut) { PTHR_UNLOCK return 1; }   // ya estaba
+        if (slot == PTHR_TOMBSTONE) {
+            if (tomb < 0) tomb = (int) i;            // reusable, pero seguir
+        } else if (slot == NULL) {
+            __atomic_store_n(&pthr_set[tomb >= 0 ? (unsigned) tomb : i], mut, __ATOMIC_RELEASE);
             PTHR_UNLOCK
             return 1;
         }
+        i = (i + 1) & PTHR_SET_MASK;
+    }
+    if (tomb >= 0) {
+        __atomic_store_n(&pthr_set[tomb], mut, __ATOMIC_RELEASE);
+        PTHR_UNLOCK
+        return 1;
     }
     PTHR_UNLOCK
-    return 0;
+    return 0;   // set lleno (no deberia pasar con PTHR_SET_CAP=8192)
 }
 
 int forgetObject(const void * mut) {
     PTHR_LOCK
-    for (int i = 0; i < PTHR_MAX_OBJECTS; ++i) {
-        if (initializedObjects[i] == mut) {
-            initializedObjects[i] = 0;
+    unsigned i = pthr_hash(mut);
+    for (unsigned probe = 0; probe < PTHR_SET_CAP; ++probe) {
+        void *slot = pthr_set[i];
+        if (slot == NULL) break;
+        if (slot == mut) {
+            // Tombstone, no NULL: un NULL cortaria la cadena de sondeo de
+            // cualquier otra clave que haya colisionado en este indice y
+            // termine mas adelante, y esa clave dejaria de encontrarse.
+            __atomic_store_n(&pthr_set[i], PTHR_TOMBSTONE, __ATOMIC_RELEASE);
             PTHR_UNLOCK
             return 1;
         }
+        i = (i + 1) & PTHR_SET_MASK;
     }
     PTHR_UNLOCK
     return 0;
@@ -132,9 +189,26 @@ PTHR_INLINE int _attr_t_static_init(pthread_attr_t_bionic * attr) {
 }
 
 // null check for `mutex` param must be performed before this, `attr` is fine as null
+// `real_ptr` de las structs bionic ALIASEA el `int volatile value` de bionic, y
+// un mutex/cond inicializado estaticamente por el motor trae ahi una de las
+// constantes PTHREAD_*_INITIALIZER (0, 0x4000, 0x8000) -- no un puntero. Todo
+// lo que nosotros guardamos ahi viene de malloc(), que en Vita devuelve
+// direcciones del heap de usuario, siempre muy por encima de los primeros 64KB
+// (esa zona no esta mapeada). Asi que este umbral distingue de forma confiable
+// "puntero real que publicamos nosotros" de "constante de inicializador
+// estatico". Es la misma suposicion que ya hacia el codigo original al leer
+// *(int*)mutex y compararlo contra esas constantes.
+#define PTHR_IS_LIVE_PTR(p) ((uintptr_t)(p) > 0x10000u)
+
 PTHR_INLINE int _mutex_t_static_init(pthread_mutex_t_bionic * mutex, const pthread_mutexattr_t * attr) {
     int ret = 0, kind = PTHREAD_MUTEX_NORMAL;
 
+    // El registro es la UNICA autoridad sobre "ya inicializado", igual que en el
+    // codigo original. Una version anterior de este fix dedujo eso del valor de
+    // mutex->real_ptr (asumiendo que un puntero de malloc siempre queda por
+    // encima de 0x10000): era fragil, porque un mutex con basura sin inicializar
+    // en ese campo se tomaba como ya listo. Lo que se arreglo aca es el COSTO de
+    // la consulta (ahora O(1) y sin syscalls), no quien decide.
     if (isObjectInitialized(mutex)) {
         //logv_debug("mutex already initialized: %p", mutex);
         return ret;
@@ -148,19 +222,25 @@ PTHR_INLINE int _mutex_t_static_init(pthread_mutex_t_bionic * mutex, const pthre
         else if (* (int *) mutex == BIONIC_PTHREAD_ERRORCHECK_MUTEX_INITIALIZER) kind = PTHREAD_MUTEX_ERRORCHECK;
     }
 
-    pthread_mutex_t mut;
-    mutex->real_ptr = malloc(sizeof(pthread_mutex_t));
-    sceClibMemcpy(mutex->real_ptr, &mut, sizeof(pthread_mutex_t));
+    pthread_mutex_t *p = malloc(sizeof(pthread_mutex_t));
+    if (!p) return ENOMEM;
 
     pthread_mutexattr_t mutattr;
     pthread_mutexattr_init(&mutattr);
     pthread_mutexattr_settype(&mutattr, kind);
-    ret = pthread_mutex_init(mutex->real_ptr, &mutattr);
+    ret = pthread_mutex_init(p, &mutattr);
     pthread_mutexattr_destroy(&mutattr);
 
     if (ret == 0) {
+        // real_ptr ANTES de rememberObject, para conservar la invariante del
+        // codigo original: "esta en el registro" implica "real_ptr ya es un
+        // puntero valido". Al reves, otro hilo (o esta misma funcion mas tarde)
+        // podria ver el objeto como registrado y usar un real_ptr que todavia es
+        // la constante del inicializador estatico.
+        __atomic_store_n(&mutex->real_ptr, p, __ATOMIC_RELEASE);
         rememberObject(mutex);
     } else {
+        free(p);
         l_error("mutex initialization for %p has failed", mutex);
     }
 
@@ -176,15 +256,16 @@ PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_
         return ret;
     }
 
-    pthread_cond_t c;
-    cond->real_ptr = malloc(sizeof(pthread_cond_t));
-    sceClibMemcpy(cond->real_ptr, &c, sizeof(pthread_cond_t));
+    pthread_cond_t *p = malloc(sizeof(pthread_cond_t));
+    if (!p) return ENOMEM;
 
-    ret = pthread_cond_init(cond->real_ptr, attr);
+    ret = pthread_cond_init(p, attr);
 
     if (ret == 0) {
+        __atomic_store_n(&cond->real_ptr, p, __ATOMIC_RELEASE);  // ver el mutex
         rememberObject(cond);
     } else {
+        free(p);
         l_error("cond initialization for %p has failed", cond);
     }
 
@@ -291,9 +372,22 @@ int pthread_mutex_init_soloader(pthread_mutex_t_bionic *uid, const pthread_mutex
 int pthread_mutex_destroy_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return 0;
+    // PTHR_IS_LIVE_PTR, no un simple chequeo de NULL: un mutex que el motor
+    // inicializo estaticamente y nunca uso trae una constante de inicializador
+    // (0x4000/0x8000) en real_ptr, y pasarsela a pthread_mutex_destroy()/free()
+    // es dereferenciar un puntero salvaje.
+    // forgetObject SIEMPRE, pase lo que pase con real_ptr. Una version anterior
+    // de este fix hacia early-return aca sin desregistrar: la entrada quedaba
+    // viva para siempre y, cuando el heap reutilizaba esa direccion para otro
+    // objeto, isObjectInitialized devolvia true sobre un mutex nuevo cuyo
+    // real_ptr todavia era 0 -> pthread_mutex_lock(0) -> crash en el arranque.
     forgetObject(mutex);
+    if (!PTHR_IS_LIVE_PTR(mutex->real_ptr)) {
+        mutex->real_ptr = 0x0;
+        return 0;
+    }
     int ret = pthread_mutex_destroy(mutex->real_ptr);
-    if (mutex->real_ptr) free(mutex->real_ptr);
+    free(mutex->real_ptr);
     mutex->real_ptr = 0x0;
     return ret;
 }
@@ -315,7 +409,7 @@ int pthread_mutex_trylock_soloader(pthread_mutex_t_bionic *mutex)
 int pthread_mutex_unlock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
-    if (!mutex->real_ptr) return EINVAL;
+    if (!PTHR_IS_LIVE_PTR(mutex->real_ptr)) return EINVAL;
     return pthread_mutex_unlock(mutex->real_ptr);
 }
 
@@ -344,9 +438,13 @@ int pthread_cond_init_soloader(pthread_cond_t_bionic *cond,
 int pthread_cond_destroy_soloader(pthread_cond_t_bionic *cond)
 {
     if (!cond) return 0;
-    forgetObject(cond);
+    forgetObject(cond);   // siempre -- ver el comentario del mutex
+    if (!PTHR_IS_LIVE_PTR(cond->real_ptr)) {
+        cond->real_ptr = 0x0;
+        return 0;
+    }
     int ret = pthread_cond_destroy(cond->real_ptr);
-    if (cond->real_ptr) free(cond->real_ptr);
+    free(cond->real_ptr);
     cond->real_ptr = 0x0;
     return ret;
 }

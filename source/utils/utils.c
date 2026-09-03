@@ -25,6 +25,27 @@
 #ifdef USE_SCELIBC_IO
 #include <libc_bridge/libc_bridge.h>
 #endif
+#include <psp2/rtc.h>
+#include <psp2/kernel/processmgr.h>
+
+int fast_gettimeofday(struct timeval *tv, void *tz) {
+    static struct timeval base_tv = {0, 0};
+    static uint64_t base_tick = 0;
+    if (base_tick == 0) {
+        gettimeofday(&base_tv, NULL);
+        base_tick = sceKernelGetProcessTimeWide();
+    }
+    if (tv) {
+        uint64_t tick = sceKernelGetProcessTimeWide() - base_tick;
+        tv->tv_sec = base_tv.tv_sec + (tick / 1000000);
+        tv->tv_usec = base_tv.tv_usec + (tick % 1000000);
+        if (tv->tv_usec >= 1000000) {
+            tv->tv_sec++;
+            tv->tv_usec -= 1000000;
+        }
+    }
+    return 0;
+}
 
 uint64_t current_timestamp_ms() {
     struct timeval te;

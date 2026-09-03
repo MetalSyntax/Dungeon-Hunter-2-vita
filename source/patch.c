@@ -110,6 +110,36 @@ void so_patch(void) {
      * @details Prevents enemies/NPCs/objects from disappearing erratically during gameplay
      *          due to dynamic bounding box / aspect ratio culling mismatches.
      */
+    // CULLING_MODE controla cuanto de este bypass se aplica. Es la palanca de
+    // rendimiento mas grande que tiene el port, y a la vez la mas riesgosa:
+    //
+    // Forzar isCulled -> 0 significa "NADA esta nunca fuera de camara", asi que
+    // el motor corre onAnimate() (esqueletos, huesos, skinning) de TODO el nivel
+    // cada frame, actualiza todos los objetos y encola todos los draws, visibles
+    // o no. Eso encaja exacto con lo medido en hardware: CPU-submission de
+    // 120-185ms por frame con el GPU libre en 0.18ms, y -- lo decisivo -- que
+    // bajar la resolucion de render a 480x272 (25% de los pixeles) no cambiara
+    // NADA el FPS de combate (log_003 vs log_004). El costo no esta en pixeles,
+    // esta en animar y actualizar un nivel entero por frame.
+    //
+    //   0 = bypass completo (los 3 hooks). Comportamiento historico y DEFAULT:
+    //       es lo que arreglo el bug de enemigos invisibles (commit 853ac40) y
+    //       lo unico confirmado bueno visualmente en hardware. No cambiar el
+    //       default sin una prueba que demuestre que la alternativa no regresa
+    //       ese bug.
+    //   1 = se restaura SOLO ObjectBase::TestCullingBeforeUpdate (culling del
+    //       lado del UPDATE), y los dos isCulled siguen bypasseados (culling del
+    //       lado de la VISIBILIDAD). El bug de invisibilidad era que cosas no se
+    //       DIBUJABAN, y esto no toca ese camino -- separa el costo de update del
+    //       de render para poder medirlos por separado. Artefacto posible y mas
+    //       leve: entidades fuera de camara que se congelan en vez de desaparecer.
+    //   2 = culling stock del motor, sin ningun hook. Es el modo mas rapido y el
+    //       que con mas probabilidad devuelve el bug de enemigos invisibles.
+#ifndef CULLING_MODE
+#define CULLING_MODE 0
+#endif
+
+#if CULLING_MODE < 2
     void *sym_is_culled_node = (void *)so_symbol(&so_mod, "_ZNK6glitch5scene13CSceneManager8isCulledEPKNS0_10ISceneNodeE");
     if (sym_is_culled_node) {
         hook_addr((uintptr_t)sym_is_culled_node, (uintptr_t)&ret0);
@@ -121,12 +151,17 @@ void so_patch(void) {
         hook_addr((uintptr_t)sym_is_culled_box, (uintptr_t)&ret0);
         l_success("Hooked CSceneManager::isCulled(aabbox3d, E_CULLING_TYPE) -> ret0");
     }
+#endif
 
+#if CULLING_MODE < 1
     void *sym_test_culling = (void *)so_symbol(&so_mod, "_ZN10ObjectBase23TestCullingBeforeUpdateERK4aabbIfE");
     if (sym_test_culling) {
         hook_addr((uintptr_t)sym_test_culling, (uintptr_t)&ret1);
         l_success("Hooked ObjectBase::TestCullingBeforeUpdate -> ret1");
     }
+#endif
+    l_error("[culling] CULLING_MODE=%d (0=bypass total, 1=update-culling activo, 2=culling stock)",
+            CULLING_MODE);
 
     /**
      * @brief Replace obsolete ARMv5 'SWP' atomic spinlocks in Boost with ARMv7 atomics.

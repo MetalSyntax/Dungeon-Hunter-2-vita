@@ -2,6 +2,15 @@
 set -e
 
 # Uso: ./build.sh                 -> build normal, build/dungeon_hunter_2.vpk
+#      ./build.sh debug|release|relwithdebinfo|minsizerel
+#                                   -> mismo build normal pero con CMAKE_BUILD_TYPE
+#                                    fijo y SIN preguntar por stdin (release ->
+#                                    Release, etc.) -- convencion que espera
+#                                    psvita-toolkit al invocar
+#                                    `bash build.sh <preset>` de forma no
+#                                    interactiva. Se puede combinar con
+#                                    cualquiera de los flags de diagnostico de
+#                                    abajo, ej. `./build.sh release --downsample-test`.
 #      ./build.sh --no-vsync-test  -> build de diagnostico (Fase performance,
 #                                    ver PORTING_PLAN.md) que deshabilita la
 #                                    espera de vblank de eglSwapInterval
@@ -13,6 +22,19 @@ set -e
 #                                    o ya estamos genuinamente por debajo de
 #                                    eso?" antes de invertir en algo mas
 #                                    invasivo como --downsample-test.
+#      ./build.sh --culling-test [MODE]
+#                                   -> LA palanca de perf mas grande. MODE 1
+#                                    (default) restaura el culling de update;
+#                                    MODE 2 restaura el culling stock completo
+#                                    (riesgo alto de devolver el bug de
+#                                    enemigos invisibles). Ver source/patch.c.
+#      ./build.sh --speedhacks-test -> build con el set agresivo de speedhacks
+#                                    de vitaGL (DRAW_SPEEDHACK=1,
+#                                    INDICES_DRAW/BUFFERS/MATH/CIRCULAR_POOL/
+#                                    TEXTURE_UPLOADS), a resolucion nativa.
+#                                    Puede crashear o glitchear: si falla, ir
+#                                    quitando flags de VITAGL_EXTRA_SPEEDHACKS
+#                                    en CMakeLists.txt de a uno.
 #      ./build.sh --downsample-test [DS_NUM] [DS_DEN]
 #                                   -> build experimental que renderiza toda
 #                                    la escena (mundo 3D + HUD 2D) a un FBO
@@ -70,6 +92,23 @@ set -e
 VPK_OUTPUT_NAME="dungeon_hunter_2"
 CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=OFF)
 
+# Extraemos un preset universal (debug/release/relwithdebinfo/minsizerel) de
+# los argumentos si esta presente, dejando el resto (los flags de diagnostico
+# de abajo, que siguen usando posicion $1/$2/$3) intacto -- ver comentario de
+# cabecera. psvita-toolkit siempre pasa el preset como primer argumento.
+BUILD_TYPE_EXPLICIT=""
+REMAINING_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        debug|Debug|DEBUG) BUILD_TYPE_EXPLICIT="Debug" ;;
+        release|Release|RELEASE) BUILD_TYPE_EXPLICIT="Release" ;;
+        relwithdebinfo|RelWithDebInfo|RELWITHDEBINFO) BUILD_TYPE_EXPLICIT="RelWithDebInfo" ;;
+        minsizerel|MinSizeRel|MINSIZEREL) BUILD_TYPE_EXPLICIT="MinSizeRel" ;;
+        *) REMAINING_ARGS+=("$arg") ;;
+    esac
+done
+set -- "${REMAINING_ARGS[@]}"
+
 if [ "$1" = "--no-vsync-test" ]; then
     VPK_OUTPUT_NAME="dungeon_hunter_2_novsync_test"
     CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=ON -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=OFF)
@@ -81,8 +120,27 @@ elif [ "$1" = "--profile-frame-time" ]; then
     CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=ON -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=ON -DDUMP_COMPILED_SHADERS=OFF)
 elif [ "$1" = "--downsample-test" ]; then
     VPK_OUTPUT_NAME="dungeon_hunter_2_downsample_test"
-    DS_N="${2:-2}"; DS_D="${3:-3}"
-    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=ON -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=OFF -DDS_NUM="$DS_N" -DDS_DEN="$DS_D")
+    # Default 3/4 = 720x408: exacto en los dos ejes, mismo aspect ratio de la
+    # Vita, 56% de los pixeles. Ver el comentario de DS_NUM/DS_DEN en
+    # CMakeLists.txt.
+    DS_N="${2:-3}"; DS_D="${3:-4}"
+    # PROFILE_FRAME_TIME=ON: el punto entero de esta variante es MEDIR si bajar
+    # la resolucion mueve la aguja, y sin el split CPU-submission/eglSwapBuffers
+    # el log solo da [fps] y no se puede saber que mitad cambio.
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=ON -DPROFILE_FRAME_TIME=ON -DDUMP_COMPILED_SHADERS=OFF -DDS_NUM="$DS_N" -DDS_DEN="$DS_D")
+elif [ "$1" = "--culling-test" ]; then
+    # CULLING_MODE=1 por default: restaura solo el culling del lado del UPDATE y
+    # deja los dos isCulled bypasseados, que es el escalon medible de menor
+    # riesgo (ver source/patch.c). `--culling-test 2` prueba el culling stock
+    # completo, mucho mas probable que devuelva el bug de invisibilidad.
+    CULL_M="${2:-1}"
+    VPK_OUTPUT_NAME="dungeon_hunter_2_culling_test${CULL_M}"
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=ON -DDUMP_COMPILED_SHADERS=OFF -DCULLING_MODE="$CULL_M")
+elif [ "$1" = "--speedhacks-test" ]; then
+    VPK_OUTPUT_NAME="dungeon_hunter_2_speedhacks_test"
+    # Set agresivo de speedhacks de vitaGL, a resolucion NATIVA para que sea
+    # comparable 1:1 contra la build normal (una variable a la vez).
+    CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=ON -DDUMP_COMPILED_SHADERS=OFF -DVITAGL_EXTRA_SPEEDHACKS=ON)
 elif [ "$1" = "--shader-cache-test" ]; then
     VPK_OUTPUT_NAME="dungeon_hunter_2_shader_cache_test"
     CMAKE_EXTRA_ARGS=(-DVITA_VPKNAME="$VPK_OUTPUT_NAME" -DDISABLE_VSYNC=OFF -DDOWNSAMPLE_RENDER=OFF -DPROFILE_FRAME_TIME=OFF -DDUMP_COMPILED_SHADERS=ON)
@@ -129,11 +187,16 @@ rsync -a \
 
 echo "[2/3] Ejecutando CMake y Make (${1:-build normal})..."
 
-read -p "¿Build de depuracion (logging detallado, DEBUG_SOLOADER)? [S/n] " DEBUG_OPTION
-if [[ "$DEBUG_OPTION" =~ ^[nN]$ ]]; then
-    BUILD_TYPE="Release"
+if [ -n "$BUILD_TYPE_EXPLICIT" ]; then
+    BUILD_TYPE="$BUILD_TYPE_EXPLICIT"
+    echo "Preset explicito: CMAKE_BUILD_TYPE=$BUILD_TYPE (sin prompt)"
 else
-    BUILD_TYPE="Debug"
+    read -p "¿Build de depuracion (logging detallado, DEBUG_SOLOADER)? [S/n] " DEBUG_OPTION
+    if [[ "$DEBUG_OPTION" =~ ^[nN]$ ]]; then
+        BUILD_TYPE="Release"
+    else
+        BUILD_TYPE="Debug"
+    fi
 fi
 
 # Ver el comentario de cabecera: nunca dejar un flag sin mencionar entre
@@ -189,4 +252,4 @@ if [ -z "$1" ]; then
 else
     echo "(build con flag -- el eboot.bin generico NO se tocó; usa el VPK completo o elegí el eboot_${VPK_OUTPUT_NAME}.bin a mano)"
 fi
-echo "Para instalar en un Vita real o Vita3K, usar porting_tools/manage_vita.py."
+echo "Para instalar en un Vita real, usar: psvita-toolkit deploy --project \"$PROJECT_DIR\""

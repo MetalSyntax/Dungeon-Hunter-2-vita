@@ -10,7 +10,17 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
-#include <gpu_es4/psp2_pvr_hint.h>
+
+#include <psp2/gxm.h>
+
+extern unsigned char vglInitWithCustomThreshold(int legacy_pool_size, int width, int height, int ram_threshold,
+                                                 int cdram_threshold, int phycont_threshold, int cdlg_threshold,
+                                                 unsigned int msaa);
+// SCE_KERNEL_MAX_MAIN_CDIALOG_MEM_SIZE (lib/vitagl/source/utils/mem_utils.h) -- the fixed
+// size of the separate "common dialog" memory region on Vita. Passing this exact value as
+// cdlg_threshold makes vitaGL reserve 0 bytes of it for itself (same as vglInitExtended's
+// own hardcoded behavior), leaving it fully available for sceMsgDialog (see dialog.c).
+#define VGL_CDLG_THRESHOLD 0x8C6000
 
 static EGLDisplay display;
 static EGLSurface surface;
@@ -160,6 +170,16 @@ static void compute_letterbox_rect(int *out_x, int *out_y, int *out_w, int *out_
     *out_h = REAL_SCREEN_H;
 }
 
+void glutil_get_render_target_size(int *out_w, int *out_h) {
+#ifdef DOWNSAMPLE_RENDER
+    if (out_w) *out_w = REAL_SCREEN_W * DS_NUM / DS_DEN;
+    if (out_h) *out_h = REAL_SCREEN_H * DS_NUM / DS_DEN;
+#else
+    if (out_w) *out_w = REAL_SCREEN_W;
+    if (out_h) *out_h = REAL_SCREEN_H;
+#endif
+}
+
 int glutil_screen_touch_to_logical(int screen_x, int screen_y, int *out_x, int *out_y) {
     if (screen_x < 0 || screen_x >= REAL_SCREEN_W || screen_y < 0 || screen_y >= REAL_SCREEN_H) {
         return 0;
@@ -169,155 +189,81 @@ int glutil_screen_touch_to_logical(int screen_x, int screen_y, int *out_x, int *
     return 1;
 }
 
-#ifdef DOWNSAMPLE_RENDER
-// Offscreen FBO the whole scene renders into instead of the real default
-// framebuffer (see glBindFramebuffer_soloader), sized DS_NUM/DS_DEN of
-// native -- gl_swap() upscales it onto the real screen with one GL_LINEAR
-// blit before the real eglSwapBuffers. s_ds_fbo == 0 means either not yet
-// initialized or initialization failed (FBO incomplete) -- both cases fall
-// back to rendering straight to the default framebuffer, same as
-// DOWNSAMPLE_RENDER being off.
-static GLuint s_ds_fbo = 0;
-static GLuint s_ds_color_tex = 0;
-static GLuint s_ds_depth_rb = 0;
-static GLuint s_blit_program = 0;
-
-// Fullscreen triangle strip, interleaved (x, y, u, v) per vertex -- covers
-// the full [-1,1] clip-space quad with matching [0,1] texcoords (no Y-flip
-// needed: the FBO's color texture and this blit live in the same GL
-// texture-coordinate convention, origin bottom-left, as the render itself).
-static const GLfloat kBlitQuad[16] = {
-    -1.0f, -1.0f, 0.0f, 0.0f,
-     1.0f, -1.0f, 1.0f, 0.0f,
-    -1.0f,  1.0f, 0.0f, 1.0f,
-     1.0f,  1.0f, 1.0f, 1.0f,
-};
-
-static GLuint compile_blit_shader(GLenum type, const char *src) {
-    GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &src, NULL);
-    glCompileShader(shader);
-    GLint status = GL_FALSE;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
-    if (status == GL_FALSE) {
-        GLchar log[512];
-        GLsizei len = 0;
-        glGetShaderInfoLog(shader, sizeof(log), &len, log);
-        l_error("DOWNSAMPLE_RENDER: blit shader compile FAILED: %s", log);
-    }
-    return shader;
-}
-
-static void init_downsample_render(void) {
-    int ds_w = REAL_SCREEN_W * DS_NUM / DS_DEN;
-    int ds_h = REAL_SCREEN_H * DS_NUM / DS_DEN;
-
-    glGenTextures(1, &s_ds_color_tex);
-    glBindTexture(GL_TEXTURE_2D, s_ds_color_tex);
-    // GL_RGBA (not GL_RGB): the 3-channel format isn't a universally
-    // guaranteed color-renderable format on embedded GLES2 drivers -- RGBA8
-    // is the one format every GLES2 implementation is required to support
-    // as an FBO color attachment. Using GL_RGB here was a real candidate for
-    // why the downsample build "didn't even open" on hardware: an
-    // unsupported attachment format can misbehave a lot worse than the
-    // graceful glCheckFramebufferStatus-incomplete path below is built to
-    // handle, on a driver that isn't fully spec-conformant for the edge case.
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ds_w, ds_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    glGenRenderbuffers(1, &s_ds_depth_rb);
-    glBindRenderbuffer(GL_RENDERBUFFER, s_ds_depth_rb);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, ds_w, ds_h);
-
-    glGenFramebuffers(1, &s_ds_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, s_ds_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s_ds_color_tex, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, s_ds_depth_rb);
-
-    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        l_error("DOWNSAMPLE_RENDER: FBO incomplete (status=0x%04x) -- falling back to native resolution", status);
-        glDeleteFramebuffers(1, &s_ds_fbo);
-        s_ds_fbo = 0;
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        return;
-    }
-    l_success("DOWNSAMPLE_RENDER: FBO %dx%d ready (native %dx%d, ratio %d/%d)",
-              ds_w, ds_h, REAL_SCREEN_W, REAL_SCREEN_H, DS_NUM, DS_DEN);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    static const char *kBlitVS =
-        "attribute vec2 aPos;\n"
-        "attribute vec2 aUV;\n"
-        "varying vec2 vUV;\n"
-        "void main() {\n"
-        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
-        "    vUV = aUV;\n"
-        "}\n";
-    static const char *kBlitFS =
-        "precision mediump float;\n"
-        "varying vec2 vUV;\n"
-        "uniform sampler2D uTex;\n"
-        "void main() {\n"
-        "    gl_FragColor = texture2D(uTex, vUV);\n"
-        "}\n";
-
-    GLuint vs = compile_blit_shader(GL_VERTEX_SHADER, kBlitVS);
-    GLuint fs = compile_blit_shader(GL_FRAGMENT_SHADER, kBlitFS);
-    s_blit_program = glCreateProgram();
-    glAttachShader(s_blit_program, vs);
-    glAttachShader(s_blit_program, fs);
-    glBindAttribLocation(s_blit_program, 0, "aPos");
-    glBindAttribLocation(s_blit_program, 1, "aUV");
-    glLinkProgram(s_blit_program);
-    GLint link_status = GL_FALSE;
-    glGetProgramiv(s_blit_program, GL_LINK_STATUS, &link_status);
-    if (link_status == GL_FALSE) {
-        GLchar log[512];
-        GLsizei len = 0;
-        glGetProgramInfoLog(s_blit_program, sizeof(log), &len, log);
-        l_error("DOWNSAMPLE_RENDER: blit program link FAILED: %s", log);
-    }
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-}
-#endif // DOWNSAMPLE_RENDER
+// NOTA: aca vivia todo el andamiaje del FBO offscreen + blit de upscale que
+// implementaba DOWNSAMPLE_RENDER. Se elimino a favor de bajar directamente
+// DISPLAY_WIDTH/HEIGHT en vglInitWithCustomThreshold() (ver gl_init()), que es
+// el enfoque de Asphalt-5-Vita: el escalado lo hace el hardware de display de
+// la Vita, y el framebuffer por defecto conserva su depth y su stencil, que es
+// justo lo que le faltaba al FBO y dejaba a toda la UI de GameSWF sin dibujar.
 
 void gl_preload() {
     // Nothing required for PVR_PSP2
 }
 
 void gl_init() {
-    PVRSRV_PSP2_APPHINT hint;
-    memset(&hint, 0, sizeof(hint));
-    unsigned int rc = PVRSRVInitializeAppHint(&hint);
-    l_success("PVRSRVInitializeAppHint -> %u", rc);
-    if (!rc) {
-        l_error("PVRSRVInitializeAppHint failed");
-        sceKernelExitProcess(0);
+    // gl_init() and eglInitialize() call each other unconditionally (eglInitialize's
+    // body just does gl_init(); gl_init() itself calls eglInitialize(display,...) to
+    // finish EGL setup). That mutual recursion was harmless under the old PVR_PSP2
+    // path (PVRSRVInitializeAppHint/CreateVirtualAppHint are cheap/idempotent), but
+    // vglInitExtended() is NOT safe to call more than once -- calling it again while
+    // the first sceGxm context/display queue is still alive is exactly what produced
+    // a build that never got past the spinning vitaGL splash logo.
+    static unsigned char vgl_initialized = 0;
+    if (vgl_initialized) return;
+    vgl_initialized = 1;
+
+    // vglInitExtended() (what this used to call) hardcodes cdram_threshold=0 and
+    // phycont_threshold=0 -- see lib/vitagl/source/vgl.c:562-580 -- which means it
+    // reserves 100% of whatever CDRAM/PHYCONT is free at boot for its own internal
+    // pool, leaving NONE for anything allocated afterwards. That's exactly why the
+    // intro video's texture allocator failed on both CDRAM and PHYCONT (log_158/159/
+    // 160.txt: "texture memblock alloc FAILED on both CDRAM ... and PHYCONT ..."),
+    // and very likely why the engine's own subsequent allocations were stalling for
+    // several seconds at a time right after (log_160.txt: nativeRender() taking 4-9s
+    // per call around iter=40/46, watched by the [watchdog] thread below) -- fighting
+    // over an already fully-exhausted pool. PVR_PSP2 never had this problem since it
+    // managed CDRAM/PHYCONT itself, independently of the game/video's own allocations.
+    // Reserve explicit headroom instead (tune these if a future video/texture still
+    // fails to allocate, or reduce them if profiling shows vitaGL itself is starved).
+    //
+    // log_161.txt: even with 16MB/8MB reserved, the intro video's own allocator still
+    // failed -- but this time it asked for 17MB (1MB-aligned) instead of the ~2.75MB
+    // (128B-aligned) it asked for in log_158/159/160.txt. SceAvPlayer apparently sizes
+    // its decode buffer request based on how much free CDRAM it sees available, not a
+    // fixed size -- so raising the threshold just makes it ask for more, not less. Log
+    // the real free sizes so the actual budget is known instead of guessed at.
+    {
+        SceKernelFreeMemorySizeInfo mem_info;
+        mem_info.size = sizeof(mem_info);
+        if (sceKernelGetFreeMemorySize(&mem_info) >= 0) {
+            l_success("[mem_diag] free before vitaGL init: user=%d cdram=%d phycont=%d bytes",
+                      mem_info.size_user, mem_info.size_cdram, mem_info.size_phycont);
+        }
     }
-
-    // PVRSRVInitializeAppHint() only fills the numeric/boolean defaults. The
-    // window-system and GLES driver paths are app-specific and are left empty,
-    // so we MUST set them here: libIMGEGL dlopen()s these three modules to back
-    // the EGL display. If szWindowSystem is empty, eglGetDisplay() returns
-    // EGL_NO_DISPLAY while eglGetError() still reports EGL_SUCCESS (0x3000) --
-    // the exact failure seen in logs 047-050 after this block was reduced to a
-    // bare memset. Paths mirror the sceKernelLoadStartModule() calls in main.c.
-    strncpy(hint.szWindowSystem, "app0:module/libpvrPSP2_WSEGL.suprx", sizeof(hint.szWindowSystem) - 1);
-    strncpy(hint.szGLES1, "app0:module/libGLESv1_CM.suprx", sizeof(hint.szGLES1) - 1);
-    strncpy(hint.szGLES2, "app0:module/libGLESv2.suprx", sizeof(hint.szGLES2) - 1);
-
-    rc = PVRSRVCreateVirtualAppHint(&hint);
-    l_success("PVRSRVCreateVirtualAppHint -> %u (WS=%s)", rc, hint.szWindowSystem);
-    if (!rc) {
-        l_error("PVRSRVCreateVirtualAppHint failed");
-        sceKernelExitProcess(0);
+    // DOWNSAMPLE_RENDER: reduccion de resolucion REAL, no un FBO offscreen.
+    // vitaGL pasa estos width/height tal cual a sceDisplaySetFrameBuf()
+    // (lib/vitagl/source/gxm.c:249-250) y el controlador de display de la Vita
+    // escala por hardware hasta los 960x544 fisicos del panel -- gratis, sin
+    // blit, sin shader de upscale, sin FBO propio. Es el enfoque de
+    // Asphalt-5-Vita y el que pidio el usuario.
+    //
+    // Por que se abandono el FBO+blit que estaba antes aca: metia tres modos de
+    // fallar que este no tiene (el FBO nunca quedaba bindeado, el blit pisaba
+    // estado GL del motor, y al FBO le faltaba el buffer de stencil que GameSWF
+    // necesita para las mascaras de toda la UI -> pantalla negra). Bajar
+    // DISPLAY_WIDTH/HEIGHT no tiene ninguno de esos problemas porque el
+    // framebuffer por defecto sigue siendo el framebuffer por defecto, con su
+    // depth y su stencil normales -- solo que mas chico.
+    {
+        int init_w = REAL_SCREEN_W, init_h = REAL_SCREEN_H;
+        glutil_get_render_target_size(&init_w, &init_h);
+        vglInitWithCustomThreshold(0, init_w, init_h, 24 * 1024 * 1024,
+                                    40 * 1024 * 1024 /* cdram_threshold */,
+                                    20 * 1024 * 1024 /* phycont_threshold */,
+                                    VGL_CDLG_THRESHOLD, SCE_GXM_MULTISAMPLE_NONE);
+        l_success("vitaGL initialized at %dx%d (panel fisico %dx%d, escalado por hardware)",
+                  init_w, init_h, REAL_SCREEN_W, REAL_SCREEN_H);
     }
-
     display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     l_success("eglGetDisplay -> %p (err 0x%x)", (void *)display, eglGetError());
     if (display == EGL_NO_DISPLAY) {
@@ -409,9 +355,15 @@ void gl_init() {
 #endif
 
 #ifdef DOWNSAMPLE_RENDER
-    l_success("DOWNSAMPLE_RENDER: about to create the offscreen FBO...");
-    init_downsample_render();
-    l_success("DOWNSAMPLE_RENDER: init_downsample_render() returned (fbo=%u)", s_ds_fbo);
+    // Nada que crear: la reduccion ya se aplico en vglInitWithCustomThreshold()
+    // mas arriba. Se deja el log para poder confirmar en el log de hardware que
+    // la variante realmente es la reducida.
+    {
+        int rw = 0, rh = 0;
+        glutil_get_render_target_size(&rw, &rh);
+        l_success("DOWNSAMPLE_RENDER activo: render a %dx%d, escalado por hardware a %dx%d",
+                  rw, rh, REAL_SCREEN_W, REAL_SCREEN_H);
+    }
 #endif
 }
 
@@ -430,43 +382,14 @@ void gl_swap() {
         s_cpu_us_total += now - s_last_swap_end_time;
     }
 #endif
-#ifdef DOWNSAMPLE_RENDER
-    if (s_ds_fbo != 0) {
-        // Blit the reduced-resolution FBO up onto the REAL default
-        // framebuffer -- glBindFramebuffer(0) here calls the real GL entry
-        // point directly (this is glutil.c, not the _soloader wrapper), so
-        // it genuinely targets the window's framebuffer, bypassing the
-        // FBO-0 redirect that glBindFramebuffer_soloader applies to the
-        // engine's own calls.
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_BLEND);
-        glDisable(GL_SCISSOR_TEST);
-        glDisable(GL_CULL_FACE);
 
-        int lb_x, lb_y, lb_w, lb_h;
-        compute_letterbox_rect(&lb_x, &lb_y, &lb_w, &lb_h);
-        glViewport(lb_x, lb_y, lb_w, lb_h);
-
-        glUseProgram(s_blit_program);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, s_ds_color_tex);
-        glUniform1i(glGetUniformLocation(s_blit_program, "uTex"), 0);
-
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), kBlitQuad);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), kBlitQuad + 2);
-        glEnableVertexAttribArray(0);
-        glEnableVertexAttribArray(1);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray(0);
-        glDisableVertexAttribArray(1);
-    }
-#endif
 #ifdef PROFILE_FRAME_TIME
     uint64_t swap_start = sceKernelGetProcessTimeWide();
 #endif
     eglSwapBuffers(display, surface);
     s_frame_counter++;
+
+
 #ifdef PROFILE_FRAME_TIME
     uint64_t swap_end = sceKernelGetProcessTimeWide();
     s_swap_us_total += swap_end - swap_start;
@@ -925,6 +848,14 @@ void glDisable_soloader(GLenum cap) {
 }
 
 static void track_seen_texture(void) {
+#ifndef DEBUG_SOLOADER
+    // Instrumentacion de diagnostico SOLO de builds Debug. Estaba corriendo
+    // tambien en Release: ~10 glGet*/glIsEnabled POR CADA DRAW CALL, mas un
+    // barrido lineal. Es una regresion del fix documentado del 2026-07-24
+    // ("wrapping the actual work bodies in #ifdef DEBUG_SOLOADER, not just the
+    // log call"), que se perdio en un refactor posterior.
+    (void) 0;
+#else
     GLint tex = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
     for (int i = 0; i < s_seen_textures_count; i++) {
@@ -957,6 +888,7 @@ static void track_seen_texture(void) {
         l_info("[gl_diag_alphamap] texture=%u program=%u unit0_tex=%d unit1_tex=%d",
                (GLuint) tex, (GLuint) program, unit0_tex, unit1_tex);
     }
+#endif
 }
 
 // Per-render-call geometry/texture attribution for the invisible-enemy
@@ -982,6 +914,14 @@ void gl_diag_get_render_track(GLNodeDrawState *out) {
 }
 
 static void track_render_call(GLsizei count) {
+#ifndef DEBUG_SOLOADER
+    // Instrumentacion de diagnostico SOLO de builds Debug. Estaba corriendo
+    // tambien en Release: ~10 glGet*/glIsEnabled POR CADA DRAW CALL, mas un
+    // barrido lineal. Es una regresion del fix documentado del 2026-07-24
+    // ("wrapping the actual work bodies in #ifdef DEBUG_SOLOADER, not just the
+    // log call"), que se perdio en un refactor posterior.
+    (void) count;
+#else
     s_node_state.draw_calls++;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &s_node_state.last_texture);
     s_node_state.last_vertex_count = count;
@@ -994,6 +934,7 @@ static void track_render_call(GLsizei count) {
 
     s_node_state.last_depth_test_enabled = glIsEnabled(GL_DEPTH_TEST);
     glGetBooleanv(GL_DEPTH_WRITEMASK, &s_node_state.last_depth_write_mask);
+#endif
 }
 
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
@@ -1267,11 +1208,19 @@ void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
 }
 
 void glBindFramebuffer_soloader(GLenum target, GLuint framebuffer) {
-#ifdef DOWNSAMPLE_RENDER
-    if (framebuffer == 0 && s_ds_fbo != 0) {
-        glBindFramebuffer(target, s_ds_fbo);
-        return;
-    }
-#endif
+    // Sin redirect: con la reduccion aplicada a nivel de display, el
+    // framebuffer 0 YA es el framebuffer reducido (con su depth/stencil), asi
+    // que el bind-a-0 del motor es exactamente lo que queremos que pase.
     glBindFramebuffer(target, framebuffer);
 }
+
+// Missing GL functions from vitaGL
+extern void *glMapBuffer(GLenum target, GLenum access);
+extern GLboolean glUnmapBuffer(GLenum target);
+
+void glBlendColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {}
+void glCompressedTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLsizei imageSize, const void *data) {}
+void glDetachShader(GLuint program, GLuint shader) {}
+void *glMapBufferOES(GLenum target, GLenum access) { return glMapBuffer(target, access); }
+GLboolean glUnmapBufferOES(GLenum target) { return glUnmapBuffer(target); }
+void glValidateProgram(GLuint program) {}

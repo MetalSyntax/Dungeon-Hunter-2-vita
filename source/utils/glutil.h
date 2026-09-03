@@ -81,6 +81,14 @@ void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height);
 // there's no real content to hit; 1 with *out_x/*out_y filled otherwise.
 int glutil_screen_touch_to_logical(int screen_x, int screen_y, int *out_x, int *out_y);
 
+// Tamano real del render target al que se esta dibujando ahora mismo: la
+// pantalla fisica (960x544) normalmente, o el FBO reducido cuando
+// DOWNSAMPLE_RENDER esta activo. Cualquier codigo NUESTRO que setee un
+// glViewport de "pantalla completa" a mano tiene que usar esto en vez de
+// hardcodear 960x544 -- si no, dibuja fuera del FBO reducido y solo se ve el
+// pedazo que entra (fue exactamente el "video con zoom" de log_001.log).
+void glutil_get_render_target_size(int *out_w, int *out_h);
+
 // Diagnostic for the "2D UI draws fine, 3D world is invisible/replaced by a
 // flat color" symptom: logs whether depth testing is actually enabled,
 // whether the currently bound framebuffer (if not the default one) is

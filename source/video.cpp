@@ -628,7 +628,17 @@ static void draw_video_frame(const unsigned short *rgb565, unsigned w, unsigned 
                    savedBlend, savedDepthTest, savedScissor, savedCull, savedProgram, savedTex, savedArrayBuffer);
 #endif
 
-    glViewport(0, 0, REAL_SCREEN_W, REAL_SCREEN_H);
+    // No hardcodear 960x544: con DOWNSAMPLE_RENDER activo estamos dibujando
+    // dentro de un FBO reducido, y un viewport de pantalla completa mandaria el
+    // quad del video 4x fuera de el -- solo entraria el cuarto inferior
+    // izquierdo, que despues el blit sube a pantalla completa. Eso es
+    // literalmente el "video con zoom" que se vio en log_001.log.
+    // El quad en si se calcula en clip-space normalizado (-1..1) usando el
+    // aspect ratio de REAL_SCREEN_W/H, que NO cambia: 480x272 tiene el mismo
+    // aspect que 960x544, asi que el letterbox del video sigue saliendo bien.
+    int rt_w = REAL_SCREEN_W, rt_h = REAL_SCREEN_H;
+    glutil_get_render_target_size(&rt_w, &rt_h);
+    glViewport(0, 0, rt_w, rt_h);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_SCISSOR_TEST);
@@ -917,7 +927,9 @@ void video_play(const char *name) {
         l_warn("video: timed out waiting for video decoder to become active (%s)", path);
     }
 
+    extern volatile int g_loop_iter;
     while (sceAvPlayerIsActive(handle)) {
+        g_loop_iter++;
         SceCtrlData pad;
         sceCtrlPeekBufferPositive(0, &pad, 1);
         uint32_t pressed = pad.buttons & ~old_pad_buttons;

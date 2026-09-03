@@ -505,7 +505,12 @@ void audio_init(void) {
     }
 
     gQuit = 0;
-    gThread = sceKernelCreateThread("audio_mixer", mixer_thread, 0x10000100, 0x10000, 0, 0, NULL);
+    // Pinned to USER_1, off the main thread's core (USER_0, see main.c) -- this
+    // thread runs continuously for the whole game session (blocks on
+    // sceAudioOutOutput between mix passes, not a one-shot), so leaving it
+    // unpinned means the scheduler can put it on the same core as the main
+    // render/logic thread at any time, unlike a transient worker.
+    gThread = sceKernelCreateThread("audio_mixer", mixer_thread, 0x10000100, 0x10000, 0, SCE_KERNEL_CPU_MASK_USER_1, NULL);
     if (gThread < 0) {
         l_error("[audio] mixer thread creation failed (0x%08X) -- audio disabled", (unsigned) gThread);
         sceAudioOutReleasePort(gPort);

@@ -36,6 +36,8 @@ static char buffer_b[2048];
 // Buffer C is used for file output (no colors).
 static char buffer_c[2048];
 static char buffer_d[2048];
+// Buffer de stdio para el archivo de log (ver setvbuf mas abajo).
+static char log_buffer[64 * 1024];
 
 void _log_print(int t, const char* fmt, ...) {
     if (!atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
@@ -50,7 +52,7 @@ void _log_print(int t, const char* fmt, ...) {
         
         char log_path[128];
         for (int i = 0; i < 1000; ++i) {
-            snprintf(log_path, sizeof(log_path), "ux0:data/dungeon-hunter-2/logs/log_%03d.txt", i);
+            snprintf(log_path, sizeof(log_path), "ux0:data/dungeon-hunter-2/logs/log_%03d.log", i);
             FILE *f = fopen(log_path, "r");
             if (f) {
                 fclose(f);
@@ -59,7 +61,15 @@ void _log_print(int t, const char* fmt, ...) {
                 break;
             }
         }
-        
+
+        // Buffer grande y explicito: sin esto, newlib usa un buffer chico y
+        // termina escribiendo a ux0 mucho mas seguido de lo necesario. Las
+        // escrituras se agrupan y solo bajan a disco cuando se llena el buffer
+        // o cuando una linea de ERROR/FATAL fuerza el flush (ver abajo).
+        if (log_file) {
+            setvbuf(log_file, log_buffer, _IOFBF, sizeof(log_buffer));
+        }
+
         atomic_store_explicit(&_log_mutex_ready, true, memory_order_relaxed);
     }
     sceKernelLockLwMutex(&_log_mutex, 1, NULL);
@@ -107,7 +117,25 @@ void _log_print(int t, const char* fmt, ...) {
     
     if (log_file) {
         fprintf(log_file, "%s", buffer_d);
-        fflush(log_file);
+        // Flush en todo lo que no sea DEBUG/INFO.
+        //
+        // Historia, para no repetir el error: primero esto flusheaba en CADA
+        // linea, lo cual era carisimo porque main.c logueaba 3 lineas por frame
+        // ([loop_diag]) -> 3 escrituras sincronas a ux0 por frame. Despues se
+        // acoto el flush a ERROR/FATAL... y el resultado fue que el primer crash
+        // real (log_005/006.log) corto el log justo antes de las lineas
+        // l_success que decian donde estaba muriendo: quedaron en el buffer y se
+        // perdieron. Diagnostico inutil justo cuando mas hacia falta.
+        //
+        // El ahorro real nunca estuvo aca, estuvo en BORRAR los logs por frame:
+        // una sesion entera son ~330 lineas (log_003.log), asi que flushear
+        // warn/success/error/fatal no cuesta nada medible y mantiene la
+        // propiedad que hace utiles a estos logs: el log corta exactamente en la
+        // ultima cosa que paso antes del crash. DEBUG/INFO (que solo existen en
+        // builds Debug, y ahi si pueden ser miles de lineas) siguen buffereados.
+        if (t != LT_DEBUG && t != LT_INFO) {
+            fflush(log_file);
+        }
     }
 
     if (atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {

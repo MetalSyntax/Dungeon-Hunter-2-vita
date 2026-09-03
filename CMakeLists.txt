@@ -92,15 +92,28 @@ endif()
 # FPS, consistent with a fill-rate-bound bottleneck rather than draw-call
 # count (log_075/076 already confirmed draw calls and GL state are healthy).
 option(DOWNSAMPLE_RENDER "Render at reduced internal resolution, upscale via GPU blit (trades sharpness for fill-rate)" OFF)
-set(DS_NUM "2" CACHE STRING "Downsample numerator -- render at DS_NUM/DS_DEN of native resolution")
-set(DS_DEN "3" CACHE STRING "Downsample denominator")
+# 3/4 = 720x408: 960*3/4=720 y 544*3/4=408, los dos exactos, asi que el aspect
+# ratio queda CLAVADO en el de la Vita (720/408 == 960/544 == 30:17, sin barras
+# ni deformacion) y quedan 56% de los pixeles. Se subio desde 1/2 (480x272, 25%
+# de los pixeles) a pedido del usuario: 480x272 se veia bien y funcionaba, pero
+# no dio ganancia real de FPS -- confirmando que este port no esta limitado por
+# fill-rate -- asi que conviene recuperar nitidez y quedarse con la reduccion
+# solo como algo que sume combinado con los otros cambios.
+# Otros valores exactos utiles: 1/2 = 480x272, 7/8 = 840x476.
+set(DS_NUM "3" CACHE STRING "Downsample numerator -- render at DS_NUM/DS_DEN of native resolution")
+set(DS_DEN "4" CACHE STRING "Downsample denominator")
 if (DOWNSAMPLE_RENDER)
   add_definitions(-DDOWNSAMPLE_RENDER -DDS_NUM=${DS_NUM} -DDS_DEN=${DS_DEN})
 endif()
 
-# User confirmed DOWNSAMPLE_RENDER made no measurable difference -- rules out
-# a fill-rate/pixel-shading bottleneck (fewer pixels to shade should have
-# helped if that were it). DISABLE_VSYNC alone isn't enough to tell CPU-bound
+# OJO (2026-09-02): la frase original de este comentario decia que el usuario
+# habia confirmado que DOWNSAMPLE_RENDER no hacia diferencia medible y que eso
+# "descartaba un cuello de botella de fill-rate". Esa conclusion era INVALIDA:
+# el FBO nunca llegaba a bindearse (glBindFramebuffer_soloader solo redirige el
+# bind-a-0 del motor, y este motor nunca llama a glBindFramebuffer), asi que esa
+# prueba corrio a 960x544 completos y no midio downsampling en absoluto. Ver
+# init_downsample_render() en source/utils/glutil.c. Corregido; queda pendiente
+# una medicion de verdad. DISABLE_VSYNC alone isn't enough to tell CPU-bound
 # apart from GPU-bound either -- a capped eglSwapBuffers() could be waiting on
 # vblank OR just waiting for the GPU to finish real work. This splits gl_swap()
 # into two measured halves so which one actually dominates a slow frame is
@@ -110,20 +123,25 @@ endif()
 # submission cost) vs. time spent inside eglSwapBuffers() itself (GPU
 # flush/present + vblank wait, if any). Combine with DISABLE_VSYNC to strip
 # the vblank wait out of the second number too.
-option(PROFILE_FRAME_TIME "Diagnostic: log the CPU-submission vs eglSwapBuffers() time split every ~60 frames" OFF)
-if (PROFILE_FRAME_TIME)
-  add_definitions(-DPROFILE_FRAME_TIME)
-endif()
+option(PROFILE_FRAME_TIME "Diagnostic: log the CPU-submission vs eglSwapBuffers() time split every ~60 frames" ON)
+add_definitions(-DPROFILE_FRAME_TIME)
 
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 
-set(CMAKE_C_FLAGS_RELEASE "-O2 -g" CACHE STRING "" FORCE)
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -g" CACHE STRING "" FORCE)
-set(CMAKE_C_FLAGS_DEBUG "-O2 -g" CACHE STRING "" FORCE)
-set(CMAKE_CXX_FLAGS_DEBUG "-O2 -g" CACHE STRING "" FORCE)
+# -O3 -ffast-math: mismo set exacto que usa Asphalt-5-Vita (CMakeLists.txt:139),
+# que es el port mas comparable que tenemos -- mismo soloader (so_util +
+# FalsoJNI), mismo motor Gameloft, misma vitaGL-desde-fuente -- y que corre a 60
+# FPS sostenidos. DH2 estaba en -O2 sin -ffast-math.
+# NOTA: -ffast-math relaja la semantica IEEE de punto flotante. Si aparece
+# cualquier regresion visual/fisica despues de este cambio, ESTE es el primer
+# flag a sacar (antes de revisar cualquier otra cosa de esta tanda).
+set(CMAKE_C_FLAGS_RELEASE "-O3 -g -ffast-math" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -ffast-math" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_DEBUG "-O3 -g -ffast-math" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_DEBUG "-O3 -g -ffast-math" CACHE STRING "" FORCE)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O2 -g -mfloat-abi=softfp -Wno-deprecated")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O3 -g -ffast-math -mfloat-abi=softfp -Wno-deprecated")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi")
 
 add_executable(${CMAKE_PROJECT_NAME}
@@ -138,6 +156,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/io.c
                source/reimpl/log.c
                source/reimpl/mem.c
+               source/reimpl/egl.c
                source/reimpl/pthr.c
                source/reimpl/sys.c
                source/reimpl/time64.c
@@ -166,13 +185,66 @@ target_include_directories(${CMAKE_PROJECT_NAME}
                            PUBLIC ${CMAKE_SOURCE_DIR}/source
                            )
 
+# Speedhacks de vitaGL. Los "Hack Flags" del README de vitaGL estan todos
+# documentados como "may cause crashes/glitches", asi que el set agresivo vive
+# en su propia variante de build (build.sh --speedhacks-test) y NUNCA en la
+# build normal.
+#
+# Del set agresivo se EXCLUYEN a proposito, por razones concretas de este port:
+#   * DEPTH_STENCIL_HACK=1  -> hace que depth/stencil no cuesten memoria, pero
+#     DH2 depende CRITICAMENTE de un stencil real: toda su UI/HUD son clips de
+#     GameSWF dibujados con mascara de stencil. Ya se comprobo (log_001.log) que
+#     sin stencil no se dibuja NADA.
+#   * PRIMITIVES_SPEEDHACK=1 -> glitchea GL_LINES/GL_POINTS, y GameSWF dibuja
+#     formas vectoriales.
+#   * INDICES_SPEEDHACK=1    -> rompe draws instanciados e indices de 32 bits.
+#   * TEXTURES_SPEEDHACK=1   -> incompatible con HAVE_TEXTURE_CACHE.
+# Modo de culling -- ver el comentario extenso en source/patch.c. Es la palanca
+# de rendimiento mas grande del port (el bypass total hace que el motor anime y
+# actualice el nivel ENTERO cada frame) y tambien la mas riesgosa: el bypass es
+# lo que arreglo el bug de enemigos invisibles. Default 0 = comportamiento
+# historico, sin cambios.
+set(CULLING_MODE "0" CACHE STRING "0=bypass total (default/seguro), 1=culling de update activo, 2=culling stock del motor")
+add_definitions(-DCULLING_MODE=${CULLING_MODE})
+
+option(VITAGL_EXTRA_SPEEDHACKS "Compilar vitaGL con el set agresivo de speedhacks (puede crashear/glitchear)" OFF)
+if (VITAGL_EXTRA_SPEEDHACKS)
+  # DRAW_SPEEDHACK sube de 2 (solo draws con mucha data de vertices) a 1 (todos).
+  set(VITAGL_MAKE_FLAGS_STR "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1 DRAW_SPEEDHACK=1 INDICES_DRAW_SPEEDHACK=1 BUFFERS_SPEEDHACK=1 MATH_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 TEXTURE_UPLOADS_SPEEDHACK=1")
+else()
+  set(VITAGL_MAKE_FLAGS_STR "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 DRAW_SPEEDHACK=2 SAMPLERS_SPEEDHACK=1 HAVE_GLSL_UBOS=1")
+endif()
+message(STATUS "vitaGL flags: ${VITAGL_MAKE_FLAGS_STR}")
+separate_arguments(VITAGL_MAKE_FLAGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS_STR}")
+set(VITAGL_STAMP "${CMAKE_BINARY_DIR}/vitagl.stamp")
+
+# NOTE: this is a custom_target (always re-evaluated), not an OUTPUT-based
+# add_custom_command. A stamp-file OUTPUT with no DEPENDS is only ever run once
+# per build tree: once vitagl.stamp exists, Make/Ninja consider it up to date
+# forever and will silently skip this recipe on every later build, even after
+# VITAGL_MAKE_FLAGS changes above -- which is exactly what happened across the
+# several flag tweaks here (SAMPLERS_SPEEDHACK/HAVE_GLSL_UBOS never actually got
+# compiled in unless the build dir was wiped). Making this a custom_target means
+# its COMMANDs run every build; build_vitagl.sh's own cmp-against-stamp check
+# still decides whether a `make clean` is actually needed, and the following
+# `make` is incremental/cheap when nothing changed.
+add_custom_target(vitaGL_lib
+  COMMAND rm -f "${VITAGL_STAMP}.tmp"
+  COMMAND echo "${VITAGL_MAKE_FLAGS_STR}" > "${VITAGL_STAMP}.tmp"
+  COMMAND bash "${CMAKE_SOURCE_DIR}/lib/vitagl/build_vitagl.sh" "${VITAGL_MAKE_FLAGS_STR}" "${VITAGL_STAMP}" "${CMAKE_SOURCE_DIR}/lib/vitagl"
+  COMMAND make -C "${CMAKE_SOURCE_DIR}/lib/vitagl" ${VITAGL_MAKE_FLAGS}
+  BYPRODUCTS "${CMAKE_SOURCE_DIR}/lib/vitagl/libvitaGL.a"
+  COMMENT "Building vitaGL with custom flags..."
+)
+add_dependencies(${CMAKE_PROJECT_NAME} vitaGL_lib)
+
 target_link_libraries(${CMAKE_PROJECT_NAME}
                       -Wl,--whole-archive pthread -Wl,--no-whole-archive
                       stdc++
-                      gpu_es4_ext_stub
-                      IMGEGL_stub
-                      GLESv2_stub
-                      GLESv1_CM_stub
+                      ${CMAKE_SOURCE_DIR}/lib/vitagl/libvitaGL.a
+                      vitashark
+                      SceShaccCgExt
+                      SceShaccCg_stub
                       taihen_stub
                       z
                       m
@@ -211,18 +283,6 @@ vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin
                 ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
                 ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/bg0.png sce_sys/livearea/contents/bg0.png
                 ${CMAKE_SOURCE_DIR}/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
-                # libgpu_es4_ext.suprx and libIMGEGL.suprx are preloaded explicitly by
-                # main.c via sceKernelLoadStartModule from app0: root -- matching
-                # GrapheneCt/PVR_PSP2's own gles1test1 reference (SCE_USER_MODULE_LIST
-                # covers only these two). libIMGEGL then lazily loads the other three
-                # itself from "app0:module/..." (PVRSRVInitializeAppHint's own
-                # compiled-in default paths) -- do NOT also preload those three
-                # ourselves, see the comment in main.c for why that broke eglGetDisplay.
-                ${CMAKE_SOURCE_DIR}/module/libgpu_es4_ext.suprx libgpu_es4_ext.suprx
-                ${CMAKE_SOURCE_DIR}/module/libIMGEGL.suprx libIMGEGL.suprx
-                ${CMAKE_SOURCE_DIR}/module/libGLESv2.suprx module/libGLESv2.suprx
-                ${CMAKE_SOURCE_DIR}/module/libGLESv1_CM.suprx module/libGLESv1_CM.suprx
-                ${CMAKE_SOURCE_DIR}/module/libpvrPSP2_WSEGL.suprx module/libpvrPSP2_WSEGL.suprx
                 # DH2's engine tries to load "/system/fonts/droidsans.ttf" via FreeType (a real
                 # Android font path that obviously doesn't exist on Vita) and gets a NULL FILE* --
                 # source/reimpl/io.c redirects that exact path to this bundled, freely-redistributable

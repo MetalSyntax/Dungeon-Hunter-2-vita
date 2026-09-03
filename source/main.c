@@ -128,6 +128,43 @@ static void *so_sym_or_warn(const char *name) {
     return addr;
 }
 
+// Diagnostico temporal (ver log_159.txt): el main loop se cuelga por completo
+// (0 frames mas, nunca vuelve de nativeRender()) un par de frames despues de
+// que el intro se salta por fallo de alloc CDRAM/PHYCONT -- sin ningun log
+// nuestro entre medio, porque el cuelgue esta DENTRO del codigo del motor
+// (compilado, cerrado) al que nativeRender() llama, no en algo que logueemos.
+// Sin un debugger conectado, la unica forma de ver EN QUE FUNCION esta
+// realmente colgado el hilo principal es forzar un crash controlado (con todos
+// los registros/stacks de todos los hilos incluidos en el .psp2dmp resultante)
+// apenas se detecta que dejo de avanzar, en vez de esperar indefinidamente a
+// que el usuario cierre el juego a mano sin dejar rastro utilizable.
+volatile int g_loop_iter = -1;
+#if 0
+static int watchdog_thread(SceSize args, void *argp) {
+    int last_seen = -2;
+    int stale_ticks = 0;
+    while (1) {
+        sceKernelDelayThread(1000 * 1000); // 1s
+        int cur = g_loop_iter;
+        if (cur == last_seen) {
+            stale_ticks++;
+            l_warn("[watchdog] main loop hasn't advanced past iter=%d in %ds", cur, stale_ticks);
+            if (stale_ticks >= 8) {
+                l_error("[watchdog] main loop stuck for 8s+ at iter=%d -- forcing a crash to capture "
+                        "a .psp2dmp with the main thread's real call stack at the hang point", cur);
+                sceKernelDelayThread(200 * 1000); // give the log a moment to flush to disk
+                volatile int *null_ptr = NULL;
+                *null_ptr = 0xDEAD; // deliberate fault -- see comment above
+            }
+        } else {
+            last_seen = cur;
+            stale_ticks = 0;
+        }
+    }
+    return 0;
+}
+#endif
+
 int main() {
     /**
      * @brief Hardware clock configuration at maximum nominal Vita limits.
@@ -139,6 +176,21 @@ int main() {
         int gpuXbarRet = scePowerSetGpuXbarClockFrequency(166);
         l_error("[clock] ARM=444MHz(0x%08X) BUS=222MHz(0x%08X) GPU=222MHz(0x%08X) GPU_XBAR=166MHz(0x%08X)",
                 armRet, busRet, gpuRet, gpuXbarRet);
+    }
+
+    // Dedicate a core to the main thread (engine tick + render submission, all
+    // synchronous/single-threaded through nativeRender()/gl_swap()) so it isn't
+    // preempted by/sharing a core with the audio mixer thread (audio_init(),
+    // source/audio.cpp) or any transient worker the engine spawns via
+    // pthread_create_soloader (source/reimpl/pthr.c). Vita exposes 3 user-mode
+    // cores (SCE_KERNEL_CPU_MASK_USER_0/1/2); with no affinity set at all, the
+    // scheduler is free to move any of them onto the same core as this one.
+    // Matches the pattern MC2BPegasus-Vita-main uses for its own background
+    // threads (audio.c). Cheap and safe -- a kernel affinity call, not a hook
+    // into engine code.
+    {
+        int affRet = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
+        l_error("[cpu_affinity] main thread -> USER_0 (0x%08X)", affRet);
     }
 
     extern void pthread_init(void);
@@ -178,21 +230,6 @@ int main() {
     l_success("Calling JNI_OnLoad...");
     JNI_OnLoad(&jvm);
 
-    /**
-     * @note Pre-loading GPU modules (libgpu_es4_ext.suprx and libIMGEGL.suprx).
-     */
-    static const char *pvr_modules[] = {
-        "app0:libgpu_es4_ext.suprx",
-        "app0:libIMGEGL.suprx",
-    };
-    for (int i = 0; i < (int)(sizeof(pvr_modules) / sizeof(pvr_modules[0])); ++i) {
-        int ret = sceKernelLoadStartModule(pvr_modules[i], 0, NULL, 0, NULL, NULL);
-        if (ret < 0) {
-            l_error("LoadStartModule(%s) FAILED: 0x%08X", pvr_modules[i], ret);
-        } else {
-            l_success("LoadStartModule(%s) -> uid 0x%08X", pvr_modules[i], ret);
-        }
-    }
 
     gl_init();
     l_success("PVR_PSP2 initialized.");
@@ -231,6 +268,18 @@ int main() {
     int pending_key_down = -1, pending_key_up = -1;
 
     uint64_t last_touch_down_us = 0;
+
+    g_loop_iter = 0;
+#if 0
+    SceUID watchdog_uid = sceKernelCreateThread("main loop watchdog", watchdog_thread,
+                                                 0x10000100, 0x4000, 0, 0, NULL);
+    if (watchdog_uid >= 0) {
+        sceKernelStartThread(watchdog_uid, 0, NULL);
+    } else {
+        l_warn("[watchdog] thread creation failed (0x%08X) -- no auto-crash-on-hang diagnostic this run",
+               (unsigned) watchdog_uid);
+    }
+#endif
 
     /**
      * @brief Main event handling and rendering loop.
@@ -303,6 +352,17 @@ int main() {
         if (pending_key_down != -1 && nativeKeyDown) { nativeKeyDown(&jni, NULL, pending_key_down); pending_key_down = -1; }
         if (pending_key_up != -1 && nativeKeyUp) { nativeKeyUp(&jni, NULL, pending_key_up); pending_key_up = -1; }
 
+        // [loop_diag] (3 lineas por frame, "before nativeRender" / "after
+        // nativeRender" / "after gl_swap") era el diagnostico temporal del cuelgue
+        // de log_158.txt -- ese cuelgue ya no existe, el juego llega a gameplay.
+        // Se saco por costo real de rendimiento, no por limpieza: usaba l_warn
+        // (activo TAMBIEN en Release, nivel MINIMAL) y cada linea hace un
+        // fflush() sincrono a ux0 dentro de _log_print() (utils/logger.c) --
+        // 3 escrituras bloqueantes a almacenamiento por frame. En log_172.txt
+        // fueron 4462 de 4770 lineas del log entero (93%), dentro del mismo
+        // presupuesto de frame que estamos tratando de bajar de 180ms a 33ms.
+        // Si hace falta volver a rastrear un cuelgue del loop, reactivarlo detras
+        // de un #ifdef propio, nunca como l_warn incondicional.
         if (nativeRender) nativeRender(&jni, NULL);
 
         {
@@ -352,6 +412,7 @@ int main() {
         }
 
         gl_swap();
+        g_loop_iter++;
     }
 
     if (nativePause && nativeCanInterrupt) {

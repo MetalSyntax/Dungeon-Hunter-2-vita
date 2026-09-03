@@ -58,8 +58,13 @@ __pycache__/
 # Private working notes (may reference details derived from the original binary) —
 # not for GitHub, local status tracking only
 /ESTADO_ACTUAL.md
+/PLAN_VITAGL_ALTERNATIVA.md
 crash_dump/
 glsl_dump/
 assets
 2026-*.jpg
 dungeon-*.webp
+vpk_backups/
+dungeon-hunter-2_extract/
+README VITAGL.md
+dump_analysis.txt

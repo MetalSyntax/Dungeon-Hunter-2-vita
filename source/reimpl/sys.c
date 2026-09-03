@@ -105,14 +105,38 @@ void __stack_chk_fail_soloader() {
     l_fatal("Stack collapsed at address %p", __builtin_return_address(0));
 }
 
+// Salir SIN correr la cadena de atexit/__cxa_atexit.
+//
+// `exit()` de newlib corre todos los handlers registrados por __cxa_atexit --
+// que en un port soloader incluye TODOS los destructores estaticos de C++ del
+// .so de Android, porque dynlib.c cablea __cxa_atexit al de newlib. Esos
+// destructores crashean: cuando el usuario cerro el juego desde el propio
+// juego (log_010.log + su .psp2dmp), el dump dio prefetch abort 0x30003 con
+// PC=0x0 -- salto a un puntero de funcion nulo -- en un hilo 'pthread', con la
+// pila llena de destructores de locale de STLport (_Locale_time_destroy,
+// _Locale_messages_destroy).
+//
+// Correr esos destructores no aporta NADA aca: el proceso se esta muriendo y el
+// kernel de Vita libera memoria, hilos, puerto de audio y contexto GXM solo. Es
+// riesgo puro a cambio de cero beneficio, asi que se va derecho a
+// sceKernelExitProcess. El l_fatal de arriba ya baja el log a disco (el logger
+// flushea todo salvo DEBUG/INFO), asi que no se pierde el rastro.
+//
+// Nota: el camino de salida normal del loop principal (START+SELECT en main.c)
+// no pasa por aca -- termina en sceKernelExitDeleteThread, que tampoco corre
+// destructores. Este wrapper cubre el caso de que el MOTOR pida salir.
 void abort_soloader() {
-    l_fatal("Abort called from address %p", __builtin_return_address(0));
-    abort();
+    l_fatal("Abort called from address %p -- saliendo directo, sin destructores estaticos",
+            __builtin_return_address(0));
+    sceKernelExitProcess(1);
+    __builtin_unreachable();
 }
 
 void exit_soloader(int status) {
-    l_fatal("Exit(%i) called from %p", status, __builtin_return_address(0));
-    exit(status);
+    l_fatal("Exit(%i) called from %p -- saliendo directo, sin destructores estaticos",
+            status, __builtin_return_address(0));
+    sceKernelExitProcess(status);
+    __builtin_unreachable();
 }
 
 int __atomic_dec(volatile int *ptr) {

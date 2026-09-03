@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <math.h>
 #include "utils/dialog.h"
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
@@ -116,100 +117,111 @@ static const struct { unsigned int btn; int x; int y; long long pointer_id; cons
 #define ACTION_BTN_MAP_COUNT (sizeof(action_btn_map) / sizeof(action_btn_map[0]))
 
 // ---------------------------------------------------------------------------
-// Stick analogico -> movimiento del personaje, SIN sintetizar touch.
+// Stick analogico izquierdo -> joystick virtual del HUD.
 //
-// El motor tiene compilada una API de comandos de personaje con movimiento
-// direccional POR VECTOR, que es exactamente la forma que tiene un stick. Los
-// tres simbolos estan en .dynsym, asi que se resuelven con so_symbol():
+// Para retomar la ruta NATIVA (sin touch) mas adelante, los simbolos ya estan
+// identificados y verificados en .dynsym:
 //
-//   Character* NativeGetPlayerChar(int idx, bool remote)   -- funcion libre
-//   void Character::Ctrl_HeadTowards(const Point3D<float>&)
-//   void Character::Ctrl_Stop()
+//   Character* NativeGetPlayerChar(int idx, bool remote)      0x43c388
+//   void Character::Ctrl_HeadTowards(const Point3D<float>&)   0x3adb60
+//   void Character::Ctrl_Stop()                               0x3ad890
+//   bool v2Controller::s_blocked                              0x9a318b
+//   void v2Controller::Cmd_HeadTowards(const Point3D<float>&) 0x405374
 //
-// Ctrl_HeadTowards recibe una DIRECCION, no un destino: internamente compara
-// x²+y²+z² contra ~1e-4 (test de deadzone propio), respeta el estado del
-// personaje (no camina mientras castea, via SM_IsUsingSkill/SM_IsCasting) y
-// normaliza el vector. Por eso la magnitud del stick NO da velocidad variable.
-//
-// Esto es mejor que el touch sintetico que usan los botones de accion
-// (action_btn_map) porque no depende de que el clip de Flash del joystick
-// virtual exista: sigue funcionando cuando se oculte el HUD.
-static void *(* NativeGetPlayerChar)(int idx, int remote);
-static void (* Character_Ctrl_HeadTowards)(void *this_, const float *dir);
-static void (* Character_Ctrl_Stop)(void *this_);
-// v2Controller::s_blocked es el gate que el motor usa para bloquear input en
-// cutscenes, menus y el IGM. Llamar Ctrl_* directo se lo saltea, asi que hay
-// que respetarlo a mano o el personaje camina durante los dialogos.
-static unsigned char *v2Controller_s_blocked;
+// Ctrl_HeadTowards recibe una DIRECCION, no un destino (internamente compara
+// x²+y²+z² contra ~1e-4 y normaliza), y respeta el estado del personaje via
+// SM_IsUsingSkill/SM_IsCasting -- o sea que la magnitud del stick no da
+// velocidad variable. Ver el comentario de stick_update() para por que esa ruta
+// no funciono en el primer intento y que probar despues.
 
-// La orientacion de los ejes del mundo respecto de la pantalla no se pudo
-// determinar del analisis estatico (la camara es isometrica). En vez de
-// adivinar y hacer varias idas y vueltas a la consola, los modos plausibles se
-// pueden ciclar en vivo con SELECT y cada cambio se loguea con l_error, asi que
-// una sola sesion de prueba resuelve cual es. Una vez confirmado, fijar
-// STICK_MAP_DEFAULT y (si se quiere) sacar el ciclado.
-#define STICK_MAP_COUNT 4
-#ifndef STICK_MAP_DEFAULT
-#define STICK_MAP_DEFAULT 0
-#endif
-static int s_stick_map = STICK_MAP_DEFAULT;
-static const char *kStickMapNames[STICK_MAP_COUNT] = {
-    "0: (x, 0, y)  ejes alineados, mundo Y-up",
-    "1: (x, 0, -y) igual pero Z invertido",
-    "2: (x, y, 0)  plano XY, mundo Z-up",
-    "3: iso 45 deg  ((x-y), 0, (x+y)) * 0.7071",
-};
+// Centro y radio del joystick virtual de Flash, en coordenadas FISICAS de
+// pantalla (960x544), medidos sobre la captura 2026-08-14-175233.jpg: el pad
+// esta abajo a la izquierda. Se convierten al espacio logico del motor con
+// glutil_screen_touch_to_logical(), igual que hace action_btn_map.
+// Si el personaje se mueve pero el pad no responde bien, ajustar estos tres.
+#define VJOY_CX 115
+#define VJOY_CY 450
+#define VJOY_R  62
 
-// Ultimo estado, para llamar Ctrl_Stop una sola vez al soltar en vez de en
-// cada frame.
-static int s_stick_was_active = 0;
+// pointer_id propio: 0 lo usa el touch real y 1..5 los botones de accion.
+#define VJOY_POINTER_ID 6
 
+static int s_vjoy_active = 0;
+static int s_vjoy_last_x = 0, s_vjoy_last_y = 0;
+
+// El stick analogico se mapea sintetizando touch SOBRE el joystick virtual de
+// Flash, que es el mismo camino que ya usan los botones de accion.
+//
+// Por que no la API nativa del motor: se intento primero llamar directo a
+// Character::Ctrl_HeadTowards() (ver git log, commit 54f1b1a). Los 4 simbolos
+// resolvieron bien (log_011.log no tiene ni un "Symbol not found") y se
+// probaron los 4 mapeos de ejes posibles, pero el personaje NO se movio nunca.
+// Hipotesis para retomarlo: el v2HudController del motor corre su propio
+// Update() dentro de nativeRender() leyendo el joystick de Flash (que esta en
+// cero) y PISA nuestra direccion con un Ctrl_Stop. Nuestra llamada pasa antes
+// de nativeRender(), asi que siempre pierde. Para que la ruta nativa funcione
+// probablemente haya que alimentar al v2Controller (Cmd_HeadTowards, que si
+// respeta los gates) en vez de al Character, y para eso falta conseguir el
+// v2Controller* vivo -- esta en Character+884 y no tiene getter publico.
+//
+// CONTRA de esta solucion: depende de que el clip de Flash del joystick exista.
+// Cuando se oculte el HUD hay que volver a la ruta nativa.
 static void stick_update(const SceCtrlData *pad) {
-    if (!NativeGetPlayerChar || !Character_Ctrl_HeadTowards || !Character_Ctrl_Stop) {
-        return;
-    }
-    // Devuelve 0 mientras no haya jugador (menus, carga), asi que sirve de
-    // chequeo de "estamos en gameplay" sin ningun trabajo extra.
-    void *player = NativeGetPlayerChar(0, 0);
-    if (!player) {
-        s_stick_was_active = 0;
-        return;
-    }
-    if (v2Controller_s_blocked && *v2Controller_s_blocked) {
-        if (s_stick_was_active) {
-            Character_Ctrl_Stop(player);
-            s_stick_was_active = 0;
-        }
-        return;
-    }
+    if (!nativeOnTouch) return;
 
-    // Stick de Vita: 0..255 con centro en ~128. sy positivo = ABAJO en pantalla.
+    // Stick de Vita: 0..255 con centro en ~128. sy positivo = ABAJO en pantalla,
+    // que coincide con el eje Y de las coordenadas de pantalla, asi que no hay
+    // que invertir nada.
     float sx = ((float) pad->lx - 128.0f) / 128.0f;
     float sy = ((float) pad->ly - 128.0f) / 128.0f;
 
-    // Deadzone radial (no por eje): los sticks de Vita derivan bastante, y una
-    // deadzone por eje deja pasar diagonales fantasma.
+    // Deadzone radial, no por eje: los sticks de Vita derivan y una deadzone por
+    // eje deja pasar diagonales fantasma.
     const float DEADZONE = 0.28f;
-    float mag2 = sx * sx + sy * sy;
-    if (mag2 < DEADZONE * DEADZONE) {
-        if (s_stick_was_active) {
-            Character_Ctrl_Stop(player);
-            s_stick_was_active = 0;
+    float mag = sqrtf(sx * sx + sy * sy);
+    if (mag < DEADZONE) {
+        if (s_vjoy_active) {
+            nativeOnTouch(&jni, NULL, 0, s_vjoy_last_x, s_vjoy_last_y, VJOY_POINTER_ID, 0, 0);
+            s_vjoy_active = 0;
         }
         return;
     }
 
-    float dir[3] = {0.0f, 0.0f, 0.0f};
-    switch (s_stick_map) {
-        case 0: dir[0] = sx; dir[2] = sy; break;
-        case 1: dir[0] = sx; dir[2] = -sy; break;
-        case 2: dir[0] = sx; dir[1] = sy; break;
-        case 3: dir[0] = (sx - sy) * 0.7071f; dir[2] = (sx + sy) * 0.7071f; break;
-        default: dir[0] = sx; dir[2] = sy; break;
+    // Reescalar de [DEADZONE..1] a [0..1] para no perder recorrido util, y topear
+    // en 1 (las esquinas del cuadrado dan magnitud > 1).
+    float scaled = (mag - DEADZONE) / (1.0f - DEADZONE);
+    if (scaled > 1.0f) scaled = 1.0f;
+    float nx = (sx / mag) * scaled;
+    float ny = (sy / mag) * scaled;
+
+    int px = VJOY_CX + (int) (nx * VJOY_R);
+    int py = VJOY_CY + (int) (ny * VJOY_R);
+
+    int lx, ly;
+    if (!glutil_screen_touch_to_logical(px, py, &lx, &ly)) {
+        lx = px; ly = py;
     }
 
-    Character_Ctrl_HeadTowards(player, dir);
-    s_stick_was_active = 1;
+    if (!s_vjoy_active) {
+        // Un joystick analogico necesita DOWN y despues MOVEs continuos: el clip
+        // de Flash arranca a seguir el dedo en el DOWN y calcula la direccion
+        // como el offset respecto de donde se apoyo. Por eso el DOWN va en el
+        // CENTRO del pad (no en la posicion desplazada): si no, el clip tomaria
+        // ese punto como origen y la primera direccion saldria nula.
+        int clx, cly;
+        if (!glutil_screen_touch_to_logical(VJOY_CX, VJOY_CY, &clx, &cly)) {
+            clx = VJOY_CX; cly = VJOY_CY;
+        }
+        nativeOnTouch(&jni, NULL, 1, clx, cly, VJOY_POINTER_ID, 0, 0);
+        s_vjoy_active = 1;
+    }
+
+    // MOVE en cada frame mientras haya deflexion, incluso si la posicion no
+    // cambio: algunos clips de GameSWF solo actualizan su estado al recibir el
+    // evento, no lo mantienen entre frames.
+    nativeOnTouch(&jni, NULL, 2, lx, ly, VJOY_POINTER_ID, 0, 0);
+    s_vjoy_last_x = lx;
+    s_vjoy_last_y = ly;
 }
 
 static void *app_singleton_inst;
@@ -314,15 +326,6 @@ int main() {
     nativeKeyDown          = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeKeyDown");
     nativeKeyUp            = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeKeyUp");
     nativeOnTouch          = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_GameGLSurfaceView_nativeOnTouch");
-
-    // Stick analogico -> movimiento (ver el comentario de stick_update()).
-    // Los 4 estan en .dynsym, verificado con `nm -D --defined-only`.
-    NativeGetPlayerChar        = so_sym_or_warn("_Z19NativeGetPlayerCharib");
-    Character_Ctrl_HeadTowards = so_sym_or_warn("_ZN9Character16Ctrl_HeadTowardsERK7Point3DIfE");
-    Character_Ctrl_Stop        = so_sym_or_warn("_ZN9Character9Ctrl_StopEv");
-    v2Controller_s_blocked     = so_sym_or_warn("_ZN12v2Controller9s_blockedE");
-    l_error("[stick] mapeo de ejes inicial -> %s (SELECT cicla entre los %d modos)",
-            kStickMapNames[s_stick_map], STICK_MAP_COUNT);
     nativePause            = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativePause");
     nativeResume           = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeResume");
     nativeCanInterrupt     = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeCanInterrupt");
@@ -453,14 +456,6 @@ int main() {
         } else if (last_touch) {
             if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, last_tx, last_ty, 0, 0, 0);
             last_touch = 0;
-        }
-
-        // SELECT solo (sin START, que junto a START es el combo de salida) cicla
-        // el mapeo de ejes del stick, para poder resolver la orientacion en una
-        // sola sesion de consola. Ver stick_update().
-        if ((pressed & SCE_CTRL_SELECT) && !(pad.buttons & SCE_CTRL_START)) {
-            s_stick_map = (s_stick_map + 1) % STICK_MAP_COUNT;
-            l_error("[stick] mapeo de ejes -> %s", kStickMapNames[s_stick_map]);
         }
 
         stick_update(&pad);

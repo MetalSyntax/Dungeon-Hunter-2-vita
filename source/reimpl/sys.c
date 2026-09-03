@@ -174,7 +174,28 @@ int getpagesize(void) {
     return PAGE_SIZE;
 }
 
-// El motor SI importa usleep y nanosleep (confirmado con
+// REVERTIDO A ret0 EN dynlib.c -- MEDIDO, NO ESPECULADO. NO volver a cablear
+// estas tres sin repetir la medicion.
+//
+// El razonamiento para implementarlas era correcto en abstracto (el motor SI
+// las importa, y con ret0 cualquier `while (!cond) usleep(x)` es un busy-spin)
+// pero en hardware el efecto fue el OPUESTO: un test controlado, cambiando solo
+// esta variable sobre la misma build --hack-safe, dio 11 FPS con CPU-submission
+// de 59-89ms (log_011.log) contra 59.7 FPS con CPU de 16.6ms cuando estaban en
+// ret0 (log_010.log). O sea que 5x del rendimiento se iba en dormir.
+//
+// La explicacion mas probable: el motor duerme en su propio camino de frame
+// (frame limiter, espera de streaming o de buffer de audio), y el quantum del
+// scheduler de Vita es MUCHO mas grueso que el 1ms que pide -- asi que cada
+// usleep(1000) cuesta varios ms reales. Ese es tambien el motivo de que
+// Asphalt-5-Vita saltee las esperas de menos de 1ms; con este motor hay que
+// saltear TODAS.
+//
+// Las implementaciones se dejan aca a proposito (no se borran) para que quede
+// registro de que se probo y con que resultado, y por si alguna vez hace falta
+// una espera real puntual en otro lugar.
+//
+// Contexto original: el motor SI importa usleep y nanosleep (confirmado con
 // `nm -D --undefined-only` sobre libDungeonHunter2.so), y los dos estaban
 // cableados a ret0 en source/dynlib.c, o sea que NUNCA dormian. Cualquier
 // espera del motor con la forma `while (!condicion) usleep(x)` -- patron

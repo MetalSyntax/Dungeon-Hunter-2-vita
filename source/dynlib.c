@@ -977,12 +977,12 @@ so_default_dynlib default_dynlib[] = {
         { "localtime_r", (uintptr_t)&localtime_r },
         { "mktime", (uintptr_t)&mktime },
         { "mktime64", (uintptr_t)&mktime64 },
-        { "nanosleep", (uintptr_t)&ret0 },
+        { "nanosleep", (uintptr_t)&nanosleep_soloader },
         { "strftime", (uintptr_t)&strftime },
         { "time", (uintptr_t)&time },
         { "tzset", (uintptr_t)&tzset },
-        { "sleep", (uintptr_t)&ret0 },
-        { "usleep", (uintptr_t)&ret0 },
+        { "sleep", (uintptr_t)&sleep_soloader },
+        { "usleep", (uintptr_t)&usleep_soloader },
 
 
         // Temp

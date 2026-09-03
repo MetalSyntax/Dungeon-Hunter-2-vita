@@ -20,6 +20,7 @@ extern "C" {
 #endif
 
 #include <sys/time.h>
+#include <unistd.h>
 
 #define PAGE_SIZE 4096
 
@@ -54,6 +55,12 @@ char * getenv_soloader(const char * name);
 int setenv_soloader(const char * name, const char * value, int overwrite);
 
 int getpagesize(void);
+
+// Ver el comentario extenso en sys.c: el motor importa estas tres y estaban
+// cableadas a ret0, convirtiendo sus esperas en busy-spins.
+int usleep_soloader(useconds_t usec);
+int nanosleep_soloader(const struct timespec *req, struct timespec *rem);
+unsigned int sleep_soloader(unsigned int seconds);
 
 #ifdef __cplusplus
 };

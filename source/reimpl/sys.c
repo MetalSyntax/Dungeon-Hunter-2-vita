@@ -149,3 +149,51 @@ int setenv_soloader(const char * name, const char * value, int overwrite) {
 int getpagesize(void) {
     return PAGE_SIZE;
 }
+
+// El motor SI importa usleep y nanosleep (confirmado con
+// `nm -D --undefined-only` sobre libDungeonHunter2.so), y los dos estaban
+// cableados a ret0 en source/dynlib.c, o sea que NUNCA dormian. Cualquier
+// espera del motor con la forma `while (!condicion) usleep(x)` -- patron
+// clasico esperando un worker, una carga de asset o un buffer de audio -- se
+// convertia asi en un busy-spin al 100% de CPU, quemando el core en vez de
+// cederlo. Con el hilo principal fijado a USER_0 eso es especialmente caro.
+//
+// Se sigue el mismo criterio que Asphalt-5-Vita (source/reimpl/sys.c:85-95),
+// que es el port comparable que llego a 60 FPS: las esperas de menos de 1ms se
+// saltean (si es un spinlock corto, dormirlo cuesta mas que girar, porque el
+// quantum del scheduler de Vita es mucho mayor que eso), y de 1ms para arriba
+// se duerme de verdad.
+int usleep_soloader(useconds_t usec) {
+    if (usec < 1000) {
+        return 0;
+    }
+    return sceKernelDelayThread(usec);
+}
+
+int nanosleep_soloader(const struct timespec *req, struct timespec *rem) {
+    if (!req) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (rem) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+    }
+    if (req->tv_sec == 0 && req->tv_nsec < 1000000) {
+        return 0;   // menos de 1ms: ver arriba
+    }
+    // sceKernelDelayThread toma microsegundos y su argumento es de 32 bits, asi
+    // que se topea en ~71 minutos; ninguna espera real del motor se acerca, pero
+    // se satura por las dudas en vez de desbordar.
+    uint64_t us = (uint64_t) req->tv_sec * 1000000ull + (uint64_t) req->tv_nsec / 1000ull;
+    if (us > 0xFFFFFFFFull) us = 0xFFFFFFFFull;
+    return sceKernelDelayThread((SceUInt) us);
+}
+
+unsigned int sleep_soloader(unsigned int seconds) {
+    if (seconds == 0) return 0;
+    uint64_t us = (uint64_t) seconds * 1000000ull;
+    if (us > 0xFFFFFFFFull) us = 0xFFFFFFFFull;
+    sceKernelDelayThread((SceUInt) us);
+    return 0;   // 0 = se durmio todo el tiempo pedido, sin interrupciones
+}

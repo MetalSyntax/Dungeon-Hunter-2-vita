@@ -226,8 +226,12 @@ static void stick_update(const SceCtrlData *pad) {
 
 static void *app_singleton_inst;
 static void (* SavegameManager_setLanguage)(void *this_, int lang);
-#define LANGUAGE_FORCE_FRAMES 180
-#define LANGUAGE_ENGLISH 0
+static int (* SavegameManager_getLanguage)(void *this_);
+static void (* SavegameManager_saveSettings)(void *this_);
+// Queued async saves are drained on a timer and at exit (see savejobs_* in
+// source/patch.c); implemented there, declared here.
+extern void savejobs_drain(void);
+extern int savejobs_has_pending(void);
 
 static void *so_sym_or_warn(const char *name) {
     void *addr = (void *) so_symbol(&so_mod, name);
@@ -331,6 +335,8 @@ int main() {
     nativeCanInterrupt     = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeCanInterrupt");
     app_singleton_inst     = so_sym_or_warn("_ZN9SingletonI11ApplicationE6s_instE");
     SavegameManager_setLanguage = so_sym_or_warn("_ZN15SavegameManager11setLanguageEi");
+    SavegameManager_getLanguage = so_sym_or_warn("_ZNK15SavegameManager11getLanguageEv");
+    SavegameManager_saveSettings = so_sym_or_warn("_ZN15SavegameManager12saveSettingsEv");
 
     int (* JNI_OnLoad)(void *jvm) = (void *) so_symbol(&so_mod, "JNI_OnLoad");
     if (!JNI_OnLoad) {
@@ -477,15 +483,43 @@ int main() {
         if (nativeRender) nativeRender(&jni, NULL);
 
         {
-            static int lang_force_frame = 0;
-            if (lang_force_frame < LANGUAGE_FORCE_FRAMES) {
-                lang_force_frame++;
-                if (app_singleton_inst && SavegameManager_setLanguage) {
-                    void *sgm = *(void **)((char *) app_singleton_inst + 76);
-                    if (sgm) {
-                        SavegameManager_setLanguage(sgm, LANGUAGE_ENGLISH);
+            // One-shot language sanitize (replaces the old 180-frame forced
+            // English). The old force rewrote the user's saved language to
+            // English on EVERY boot, so "can't change language" was
+            // guaranteed even when option saves worked fine. Now: wait until
+            // the SavegameManager instance exists, read the persisted value
+            // once, and only touch it if it is out of range (the engine
+            // itself clamps >7 in its menu_language flow; anything else is a
+            // legitimate user choice that must survive reboots).
+            static int lang_sanitized = 0;
+            if (!lang_sanitized && app_singleton_inst && SavegameManager_getLanguage) {
+                void *sgm = *(void **)((char *) app_singleton_inst + 76);
+                if (sgm) {
+                    int lang = SavegameManager_getLanguage(sgm);
+                    if (lang < 0 || lang > 7) {
+                        l_warn("[save_io] saved language %d out of range, resetting to English (0)", lang);
+                        if (SavegameManager_setLanguage)
+                            SavegameManager_setLanguage(sgm, 0);
+                    } else {
+                        l_warn("[save_io] keeping saved language %d", lang);
                     }
+                    lang_sanitized = 1;
                 }
+            }
+        }
+
+        // Periodic async-save drain: Savegame::saveAll only QUEUES write jobs
+        // (see source/patch.c). If the engine's fire-and-forget workers ever
+        // fail to run them, progress would silently die in RAM -- the exact
+        // "played but nothing persisted" symptom. Draining here (same
+        // FlushJobs(NULL) call Application::Quit makes) guarantees the queue
+        // reaches disk even then; when workers are healthy this is a cheap
+        // no-op because the queue is already empty. Gated on the pending flag
+        // set by the AddJob hook so idle frames pay nothing.
+        {
+            static int drain_tick = 0;
+            if ((drain_tick++ % 600) == 0 && savejobs_has_pending()) {
+                savejobs_drain();
             }
         }
 
@@ -524,6 +558,30 @@ int main() {
 
         gl_swap();
         g_loop_iter++;
+    }
+
+    // Exit flush: START+SELECT (or any loop break) used to skip
+    // Application::Quit entirely, so Savegame::FlushJobs(NULL) -- the only
+    // synchronous drain of the async save queue -- never ran and every save
+    // still sitting in RAM died with the process. Mirror the relevant part of
+    // Quit here: persist settings synchronously, then drain all queued save
+    // jobs before touching nativePause/exit.
+    {
+        void *sgm = NULL;
+        if (app_singleton_inst)
+            sgm = *(void **)((char *) app_singleton_inst + 76);
+        if (sgm && SavegameManager_saveSettings) {
+            l_warn("[save_io] exit: saving settings...");
+            SavegameManager_saveSettings(sgm);
+        }
+        if (savejobs_has_pending()) {
+            l_warn("[save_io] exit: draining pending save jobs...");
+            savejobs_drain();
+        } else {
+            // Drain unconditionally anyway: cheap when empty, and covers jobs
+            // queued without the hook flag (e.g. before hooks installed).
+            savejobs_drain();
+        }
     }
 
     if (nativePause && nativeCanInterrupt) {

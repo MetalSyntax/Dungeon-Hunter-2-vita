@@ -46,6 +46,113 @@ static int hook_GetSavedOption(void *this_, const char *key) {
     return SO_CONTINUE(int, s_hook_get_saved_option, this_, key);
 }
 
+/**
+ * @brief Save-pipeline hooks: prove WHERE a lost save dies.
+ * @details Player/level saves are async: SG_Save -> Savegame::saveAll ->
+ *          AddJob (in-RAM queue) -> ... -> Savegame::UpdateJobs (one chunk per
+ *          call, driven by fire-and-forget worker threads) -> CFileSystem
+ *          open("w+b")/write/close. Settings saves are synchronous
+ *          (saveSettings does open/write/close inline on the caller thread).
+ *          Every stage is infrequent (a few calls per save, not per frame),
+ *          so logging each at WARN (Release-visible) costs nothing and turns
+ *          the next hardware log into a definitive answer:
+ *            saveAll/AddJob logged + fopen "w+b" logged  = writer runs,
+ *              look at data/flush bugs instead;
+ *            saveAll/AddJob logged + NO fopen "w+b"       = queue never
+ *              drained (dead workers, no flush) -> the periodic/exit drain
+ *              in main.c covers exactly this;
+ *            saveSettings never logged on option change  = the menu never
+ *              even tried to persist (UI/script issue, not I/O).
+ *          Hook bodies forward to the original via SO_CONTINUE and are
+ *          declared int-returning even for void originals: on ARM the caller
+ *          of a void function ignores r0, so forwarding the register is
+ *          harmless and avoids a separate trampoline per signature.
+ */
+static so_hook s_hook_save_settings;
+static so_hook s_hook_save_all;
+static so_hook s_hook_add_job;
+static so_hook s_hook_flush_jobs;
+static so_hook s_hook_job_start;
+static so_hook s_hook_job_start2;
+
+// Set by the AddJob hook, cleared once a drain runs. Lets main.c flush the
+// async queue on a timer and at exit even if the engine's worker threads
+// never run -- and the log shows whether the flag was ever set.
+volatile int g_savejobs_pending = 0;
+static int (*s_save_flush_jobs)(const char *name) = NULL;
+
+static int hook_SavegameManager_saveSettings(void *this_) {
+    l_warn("[save_io] SavegameManager::saveSettings(this=%p)", this_);
+    int r = SO_CONTINUE(int, s_hook_save_settings, this_);
+    l_warn("[save_io] SavegameManager::saveSettings done");
+    return r;
+}
+
+static int hook_Savegame_saveAll(void *this_) {
+    l_warn("[save_io] Savegame::saveAll(this=%p) -- queueing async write job(s)", this_);
+    return SO_CONTINUE(int, s_hook_save_all, this_);
+}
+
+static int hook_Savegame_AddJob(void *job) {
+    g_savejobs_pending = 1;
+    __sync_synchronize();
+    l_warn("[save_io] Savegame::AddJob(job=%p) -- async save queued (pending=1)", job);
+    return SO_CONTINUE(int, s_hook_add_job, job);
+}
+
+static int hook_Savegame_FlushJobs(const char *name) {
+    // Deliberately l_debug (compiled out in Release): FlushJobs also runs on
+    // every savefile OPEN (read path), ~700 calls/session -- warning each
+    // would be pure storage-spam. Real drains (periodic/exit) are logged by
+    // savejobs_drain() itself.
+    l_debug("[save_io] Savegame::FlushJobs(%s) -- draining queue...",
+            name ? name : "(null/all)");
+    int r = SO_CONTINUE(int, s_hook_flush_jobs, name);
+    l_debug("[save_io] Savegame::FlushJobs done (ret=%d)", r);
+    return r;
+}
+
+static int hook_updateJob_Start(void *this_) {
+    int r = SO_CONTINUE(int, s_hook_job_start, this_);
+    // Start fires ~10K times/session (generic worker pump, not just saves):
+    // only failures are Release-worthy. The engine's own "Not Created" goes
+    // through _DEBUG_OUT (hidden in Release), so a nonzero return warned here
+    // is the only visible signal that a save chunk lost its worker.
+    if (r != 0)
+        l_warn("[save_io] updateJob_thread::Start(this=%p) FAILED -> %d", this_, r);
+    else
+        l_debug("[save_io] updateJob_thread::Start(this=%p) -> %d", this_, r);
+    return r;
+}
+
+static int hook_updateJob_Start2(void *this_) {
+    int r = SO_CONTINUE(int, s_hook_job_start2, this_);
+    if (r != 0)
+        l_warn("[save_io] updateJob_thread::Start2(this=%p) FAILED -> %d", this_, r);
+    else
+        l_debug("[save_io] updateJob_thread::Start2(this=%p) -> %d", this_, r);
+    return r;
+}
+
+// Engine's own drain-all (the exact call Application::Quit makes). Called
+// from main.c on a timer (only when g_savejobs_pending) and at exit.
+void savejobs_drain(void) {
+    if (!s_save_flush_jobs) {
+        l_warn("[save_io] savejobs_drain: FlushJobs not resolved, cannot drain");
+        return;
+    }
+    l_warn("[save_io] savejobs_drain: flushing pending save jobs...");
+    s_save_flush_jobs(NULL);
+    g_savejobs_pending = 0;
+    __sync_synchronize();
+    l_warn("[save_io] savejobs_drain: done");
+}
+
+int savejobs_has_pending(void) {
+    __sync_synchronize();
+    return g_savejobs_pending;
+}
+
 typedef struct sp_counted_base {
     void **_vptr;
     int use_count_;
@@ -162,6 +269,63 @@ void so_patch(void) {
 #endif
     l_error("[culling] CULLING_MODE=%d (0=bypass total, 1=update-culling activo, 2=culling stock)",
             CULLING_MODE);
+
+    /**
+     * @brief Save-pipeline diagnostic hooks (see the hook bodies above).
+     * @details Each install is best-effort: a missing symbol only skips that
+     *          hook with a warning, never aborts the boot.
+     */
+    {
+        void *sym = (void *)so_symbol(&so_mod, "_ZN15SavegameManager12saveSettingsEv");
+        if (sym) {
+            s_hook_save_settings = hook_addr((uintptr_t)sym, (uintptr_t)&hook_SavegameManager_saveSettings);
+            l_success("Hooked SavegameManager::saveSettings (save_io diag)");
+        } else {
+            l_warn("save_io diag: SavegameManager::saveSettings not found, settings saves untraced");
+        }
+    }
+    {
+        void *sym = (void *)so_symbol(&so_mod, "_ZN8Savegame7saveAllEv");
+        if (sym) {
+            s_hook_save_all = hook_addr((uintptr_t)sym, (uintptr_t)&hook_Savegame_saveAll);
+            l_success("Hooked Savegame::saveAll (save_io diag)");
+        } else {
+            l_warn("save_io diag: Savegame::saveAll not found, async saves untraced");
+        }
+    }
+    {
+        void *sym = (void *)so_symbol(&so_mod, "_ZN8Savegame6AddJobERNS_3JobE");
+        if (sym) {
+            s_hook_add_job = hook_addr((uintptr_t)sym, (uintptr_t)&hook_Savegame_AddJob);
+            l_success("Hooked Savegame::AddJob (save_io diag)");
+        } else {
+            l_warn("save_io diag: Savegame::AddJob not found, pending-job tracking off");
+        }
+    }
+    {
+        void *sym = (void *)so_symbol(&so_mod, "_ZN8Savegame9FlushJobsEPKc");
+        if (sym) {
+            s_save_flush_jobs = (int (*)(const char *))sym;
+            s_hook_flush_jobs = hook_addr((uintptr_t)sym, (uintptr_t)&hook_Savegame_FlushJobs);
+            l_success("Hooked Savegame::FlushJobs (save_io diag + drain)");
+        } else {
+            l_warn("save_io diag: Savegame::FlushJobs not found, queue drain unavailable");
+        }
+    }
+    {
+        void *sym = (void *)so_symbol(&so_mod, "_ZN16updateJob_thread5StartEv");
+        if (sym) {
+            s_hook_job_start = hook_addr((uintptr_t)sym, (uintptr_t)&hook_updateJob_Start);
+            l_success("Hooked updateJob_thread::Start (save_io diag)");
+        }
+    }
+    {
+        void *sym = (void *)so_symbol(&so_mod, "_ZN16updateJob_thread6Start2Ev");
+        if (sym) {
+            s_hook_job_start2 = hook_addr((uintptr_t)sym, (uintptr_t)&hook_updateJob_Start2);
+            l_success("Hooked updateJob_thread::Start2 (save_io diag)");
+        }
+    }
 
     /**
      * @brief Replace obsolete ARMv5 'SWP' atomic spinlocks in Boost with ARMv7 atomics.

@@ -507,13 +507,13 @@ so_default_dynlib default_dynlib[] = {
         { "pipe", (uintptr_t)&pipe },
         { "read", (uintptr_t)&read },
         { "realpath", (uintptr_t)&realpath },
-        { "remove", (uintptr_t)&remove },
-        { "rename", (uintptr_t)&rename },
+        { "remove", (uintptr_t)&remove_soloader },
+        { "rename", (uintptr_t)&rename_soloader },
         { "rewind", (uintptr_t)&rewind_soloader },
         { "rmdir", (uintptr_t)&rmdir },
         { "truncate", (uintptr_t)&truncate },
-        { "unlink", (uintptr_t)&unlink },
-        { "write", (uintptr_t)&write },
+        { "unlink", (uintptr_t)&unlink_soloader },
+        { "write", (uintptr_t)&write_soloader },
 
 
         // *printf, *scanf

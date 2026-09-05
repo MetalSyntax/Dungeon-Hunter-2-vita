@@ -7,6 +7,22 @@
 
 **Gameplay framerate went from 5-6 FPS to ~20-25 FPS, with menus and light scenes now hitting ~60.**
 
+## Saves and options now persist (verified on hardware)
+
+Progress, settings and language previously died in RAM: the game played fine in-session but
+rebooted to an old save, always in English. Three separate causes, all fixed and confirmed with a
+save → reboot → load cycle on a real Vita (Spanish kept, character level and items intact):
+
+- **The port forced English on every boot.** The loader rewrote the saved language to English for
+  the first 180 frames of each launch, so changing language could never stick. Now the saved
+  language is read once and only reset if out of range.
+- **The async save queue was never guaranteed to reach disk.** Player/level saves are queued in
+  RAM (`Savegame::saveAll → AddJob`) and drained by fire-and-forget worker threads — and quitting
+  with START+SELECT skipped `Application::Quit`, the only synchronous drain, entirely. The queue is
+  now also drained on a timer when jobs are pending and unconditionally at exit.
+- **Stale read cache.** The file cache never invalidated on write/delete, so a freshly written save
+  could still load pre-save bytes in-session. Writes, deletes and renames now invalidate.
+
 This release is almost entirely a performance pass. The surprise finding: **the GPU was never the
 bottleneck.** `eglSwapBuffers` costs ~0.2 ms per frame throughout, while the CPU was spending
 120-185 ms. Two separate experiments confirmed it instead of assuming it — rendering at 480x272

@@ -52,7 +52,8 @@ The Vita front touch screen has a native resolution of 1920x1088. Touch inputs a
 
 ## 3. Main Loop Logic (`while (1)`)
 
-- **Emergency Exit Combination:** Holding `START + SELECT` simultaneously exits the main loop and terminates the app.
-- **Language Force to English (`LANGUAGE_FORCE_FRAMES`):** For the first 180 frames after launch, `SavegameManager::setLanguage(0)` is invoked each frame. This prevents persisted save states in `dh2_settings.savegame` from defaulting to an unwanted language (such as German).
+- **Emergency Exit Combination:** Holding `START + SELECT` simultaneously exits the main loop; before terminating, the port now persists settings (`SavegameManager::saveSettings`) and drains the async save queue (`Savegame::FlushJobs(NULL)`, same call `Application::Quit` makes) so progress queued in RAM is not lost.
+- **Language sanitize (one-shot):** After the `SavegameManager` instance exists, the persisted language is read once via `SavegameManager::getLanguage()` and only reset to English (0) if out of range (>7, same clamp the engine uses in its own `menu_language` flow). A previous 180-frame forced-English overwrote the user's choice on every boot, making language changes un-persistable by design; removed.
+- **Periodic async-save drain:** Every 600 frames, if the `AddJob` hook flagged queued save jobs, `Savegame::FlushJobs(NULL)` runs on the main thread -- the same drain `Application::Quit` performs -- so `Savegame::saveAll` jobs reach disk even if the engine's fire-and-forget `UpdateJobs` workers never run. Cheap no-op when workers are healthy.
 - **Continuous FPS Measurement:** Measures real frame rendering rates (`[fps]`) using `sceRtcGetCurrentTick`, outputting results to logs every 3 seconds.
 - **OpenGL Error Auditing:** Audits `glGetError()` every 60 frames to detect potential GLES2 pipeline issues.

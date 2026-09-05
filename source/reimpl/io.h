@@ -23,6 +23,7 @@ extern "C" {
 #include <sys/dirent.h>
 #include <sys/syslimits.h>
 #include <sys/fcntl.h>
+#include <sys/types.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -110,6 +111,16 @@ int fseeko_soloader(FILE *f, off_t offset, int whence);
 off_t ftello_soloader(FILE *f);
 
 int closedir_soloader(DIR *dir);
+
+int unlink_soloader(const char *path);
+int rename_soloader(const char *oldpath, const char *newpath);
+int remove_soloader(const char *path);
+ssize_t write_soloader(int fd, const void *buf, size_t count);
+
+// Drops any cached read copy (and any negative-cache entry) for |path|.
+// Must be called whenever the file at |path| may have been created,
+// modified or deleted through a path that bypasses the read cache.
+void fcache_invalidate(const char *path);
 
 int fcntl_soloader(int fd, int cmd, ...);
 

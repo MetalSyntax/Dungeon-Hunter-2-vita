@@ -286,6 +286,41 @@ static void fcache_populate(const char *path, FILE *real_file) {
 static char s_neg_cache[NEG_CACHE_SIZE][256];
 static int s_neg_cache_count = 0;
 
+// A write through any path (fopen "w"/"a"/"+", open O_WRONLY/O_RDWR/...,
+// unlink, rename...) makes a previously cached read copy STALE, and a create
+// makes a previous negative-cache entry WRONG (a later "rb" must re-probe the
+// disk instead of failing fast). Saves (.savegame) are exactly the files the
+// engine rewrites while the game runs, so without this the next in-session
+// load of dh2_settings.savegame / dh2_XXX.savegame would keep returning the
+// pre-save bytes from RAM even though the disk copy is already new. Runs only
+// on write-intent opens (rare) and deletes, never on the read hot path.
+void fcache_invalidate(const char *path) {
+    if (!path) return;
+    pthread_mutex_lock(&s_fcache_lock);
+    for (int i = 0; i < s_fcache_entry_count; i++) {
+        if (strcmp(s_fcache_entries[i].path, path) == 0) {
+            free(s_fcache_entries[i].data);
+            s_fcache_total_bytes -= s_fcache_entries[i].size;
+            s_fcache_entries[i] = s_fcache_entries[--s_fcache_entry_count];
+            l_debug("[fcache] invalidated %s (write/delete, %d files remain)",
+                    path, s_fcache_entry_count);
+            break;
+        }
+    }
+    for (int i = 0; i < s_neg_cache_count; ) {
+        if (strcmp(s_neg_cache[i], path) == 0) {
+            if (i + 1 < s_neg_cache_count) {
+                memmove(&s_neg_cache[i], &s_neg_cache[i + 1],
+                        (size_t) (s_neg_cache_count - i - 1) * sizeof(s_neg_cache[0]));
+            }
+            s_neg_cache_count--;
+        } else {
+            i++;
+        }
+    }
+    pthread_mutex_unlock(&s_fcache_lock);
+}
+
 FILE * fopen_soloader(const char * filename, const char * mode) {
     // The engine's own on-demand asset streaming (glitch::collada::COnDemandReader,
     // used for .bdae model/character data) sometimes re-resolves an already-absolute
@@ -339,6 +374,16 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
 #else
     FILE* ret = fopen(filename, mode);
 #endif
+
+    // Write-intent opens ("w+b"/"a+b"/"r+" -- the engine's save path) are
+    // rare (a handful per save) but are THE diagnostic signal for "saves
+    // don't persist": logged at WARN so they show up in Release/MINIMAL logs
+    // too, where the per-read l_debug lines are compiled out. Success logs
+    // prove the engine tried; failure logs prove where it broke.
+    if (mode && strpbrk(mode, "wa+") != NULL) {
+        l_warn("[save_io] fopen(%s, %s): %p", filename, mode, ret);
+        if (ret) fcache_invalidate(filename);
+    }
 
     if (!ret) {
         // Dungeon environment alpha masks (data/3d/textures/env_<theme>_alpha.tga)
@@ -455,9 +500,18 @@ int open_soloader(const char * path, int oflag, ...) {
         va_end(args);
     }
 
+    int bionic_oflag = oflag;
+    int write_intent = (oflag & (BIONIC_O_WRONLY | BIONIC_O_RDWR | BIONIC_O_CREAT |
+                                 BIONIC_O_TRUNC | BIONIC_O_APPEND)) != 0;
     oflag = oflags_bionic_to_newlib(oflag);
     int ret = open(path, oflag, mode);
-    if (ret >= 0)
+    if (write_intent) {
+        // Same rationale as the fopen() write log above: fd-based writes are
+        // the engine's other save path, and this line (WARN = Release-visible)
+        // is what proves they were attempted and whether they succeeded.
+        l_warn("[save_io] open(%s, bionic_flags=0x%x): %i", path, bionic_oflag, ret);
+        if (ret >= 0) fcache_invalidate(path);
+    } else if (ret >= 0)
         l_debug("open(%s, %x): %i", path, oflag, ret);
     else
         l_warn("open(%s, %x): %i", path, oflag, ret);
@@ -500,7 +554,12 @@ int fclose_soloader(FILE * f) {
     int ret = fclose(f);
 #endif
 
-    l_debug("fclose(%p): %i", f, ret);
+    // A failed fclose can mean buffered save data never reached the disk.
+    // Rare enough to warn unconditionally (Release-visible).
+    if (ret != 0)
+        l_warn("[save_io] fclose(%p) failed: %i", f, ret);
+    else
+        l_debug("fclose(%p): %i", f, ret);
     return ret;
 }
 
@@ -543,10 +602,17 @@ size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb, FILE *f) {
         return 0;
     }
 #ifdef USE_SCELIBC_IO
-    return sceLibcBridge_fwrite(ptr, size, nmemb, f);
+    size_t ret = sceLibcBridge_fwrite(ptr, size, nmemb, f);
 #else
-    return fwrite(ptr, size, nmemb, f);
+    size_t ret = fwrite(ptr, size, nmemb, f);
 #endif
+    // A short write is a lost save. Essentially never happens on success
+    // paths, so warning unconditionally is cheap and Release-visible.
+    if (size > 0 && nmemb > 0 && ret < nmemb) {
+        l_warn("[save_io] fwrite short: asked %u x %u bytes, wrote %u items (%p)",
+               (unsigned) size, (unsigned) nmemb, (unsigned) ret, f);
+    }
+    return ret;
 }
 
 int fseek_soloader(FILE *f, long offset, int whence) {
@@ -629,10 +695,13 @@ int ferror_soloader(FILE *f) {
 int fflush_soloader(FILE *f) {
     if (fcache_is_handle(f)) return 0; // read-only, nothing to flush
 #ifdef USE_SCELIBC_IO
-    return sceLibcBridge_fflush(f);
+    int ret = sceLibcBridge_fflush(f);
 #else
-    return fflush(f);
+    int ret = fflush(f);
 #endif
+    if (ret != 0)
+        l_warn("[save_io] fflush(%p) failed: %d", f, ret);
+    return ret;
 }
 
 int fgetc_soloader(FILE *f) {
@@ -742,6 +811,49 @@ int ungetc_soloader(int c, FILE *f) {
 int close_soloader(int fd) {
     int ret = close(fd);
     l_debug("close(%i): %i", fd, ret);
+    return ret;
+}
+
+// fd-based writes are the engine's other save path (glitch::io::CFile can
+// write through open()/write() instead of fopen()/fwrite()). Failures here
+// are what a silently-lost save looks like, so warn Release-visibly; the
+// success path stays quiet (writes are hot once a save actually streams).
+ssize_t write_soloader(int fd, const void *buf, size_t count) {
+    ssize_t ret = write(fd, buf, count);
+    if (ret < 0)
+        l_warn("[save_io] write(fd=%d, %u bytes) failed: %d", fd, (unsigned) count, (int) ret);
+    return ret;
+}
+
+// Delete/rename wrappers: the engine deletes slot files via unlink/rename
+// (both are real imports in the .so's .dynsym). A deleted file must drop its
+// cached read copy (and a rename Dirties both ends), or a later load would
+// resurrect the deleted bytes from RAM. Deletes are rare: always log at WARN
+// (Release-visible) since a missing/failed delete is also a save bug signal.
+int unlink_soloader(const char *path) {
+    int ret = unlink(path);
+    l_warn("[save_io] unlink(%s): %i", path ? path : "(null)", ret);
+    fcache_invalidate(path);
+    return ret;
+}
+
+int remove_soloader(const char *path) {
+    int ret = remove(path);
+    l_warn("[save_io] remove(%s): %i", path ? path : "(null)", ret);
+    fcache_invalidate(path);
+    return ret;
+}
+
+int rename_soloader(const char *oldpath, const char *newpath) {
+    int ret = rename(oldpath, newpath);
+    l_warn("[save_io] rename(%s -> %s): %i",
+           oldpath ? oldpath : "(null)", newpath ? newpath : "(null)", ret);
+    // Invalidate both ends regardless of outcome: on success the old bytes
+    // live under the new name now (old cache key is wrong) and any stale
+    // copy under the new name is gone; on failure re-probing is just a
+    // re-read, never incorrect.
+    fcache_invalidate(oldpath);
+    fcache_invalidate(newpath);
     return ret;
 }
 

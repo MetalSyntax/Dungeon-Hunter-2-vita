@@ -116,13 +116,17 @@ static const struct { unsigned int btn; int x; int y; long long pointer_id; cons
     { SCE_CTRL_CROSS,    850, 450, 1, "Primary attack (sword icon, bottom-right)" },
     { SCE_CTRL_SQUARE,   686, 467, 2, "Skill 1 (cyan box, bottom-left of cluster)" },
     { SCE_CTRL_TRIANGLE, 905, 240, 3, "Skill 2 (golden lightning wheel icon, upper-right)" },
-    // Cuadro azul oscuro en 2026-09-18-191203.jpg: icono de espada en llamas (centro 716, 372)
-    { SCE_CTRL_CIRCLE,   716, 372, 7, "Skill 3 (dark blue box, fiery sword icon)" },
     { SCE_CTRL_R1,       905,  60, 4, "Health potion (red flask icon, top-right)" },
-    // Cuadro verde en 2026-09-18-191203.jpg: icono de pausa (centro 71, 174)
-    { SCE_CTRL_START,     71, 174, 8, "Pause button (green box, pause icon)" },
-    // Cuadro rosado en 2026-09-18-191203.jpg: retrato del personaje (centro 103, 76)
-    { SCE_CTRL_SELECT,   103,  76, 9, "Character screen (pink box, portrait icon)" },
+    // Circulo, START y SELECT ya NO estan aca: pasaron a llamadas directas al
+    // motor (ver el bloque de hud_trigger_skill()/hud_toggle_menu_state()).
+    //
+    // OJO al agregar botones nuevos: pointer_id tiene que quedar en 0..7.
+    // TouchScreenBase indexa sus slots SIN validar rango -- touchBegan()
+    // (0x33ac24) hace `this + 48*id` y escribe en +0x20/+0x24/+0x28, y clear()
+    // (0x33b4d8) recorre exactamente 8 entradas (`cmp r3,#8`). Circulo/START/
+    // SELECT usaban 7/8/9: los dos ultimos escribian FUERA del array (pisando
+    // el contador de touches en +0x190), y por eso en log_034 el tap sintetico
+    // "llegaba al motor" pero no disparaba nada. El 0 es el dedo real.
 };
 #define ACTION_BTN_MAP_COUNT (sizeof(action_btn_map) / sizeof(action_btn_map[0]))
 // Rastrea, por boton, si su DOWN sintetico realmente se mando (ver el loop en
@@ -183,16 +187,130 @@ static int (* HUDControls_hasInstance)(void);
 static void *(* NativeGetPlayerChar)(int idx, int remote);
 static void (* Character_Ctrl_Stop)(void *character);
 
+// ---------------------------------------------------------------------------
+// Circulo (poder), START (menu de pausa) y SELECT (pantalla de personaje):
+// llamadas directas al motor, sin touch sintetico.
+//
+// Los tres fallaban aunque el tap sintetico SI llegaba al motor (log_034). La
+// causa real no eran las coordenadas sino el pointer_id: TouchScreenBase indexa
+// su array de slots sin chequear rango (touchBegan hace `this + 48*id`) y
+// clear() recorre 8 entradas -> solo existen los ids 0..7. START usaba 8 y
+// SELECT 9, o sea escribian fuera del array; Circulo (7) caia justo en el
+// ultimo slot valido pero seguia dependiendo de acertarle al hitbox de un boton
+// de Flash cuya posicion el jugador puede mover (HUDControls::SetHUDPos).
+//
+// En vez de seguir adivinando pixeles, replicamos lo que hace el propio
+// ActionScript del HUD -- bytecode AS2 de data/menus/dqhud_i9000.swf:
+//   btn_skill1.onRelease        -> NativeHUDSkill(0)
+//   btn_skill2.onRelease        -> NativeHUDSkill(1)
+//   btn_skill3.onRelease        -> NativeHUDSkill(2)
+//   btn_mainmenu.onRelease      -> NativePushState("menu_Ingame")
+//   btn_charactermenu.onRelease -> NativePushState("menu_CharacterMenu");
+//                                  NativeUpdateOrientation(); NativeAwayFromHud()
+//
+// NativeHUDSkill (0x43e734), sacando el desempaquetado del gameswf::fn_call, es
+// exactamente esto:
+//     ch = NativeGetPlayerChar(0, false)
+//     if (!ch || !ch->CTRLIsAllowed()) return
+//     id = ch->SG_GetSkillInSlot(slot); if (id == -1) return
+//     ctrl = *(void**)(ch + 0x378)
+//     ctrl->Cmd_BeginSkill(id); ctrl->Cmd_EndSkill(id)
+//
+// NativePushState (0x43aebc) hace lo mismo que MenuBase::FS_PushState
+// (0x421234), que SI esta exportada y -- leyendo su desensamblado -- nunca usa
+// `this` (la primera instruccion pisa r0 con el literal de "menu_CharacterMenu"),
+// asi que se puede llamar con this = NULL y nos quedamos con el guard original
+// incluido: solo empuja el estado si arriba del StateMachine esta el de juego.
+// Idem NativeAwayFromHud (0x43ab98): nunca toca su fn_call.
+#define CHAR_OFF_CONTROLLER 0x378
+
+// Slot de skill que dispara Circulo (el cuadro azul oscuro del screenshot).
+// 0 = btn_skill1, 1 = btn_skill2, 2 = btn_skill3.
+// Resuelto en consola: con slot 2 Circulo lanzaba el MISMO poder que Cuadrado
+// (que toca el icono celeste), o sea celeste = btn_skill3. Eso fija la escala
+// del layout del SWF (sprite463: btn_skill3 (347,186) es el de abajo-izquierda
+// y btn_skill1 (370,125) el que le queda arriba-derecha, que es justo el azul
+// oscuro; btn_skill2 (435,114) esta en la columna de la derecha, con el spell).
+// Por eso Circulo = slot 0.
+#define CIRCLE_SKILL_SLOT 0
+
+static int  (* Character_CTRLIsAllowed)(void *character);
+static int  (* Character_SG_GetSkillInSlot)(void *character, int slot);
+static void (* v2Controller_Cmd_BeginSkill)(void *ctrl, unsigned int skill_id);
+static void (* v2Controller_Cmd_EndSkill)(void *ctrl, unsigned int skill_id);
+static int  (* MenuBase_FS_PushState)(void *this_, const char *menu, const char *arg, void *ud);
+static void (* NativeAwayFromHud)(void *fn_call);
+static void *(* MenuManager_GetInstance)(void);
+static void *(* MenuManager_GetMenuByName)(void *this_, const char *name);
+static int  (* MenuBase_IsVisible)(void *menu);
+static void (* MenuFX_PopAll)(void *menufx);
+
+#define MENUBASE_OFF_MENUFX 0x4
+
+// Cerrar un menu ya abierto, copiado tal cual de Application::_CheckGamepad
+// (0x322108-0x32212c), que es como el motor mismo maneja el boton de menu de un
+// gamepad: GetMenuByName -> IsVisible -> MenuFX::PopAll sobre menu->[0x4].
+// Devuelve 1 si lo cerro, para que el mismo boton sirva de toggle.
+static int hud_pop_menu_if_visible(const char *menu) {
+    if (!MenuManager_GetInstance || !MenuManager_GetMenuByName ||
+        !MenuBase_IsVisible || !MenuFX_PopAll) return 0;
+    void *mm = MenuManager_GetInstance();
+    if (!mm) return 0;
+    void *m = MenuManager_GetMenuByName(mm, menu);
+    if (!m || !MenuBase_IsVisible(m)) return 0;
+    void *fx = *(void **) ((char *) m + MENUBASE_OFF_MENUFX);
+    if (!fx) return 0;
+    l_debug("action_btn: PopAll(\"%s\")", menu);
+    MenuFX_PopAll(fx);
+    return 1;
+}
+
+static void hud_trigger_skill(int slot) {
+    if (!NativeGetPlayerChar || !Character_CTRLIsAllowed ||
+        !Character_SG_GetSkillInSlot || !v2Controller_Cmd_BeginSkill ||
+        !v2Controller_Cmd_EndSkill) return;
+    void *ch = NativeGetPlayerChar(0, 0);
+    if (!ch) return;
+    // Mismo gate que usa el HUD: sin el, apretar el boton durante una cinematica
+    // o con el personaje bloqueado mete comandos que el motor no espera.
+    if (!Character_CTRLIsAllowed(ch)) return;
+    int skill_id = Character_SG_GetSkillInSlot(ch, slot);
+    if (skill_id == -1) return; // slot vacio
+    void *ctrl = *(void **) ((char *) ch + CHAR_OFF_CONTROLLER);
+    if (!ctrl) return;
+    l_debug("action_btn: skill slot %d -> skill id %d", slot, skill_id);
+    v2Controller_Cmd_BeginSkill(ctrl, (unsigned int) skill_id);
+    v2Controller_Cmd_EndSkill(ctrl, (unsigned int) skill_id);
+}
+
+// Toggle: si el menu ya esta arriba lo cierra, si no lo abre. Sin el cierre el
+// boton fisico seria de ida nomas (FS_PushState solo empuja cuando el estado de
+// juego esta al tope del StateMachine) y habria que salir con el tactil.
+static void hud_toggle_menu_state(const char *menu, int away_from_hud) {
+    if (hud_pop_menu_if_visible(menu)) return;
+    if (!MenuBase_FS_PushState) return;
+    l_debug("action_btn: PushState(\"%s\")", menu);
+    MenuBase_FS_PushState(NULL, menu, NULL, NULL);
+    if (away_from_hud && NativeAwayFromHud) NativeAwayFromHud(NULL);
+}
+
 typedef struct {
     float m_[4][2]; // [R, G, B, A] x [mult, add]
 } gameswf_cxform;
 
-static const gameswf_cxform s_cxform_1pct = {
+// Opacidad de los controles inferiores del HUD. Por defecto 1% (casi invisibles:
+// se juega con los botones fisicos); el combo L+R del loop principal la alterna
+// a 100% para poder volver a usarlos con el tactil. Se reaplica cada frame desde
+// stick_update(), asi que cambiar el alfa aca ya surte efecto al frame siguiente.
+#define HUD_ALPHA_DIM  0.01f
+#define HUD_ALPHA_FULL 1.0f
+
+static gameswf_cxform s_cxform_hud = {
     {
         { 1.0f, 0.0f },
         { 1.0f, 0.0f },
         { 1.0f, 0.0f },
-        { 0.01f, 0.0f } // 1% opacity
+        { HUD_ALPHA_DIM, 0.0f }
     }
 };
 
@@ -236,17 +354,18 @@ static void hud_apply_bottom_controls_opacity(void *h) {
                 parents[parent_count++] = parent;
             }
         } else {
-            gameswf_character_set_cxform(ch, &s_cxform_1pct);
+            gameswf_character_set_cxform(ch, &s_cxform_hud);
         }
     }
 
     for (int j = 0; j < parent_count; j++) {
-        gameswf_character_set_cxform(parents[j], &s_cxform_1pct);
+        gameswf_character_set_cxform(parents[j], &s_cxform_hud);
     }
 
     static int s_logged_opacity = 0;
     if (!s_logged_opacity && parent_count > 0) {
-        l_info("[hud_opacity] 1%% opacity applied to %d bottom controls container(s)", parent_count);
+        l_info("[hud_opacity] alpha %d%% applied to %d bottom controls container(s)",
+               (int) (s_cxform_hud.m_[3][0] * 100.0f + 0.5f), parent_count);
         s_logged_opacity = 1;
     }
 }
@@ -459,6 +578,16 @@ int main() {
     HUDControls_hasInstance = so_sym_or_warn("_ZN11HUDControls11hasInstanceEv");
     NativeGetPlayerChar     = so_sym_or_warn("_Z19NativeGetPlayerCharib");
     Character_Ctrl_Stop     = so_sym_or_warn("_ZN9Character9Ctrl_StopEv");
+    Character_CTRLIsAllowed = so_sym_or_warn("_ZNK9Character13CTRLIsAllowedEv");
+    Character_SG_GetSkillInSlot = so_sym_or_warn("_ZN9Character17SG_GetSkillInSlotEi");
+    v2Controller_Cmd_BeginSkill = so_sym_or_warn("_ZN12v2Controller14Cmd_BeginSkillEj");
+    v2Controller_Cmd_EndSkill   = so_sym_or_warn("_ZN12v2Controller12Cmd_EndSkillEj");
+    MenuBase_FS_PushState   = so_sym_or_warn("_ZN8MenuBase12FS_PushStateEPKcS1_Pv");
+    NativeAwayFromHud       = so_sym_or_warn("_Z17NativeAwayFromHudRKN7gameswf7fn_callE");
+    MenuManager_GetInstance = so_sym_or_warn("_ZN11MenuManager11GetInstanceEv");
+    MenuManager_GetMenuByName = so_sym_or_warn("_ZN11MenuManager13GetMenuByNameEPKc");
+    MenuBase_IsVisible      = so_sym_or_warn("_ZNK8MenuBase9IsVisibleEv");
+    MenuFX_PopAll           = so_sym_or_warn("_ZN6MenuFX6PopAllEv");
     SavegameManager_setLanguage = so_sym_or_warn("_ZN15SavegameManager11setLanguageEi");
     SavegameManager_getLanguage = so_sym_or_warn("_ZNK15SavegameManager11getLanguageEv");
     SavegameManager_saveSettings = so_sym_or_warn("_ZN15SavegameManager12saveSettingsEv");
@@ -554,10 +683,60 @@ int main() {
         unsigned int released = old_buttons & ~pad.buttons;
         old_buttons = pad.buttons;
 
+        // Combo L + R: alterna la opacidad de los controles inferiores del HUD
+        // entre 1% (por defecto: se juega con los botones fisicos) y 100% (para
+        // volver a usarlos con el tactil). Mientras el combo esta enganchado se
+        // comen los eventos de L1/R1 para que no dispare ademas la pocion (R1)
+        // ni el AKEYCODE_MENU (L1).
+        {
+            const unsigned int SHOULDERS = SCE_CTRL_L1 | SCE_CTRL_R1;
+            static int combo_latched = 0;
+            if ((pad.buttons & SHOULDERS) == SHOULDERS) {
+                if (!combo_latched) {
+                    combo_latched = 1;
+                    s_cxform_hud.m_[3][0] = (s_cxform_hud.m_[3][0] < 0.5f)
+                                          ? HUD_ALPHA_FULL : HUD_ALPHA_DIM;
+                    l_warn("[hud_opacity] L+R -> bottom HUD controls alpha = %d%%",
+                           (int) (s_cxform_hud.m_[3][0] * 100.0f + 0.5f));
+                    // Si R1 ya habia mandado su touch DOWN antes de que entrara
+                    // L1, hay que soltarlo aca a mano: al comernos su `released`
+                    // el motor se quedaria con un dedo pegado en ese slot.
+                    for (int i = 0; i < ACTION_BTN_MAP_COUNT; i++) {
+                        if (!(action_btn_map[i].btn & SHOULDERS)) continue;
+                        if (!s_action_down_sent[i]) continue;
+                        int cx, cy;
+                        if (!glutil_screen_touch_to_logical(action_btn_map[i].x,
+                                                            action_btn_map[i].y, &cx, &cy)) {
+                            cx = action_btn_map[i].x; cy = action_btn_map[i].y;
+                        }
+                        if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, cx, cy,
+                                                          action_btn_map[i].pointer_id, 0, 0);
+                        s_action_down_sent[i] = 0;
+                    }
+                }
+            } else if ((pad.buttons & SHOULDERS) == 0) {
+                combo_latched = 0;
+            }
+            if (combo_latched) {
+                pressed &= ~SHOULDERS;
+                released &= ~SHOULDERS;
+            }
+        }
+
         for (int i = 0; i < BTN_MAP_COUNT; i++) {
             if (pressed & btn_map[i].btn) pending_key_down = btn_map[i].keycode;
             if (released & btn_map[i].btn) pending_key_up = btn_map[i].keycode;
         }
+
+        // Circulo / START / SELECT no pasan por touch sintetico (ver el bloque
+        // de comentarios de hud_trigger_skill()). START+SELECT juntos sigue
+        // siendo el atajo de salida de mas arriba, asi que ninguno de los dos
+        // actua mientras el otro este apretado.
+        if (pressed & SCE_CTRL_CIRCLE) hud_trigger_skill(CIRCLE_SKILL_SLOT);
+        if ((pressed & SCE_CTRL_START) && !(pad.buttons & SCE_CTRL_SELECT))
+            hud_toggle_menu_state("menu_Ingame", 0);
+        if ((pressed & SCE_CTRL_SELECT) && !(pad.buttons & SCE_CTRL_START))
+            hud_toggle_menu_state("menu_CharacterMenu", 1);
 
         SceRtcTick now_tick;
         sceRtcGetCurrentTick(&now_tick);

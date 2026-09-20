@@ -968,6 +968,15 @@ void glDepthRangef_soloader(GLclampf n, GLclampf f) {
 }
 
 void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
+    // Instrumentacion de diagnostico SOLO de builds Debug (mismo patron/misma
+    // regresion que track_seen_texture()/track_render_call() mas arriba: el
+    // fix del 2026-07-24 de envolver el CUERPO de trabajo en #ifdef
+    // DEBUG_SOLOADER, no solo el log, nunca se aplico aca). Esta corria en
+    // TODOS los builds: un loop de 16 isnan/isinf por matriz, en la llamada
+    // GL mas caliente del motor -- se sube una matriz de hueso por hueso por
+    // mesh esqueletal cada frame, o sea potencialmente cientos de veces por
+    // frame en combate con varios personajes en pantalla.
+#ifdef DEBUG_SOLOADER
     for (GLsizei i = 0; i < count; i++) {
         const GLfloat *m = value + (size_t) i * 16;
         int all_zero = 1;
@@ -981,6 +990,7 @@ void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transp
                    location, i + 1, count, s_frame_counter, all_zero, has_nan_or_inf);
         }
     }
+#endif
     glUniformMatrix4fv(location, count, transpose, value);
 }
 
@@ -988,6 +998,16 @@ void glUniformMatrix4fv_soloader(GLint location, GLsizei count, GLboolean transp
 #define MAX_LOGS_PER_UNIFORM4_LOCATION 3
 
 void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) {
+    // Mismo problema que arriba: este loop (chequeo NaN/Inf + heuristica de
+    // "parece un color con alfa casi 0" + estado estatico de logging) corria
+    // sin gatear en TODOS los builds, en la segunda llamada GL mas frecuente
+    // del motor despues de glUniformMatrix4fv (colores de material, tints,
+    // uniforms de shader en general).
+#ifndef DEBUG_SOLOADER
+    (void) location;
+    (void) count;
+    (void) value;
+#else
     for (GLsizei i = 0; i < count; i++) {
         const GLfloat *v = value + (size_t) i * 4;
         int has_nan_or_inf = 0;
@@ -1037,6 +1057,7 @@ void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) 
                    s_seen[slot].log_count, MAX_LOGS_PER_UNIFORM4_LOCATION);
         }
     }
+#endif
     glUniform4fv(location, count, value);
 }
 
@@ -1044,6 +1065,17 @@ void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) 
 #define MAX_LOGS_PER_VERTEX_ATTRIB 3
 
 static void check_vertex_attrib4(GLuint index, const GLfloat *v) {
+    // Mismo gateo que glUniformMatrix4fv_soloader/glUniform4fv_soloader arriba
+    // -- este chequeo tambien corria sin ifdef en todos los builds. Llamada
+    // menos caliente que las de arriba (glVertexAttrib4f fija un valor
+    // CONSTANTE para un atributo deshabilitado, tipicamente unas pocas veces
+    // por setup de draw call, no por vertice), pero mismo patron y mismo
+    // costo cero en Debug de no arreglarlo tambien.
+#ifndef DEBUG_SOLOADER
+    (void) index;
+    (void) v;
+    return;
+#else
     int has_nan_or_inf = 0;
     for (int j = 0; j < 4; j++) {
         if (isnan(v[j]) || isinf(v[j])) has_nan_or_inf = 1;
@@ -1090,6 +1122,7 @@ static void check_vertex_attrib4(GLuint index, const GLfloat *v) {
                has_nan_or_inf ? " NAN_OR_INF" : "", near_zero_alpha ? " NEAR_ZERO_ALPHA" : "",
                s_seen[slot].log_count, MAX_LOGS_PER_VERTEX_ATTRIB);
     }
+#endif
 }
 
 void glVertexAttrib4f_soloader(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {

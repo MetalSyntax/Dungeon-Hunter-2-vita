@@ -1,11 +1,43 @@
-# Dungeon Hunter 2 — PS Vita · v1.1.0 "Playable Framerate"
+# Dungeon Hunter 2 — PS Vita · v1.1.0 "Physical Controls & Persistence"
 
 > Paste the section below into the GitHub release description. The title above goes in the
 > release-title field; suggested tag: `v1.1.0`.
 
 ---
 
-**Gameplay framerate went from 5-6 FPS to ~20-25 FPS, with menus and light scenes now hitting ~60.**
+**All physical buttons now work — movement, attacks, skills, potion, pause and character menu —
+and saves/options finally persist across reboots.**
+
+## Physical controls, finished
+
+Every action button now works, including the three that never did: **Circle** (skill 3),
+**START** (pause / in-game menu) and **SELECT** (character screen). They were dead on every prior
+build even though the previous attempt's synthetic touch events provably reached the engine.
+
+The real cause: the touch layer (`TouchScreenBase`) indexes its slot array as `this + 48 *
+pointer_id` **with no bounds check**, and its `clear()` loops exactly 8 times — so only pointer
+ids `0..7` are valid. Circle/START/SELECT were assigned ids 7/8/9; the last two wrote past the
+array and clobbered the engine's own touch counter, which is why the tap "arrived" in the log but
+never did anything. Coordinates were never the problem — the previous synthetic-touch approach had
+a structural ceiling.
+
+Fixed by dropping synthetic touch for these three entirely and calling the engine directly instead,
+mirroring exactly what its own Flash HUD buttons do (reverse-engineered from the HUD's own
+ActionScript bytecode):
+
+- **Circle** → the same `CTRLIsAllowed` → `SG_GetSkillInSlot` → `Cmd_BeginSkill`/`Cmd_EndSkill`
+  sequence the skill-3 HUD button makes.
+- **START / SELECT** → `MenuBase::FS_PushState("menu_Ingame" / "menu_CharacterMenu")`, and if the
+  menu is already open, the same button closes it (`MenuFX::PopAll`) — one press to open, one to
+  close.
+- **L + R** → new combo, toggles the bottom HUD controls' opacity between 1% (default — play with
+  physical buttons, HUD stays out of the way) and 100% (to use them with touch again).
+
+The left stick and D-pad also got a real fix this release: instead of faking a touch drag on the
+Flash virtual joystick (which GameSWF's hit-test never reliably accepted), the loader now writes
+the engine's own `HUDControls` movement fields directly every frame, the same fields its own touch
+handler fills in when a real finger drags the stick. Confirmed on hardware: both D-pad and analog
+stick move the character correctly.
 
 ## Saves and options now persist (verified on hardware)
 
@@ -23,73 +55,51 @@ save → reboot → load cycle on a real Vita (Spanish kept, character level and
 - **Stale read cache.** The file cache never invalidated on write/delete, so a freshly written save
   could still load pre-save bytes in-session. Writes, deletes and renames now invalidate.
 
-This release is almost entirely a performance pass. The surprise finding: **the GPU was never the
-bottleneck.** `eglSwapBuffers` costs ~0.2 ms per frame throughout, while the CPU was spending
-120-185 ms. Two separate experiments confirmed it instead of assuming it — rendering at 480x272
-(a quarter of the pixels, verified correct on screen) changed combat FPS *not at all*. Every real
-gain here came from CPU-side work.
-
-## Which VPK should I install?
-
-**`dungeon_hunter_2_hack_safe.vpk`** — this is the recommended build and the fastest one.
-
-"Hack" refers to [vitaGL](https://github.com/Rinnegatamante/vitaGL)'s optional speedhack build
-flags, not to anything sketchy. The selection rule was deliberately conservative: **only flags whose
-effect is cheaper CPU code — never one that changes how the GPU is addressed or how its memory is
-managed.** A visual glitch is recoverable; a GPU hang is not. `dungeon_hunter_2.vpk` is the plain
-build if you want to compare.
-
-## What actually made it faster
-
-Roughly in order of measured impact:
-
-1. **vitaGL safe speedhacks** (`MATH_SPEEDHACK`, `CIRCULAR_POOL_SPEEDHACK`, `NO_TEX_COMBINER`) — the
-   single largest win, isolated with a controlled test.
-2. **Deleted our own per-frame logging.** Three diagnostic lines were being written *every frame*,
-   each doing a synchronous `fflush()` to `ux0:` — three blocking storage writes per frame, inside
-   the very frame budget being optimised. They accounted for **93% of all log output**. This alone
-   took 5-6 FPS to 8-9.
-3. **Fixed an O(n) hot path in the pthread bridge.** Every `pthread_mutex_lock` the engine made was
-   taking a global kernel mutex (two syscalls) and linearly scanning up to 1024 pointers. Why that
-   mattered so much: disassembly showed *all* of the engine's `pthread_mutex_lock` call sites live
-   inside STLport's allocators — so **every `std::string`, `vector` and `map` allocation** paid that
-   cost, and the engine's UI layer is a GameSWF ActionScript interpreter, which allocates constantly.
-   Now an O(1) lock-free hash lookup. This also explains a long-standing mystery: framerate used to
-   *decay* over a single session, because the registry kept growing.
-4. **`-O2` → `-O3 -ffast-math`.** Debug and Release had been compiling with identical flags.
-5. **Re-gated the GL debug instrumentation**, which was running ~10 `glGet*` calls per draw call in
-   Release builds.
-
 ## Also fixed
 
-- **Crash when quitting from inside the game.** Root-caused from the crash dump to a jump through a
-  null function pointer during C++ static-destructor teardown (STLport locale destructors). Exit now
-  goes straight to `sceKernelExitProcess` — running the Android library's global destructors buys
-  nothing when the process is already dying, and the Vita kernel reclaims memory, threads, audio and
-  the GXM context by itself.
-- **A real race in the pthread bridge**, pre-existing: a mutex pointer was published before the mutex
-  was initialised. Destroy/unlock also no longer dereference a static-initialiser constant as if it
-  were a pointer.
-- **Left analog stick now moves the character**, driving the on-screen virtual joystick.
-- Reduced-resolution rendering now actually works (`--downsample-test`, default 720x408, which keeps
-  the Vita's exact aspect ratio). It is *not* enabled in the shipped builds, because it turned out
-  not to help — but it's there and correct now if someone wants it for battery life.
+- **Crash on quitting while a sound was playing.** `Application::Quit` stops every sound with a
+  0ms fade, which frees its audio objects synchronously on the main thread — racing the engine's
+  own audio thread, which was iterating that same list at the same moment. Confirmed from a crash
+  dump (prefetch abort through a freed vtable). Level-transition sound stops already used a 500ms
+  fade and never crashed, so quit-time stops now take the same safe path; nothing audible changes,
+  and level transitions are untouched.
+- **A long-standing source of multi-second freezes: every localization file was silently failing
+  to load.** Every `text/<zone>.spanish`/`.symbols` lookup this whole project was hitting a
+  relative path that resolves under `assets/` on the real device, which holds nothing but the save
+  file — the actual files live under `data/text/`, and unlike other asset types, this one had no
+  retry-on-failure path anywhere in the engine. A burst of ~12-18 of these misses in the same frame
+  window was directly responsible for multi-hundred-millisecond stalls (one measured at 834ms
+  average over 60 frames). Now redirected to the correct path on first failure, same pattern
+  already used for a couple of other asset types.
+- **vitaGL's CPU-only speedhacks are now baked into every build by default** (`MATH_SPEEDHACK`,
+  `CIRCULAR_POOL_SPEEDHACK`, `NO_TEX_COMBINER`) — previously only in the opt-in `--hack-safe`
+  variant. Confirmed via `nm -D` that this engine imports zero fixed-function GL entry points (100%
+  GLSL), so the two math-related flags are free no-ops here and the real, measured win comes from
+  `CIRCULAR_POOL_SPEEDHACK`'s vertex-data pooling. The plain `dungeon_hunter_2.vpk` build now
+  performs the same as the old `_hack_safe` variant; `--hack-safe` is kept only for compatibility.
 - Log files are now `.log` instead of `.txt`.
+
+## Performance: 5-6 FPS → ~20-25 FPS in gameplay, ~60 in menus
+
+This is unchanged since the last notes and remains the honest headline: sustained combat is
+~20-25 FPS (up from 5-6), menus and light scenes reach ~60. **The GPU was never the bottleneck** —
+`eglSwapBuffers` costs ~0.2ms per frame throughout, while CPU-side work (the engine tick) was
+120-185ms. Two independent resolution-reduction tests changed combat FPS *not at all*, ruling out
+fill-rate directly rather than assuming it. See `PORTING_PLAN.md` Phase 23 for the full write-up.
 
 ## Known issues
 
-- **Framerate is ~20-25 FPS in gameplay, not 60.** Menus and light scenes reach ~60; heavy combat
-  still dips into the low teens, and loading transitions still stall. Being upfront about this: the
-  dominant remaining cost is understood but not yet fixed — see below.
-- **The engine's frustum culling is bypassed**, which is what makes enemies render reliably, but it
-  means the engine animates and updates the *entire level* every frame regardless of the camera.
-  That's the main remaining waste. Re-enabling culling naively measured *slower* and brings the
-  invisible-enemy bug back, so the real fix is the stale bounding box that made the bypass necessary
-  in the first place.
-- **The analog stick works by driving the virtual joystick**, so it depends on that HUD element
-  existing. A direct-to-engine input path was found and attempted (the engine has a full character
-  command API compiled in) but did not work on hardware; the findings and next experiments are
-  documented for whoever wants to try.
+- **Framerate is ~20-25 FPS in gameplay, not 60.** The dominant remaining cost is understood but
+  not fixed: the engine's real frustum culling has to stay bypassed (see below), so it animates and
+  updates the *entire level* every frame regardless of the camera.
+- **The engine's frustum culling is bypassed.** This is what makes enemies render reliably, but
+  it's also the main remaining performance waste. Naively re-enabling it (`--culling-test 2`)
+  measured *slower* and brings back the invisible-enemy bug, so the real fix is the stale bounding
+  box (or a second, object-level visibility gate — see `PORTING_PLAN.md`) that made the bypass
+  necessary in the first place.
+- **Some enemies still render invisible** (health bar and aggro ring show, no model). The opacity
+  hypothesis has been ruled out with hard evidence (52/52 sampled enemies at full opacity); the
+  current leads are all culling-related.
 - The repeating HUD icon column is still unresolved.
 
 ## Installing
@@ -107,23 +117,18 @@ yourself.
 
 ## For contributors
 
-`PORTING_PLAN.md` **Phase 23** is the full write-up of this release, and it deliberately documents
-what was *tried and rejected* alongside what worked, with the measurement for each — implementing
-real `usleep`/`nanosleep` costs 5x the framerate; restoring update-side culling halves it; raising
-the file cache to 96 MB changed nothing despite 369 MB of measured uncacheable re-reads per session.
-It also retracts an earlier conclusion in the repo that had ruled out fill-rate on the basis of a
-test that, it turns out, was silently running at full resolution.
-
-If you have a physical Vita and want to help, that document lists exactly which diagnostics are
-already wired up and waiting for a fresh hardware log.
+`PORTING_PLAN.md` documents every hypothesis tried for the open issues above, what was ruled out
+and how, and exactly which diagnostic hooks are already wired up and waiting for a fresh hardware
+log. If you have a physical Vita and want to help, that's the place to start.
 
 ## Credits
 
 Built on [SoLoBoP](https://github.com/v-atamanenko) (Andy Nguyen, Rinnegatamante, Volodymyr
 Atamanenko) and [FalsoJNI](https://github.com/v-atamanenko/FalsoJNI), rendering through
-[vitaGL](https://github.com/Rinnegatamante/vitaGL). Particular thanks to the
-**Asphalt-5-Vita** port, whose own performance write-up pointed directly at several of the fixes
-above — it is the closest comparable port and its notes were worth more than any amount of guessing.
+[vitaGL](https://github.com/Rinnegatamante/vitaGL) built from source. Particular thanks to the
+**Asphalt-5-Vita** and **Asphalt-6-Vita** ports, whose own performance write-ups pointed directly
+at several of the fixes in this and the previous release — they are the closest comparable ports
+and their notes were worth more than any amount of guessing.
 
 Dungeon Hunter 2 is © Gameloft. This is an unofficial, non-commercial fan port, not affiliated with
 or endorsed by Gameloft. The loader/bridge source in this repository is MIT licensed; that covers

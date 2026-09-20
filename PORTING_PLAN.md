@@ -1161,6 +1161,92 @@ Ruled out with evidence, to save time: `source/reimpl/mem.c` is byte-identical t
 despite 20 call sites; and vsync/`eglSwapInterval` is not a lever (neither Asphalt 5 nor
 MC2BPegasus touch it, and swap costs 0.2ms here regardless).
 
+#### Phase 26 — Circle/START/SELECT root-caused and fixed (unchecked pointer_id, not coordinates); GL-wrapper diagnostics found running in Release again; Asphalt-6-Vita sibling-port survey (2026-09-20)
+
+**Circle, START and SELECT never worked, on any build, despite the synthetic touch demonstrably
+reaching the engine.** Root cause found by disassembling `TouchScreenBase::touchBegan`/`clear()`:
+`touchBegan` indexes its slot array as `this + 48 * pointer_id` with **no bounds check**, and
+`clear()` loops exactly 8 times (`cmp r3, #8`) — valid pointer ids are `0..7` only. These three
+buttons used ids 7/8/9; the last two wrote past the array, clobbering the touch counter at `+0x190`,
+which is why the tap "arrived" (engine's own `Toucxhhh` echo) but never had an effect. Coordinates
+were never the problem — this was a structural ceiling on synthetic touch for any *new* action
+button, not something a better pixel guess could have fixed.
+
+**Fix**: dropped synthetic touch for these three and call the engine directly, mirroring exactly
+what the HUD's own Flash buttons do — reverse-engineered from the AS2 bytecode of
+`data/menus/dqhud_i9000.swf` rather than guessed:
+- Circle → `Character::CTRLIsAllowed` → `Character::SG_GetSkillInSlot(slot)` →
+  `v2Controller::Cmd_BeginSkill`/`Cmd_EndSkill` on `*(Character+0x378)`, identical to what
+  `NativeHUDSkill()` does. Slot resolved on hardware by process of elimination against Square (see
+  below): cyan icon = `btn_skill3` = slot 2 (what Square's touch hits), dark-blue icon =
+  `btn_skill1` = slot 0 → `CIRCLE_SKILL_SLOT` is 0.
+- START/SELECT → `MenuBase::FS_PushState("menu_Ingame"/"menu_CharacterMenu")`, safe to call with
+  `this=NULL` (disassembly confirms neither it nor `NativeAwayFromHud` ever dereference their first
+  argument). Closing an already-open menu reuses `Application::_CheckGamepad`'s own recipe
+  (`MenuManager::GetMenuByName` → `MenuBase::IsVisible` → `MenuFX::PopAll(menu+0x4)`), so the same
+  button toggles open/closed.
+- New L+R combo toggles the bottom HUD controls' opacity between 1% (default) and 100% (for touch),
+  releasing any half-sent R1 touch on entry so it can't leave a stuck finger on that slot.
+
+Confirmed working end-to-end on hardware. `source/main.c` carries the full technical writeup as
+block comments at the button-map/`hud_trigger_skill`/`hud_toggle_menu_state` definitions.
+
+**Separately found while investigating the above: `glUniformMatrix4fv_soloader`,
+`glUniform4fv_soloader` and `check_vertex_attrib4` (called by both `glVertexAttrib4f_soloader` and
+`glVertexAttrib4fv_soloader`) in `source/utils/glutil.c` were running their full NaN/Inf-detection
+and diagnostic-logging bodies unconditionally in every build, Release included** — the same
+regression class already fixed once in this file for `track_seen_texture()`/`track_render_call()`
+(2026-07-24: "wrap the work body in `#ifdef DEBUG_SOLOADER`, not just the log call") that evidently
+recurred in three functions the earlier pass didn't touch. `glUniformMatrix4fv`/`glUniform4fv` are
+among the hottest GL entry points this engine calls — every skinned mesh's bone matrices and every
+material/tint uniform go through them — so this was real per-call CPU cost (a 16- or 4-float
+isnan/isinf sweep plus branching/static bookkeeping) paid on every frame in every build, including
+the shipped ones. Now gated behind `#ifdef DEBUG_SOLOADER` like their neighbors; the real
+`glUniformMatrix4fv`/`glUniform4fv`/`glVertexAttrib4f(v)` calls are unchanged. Not yet isolated on
+hardware as its own measurement (bundled into this session's build), but it is a pure Release-only
+win with zero behavior change, unlike the culling/speedhack levers below.
+
+**Sibling-port survey: `Asphalt-6-Vita` (same soloader/FalsoJNI/vitaGL-from-source lineage,
+`/Volumes/Seagate/PSVITA Develop/Asphalt-6-Vita`).** Two findings worth carrying forward:
+
+1. **A concrete, untested lead for the invisible-enemy bug, found by analogy.** Asphalt-6 had the
+   same symptom (vehicles/pickups invisible most of the time) and, like DH2, first bypassed
+   `CSceneManager::isCulled` — then *disproved* that this was the cause by disabling the bypass and
+   getting the identical symptom. The real cause there: vehicles/pickups never call
+   `CSceneManager::isCulled` at all — they're gated by a *separate*, directly-called frustum test
+   (`Camera::IsInViewFrustrum`) invoked straight from their own update code. **DH2 has the same
+   shape of gate.** Full disassembly of `RootSceneNode::onAnimate` (`0x35d168`,
+   `dungeon-hunter-2_extract/lib/armeabi-v7a/libDungeonHunter2.so`) shows it calls
+   `CCameraSceneNode::getViewFrustum()` → `SViewFrustum::intersects(aabbox3d)` **directly** at
+   `+0x118` (`0x35d280`) — not through either `CSceneManager::isCulled` overload, so **not** covered
+   by the two `ret0` hooks already in `source/patch.c`. When `intersects()` returns false, the node
+   only takes any actual action if flag bit `1024` is set on `this+0x11c` (some per-node
+   "auto-view-cull" flag, not yet identified for which node types it's set); if so, it skips the rest
+   of that frame's animate work via a virtual call at `this[0]+0x18` and a state byte at `+0x20a`
+   that only re-runs the hide path once per state change. This is exactly the class of gate the
+   `CRootSceneNode::onRegisterSceneNode()` lead from [[dh2-crootscenenode-culling-lead-2026-08-31]]
+   was already looking for, but a different function and a different mechanism (direct frustum math,
+   not a cheap bbox flag check) — worth checking which characters/enemies have that `+0x11c` bit set
+   and whether that correlates with which ones go invisible. **Not hooked, not hardware-tested.**
+   Static analysis only, per this project's own standing rule against hooking hot functions blind
+   ([[dh2-prefer-static-analysis-over-hot-hooks]]) — `SViewFrustum::intersects` is called from
+   multiple systems (both `isCulled` overloads, `CBatchSceneNode::addVisibleSegments`), so forcing
+   it to always return true is a broader, riskier change than the two already-shipped `isCulled`
+   bypasses and deserves its own controlled test before shipping, not a blind patch.
+2. **A risk signal about the speedhack flags DH2 already ships by default.** Asphalt-6 adopted the
+   same set DH2 uses (`MATH_SPEEDHACK`, `CIRCULAR_POOL_SPEEDHACK`, `NO_TEX_COMBINER`, plus
+   `SAMPLERS_SPEEDHACK`/`NO_DMAC`), then reverted all of them after intermittent invisible
+   vehicles and FPS drops, landing back on the same conservative `DRAW_SPEEDHACK=2`-only baseline
+   Asphalt-5-Vita and asphalt8-vita-main already use. This is **correlation, not a confirmed cause**
+   in Asphalt-6's own account (no A/B test was run to isolate which flag), and DH2's own numbers for
+   these flags are hardware-confirmed causally (Phase 23/24's controlled A/B, not just correlation)
+   — so this is not a reason to revert them here. It is a reason to keep it in mind as a candidate
+   experiment (`build.sh` with `VITAGL_BASE_FLAGS` temporarily stripped down) if the invisible-enemy
+   or culling-bypass work above stalls and a graphics-driver cause needs to be ruled back in.
+   FCache-in-RAM and FIOS2/thread-affinity tuning were also compared against Asphalt-6's equivalents
+   and found to already be present/larger in DH2 (`source/reimpl/io.c`'s 96MB `FCache`, already
+   bigger than Asphalt-6's 48MB) — no action needed there.
+
 ## 6. Checklist
 
 - [x] APK and all 4 `.so` files decompiled, one folder per artifact, under `decompiled/`.

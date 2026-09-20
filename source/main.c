@@ -105,7 +105,6 @@ static const struct { unsigned int btn; int keycode; } btn_map[] = {
     { SCE_CTRL_LEFT,     AKEYCODE_DPAD_LEFT },
     { SCE_CTRL_RIGHT,    AKEYCODE_DPAD_RIGHT },
     { SCE_CTRL_CROSS,    AKEYCODE_DPAD_CENTER },
-    { SCE_CTRL_START,    AKEYCODE_MENU },
     { SCE_CTRL_L1,       AKEYCODE_MENU },
 };
 #define BTN_MAP_COUNT (sizeof(btn_map) / sizeof(btn_map[0]))
@@ -115,29 +114,15 @@ static const struct { unsigned int btn; int keycode; } btn_map[] = {
  */
 static const struct { unsigned int btn; int x; int y; long long pointer_id; const char *name; } action_btn_map[] = {
     { SCE_CTRL_CROSS,    850, 450, 1, "Primary attack (sword icon, bottom-right)" },
-    // Coordenadas re-medidas sobre screenshots/gj/2026-09-18/2026-09-18-191203.jpg
-    // (960x544): el usuario marco con un recuadro el icono que SQUARE debe
-    // presionar, que no es el mismo que la posicion vieja (740,350).
-    { SCE_CTRL_SQUARE,   686, 467, 2, "Skill 1 (icono marcado por el usuario, abajo-izquierda del cluster)" },
+    { SCE_CTRL_SQUARE,   686, 467, 2, "Skill 1 (cyan box, bottom-left of cluster)" },
     { SCE_CTRL_TRIANGLE, 905, 240, 3, "Skill 2 (golden lightning wheel icon, upper-right)" },
-    { SCE_CTRL_CIRCLE,   778, 498, 7, "Skill 3 (orange wheel below-left of attack)" },
+    // Cuadro azul oscuro en 2026-09-18-191203.jpg: icono de espada en llamas (centro 716, 372)
+    { SCE_CTRL_CIRCLE,   716, 372, 7, "Skill 3 (dark blue box, fiery sword icon)" },
     { SCE_CTRL_R1,       905,  60, 4, "Health potion (red flask icon, top-right)" },
-    // L1/START YA NO mandan touch aca -- ver btn_map arriba. Causaban un
-    // freeze real en consola (log_030.log): soltar START tambien dispara
-    // appKeyReleased(AKEYCODE_MENU) -> pressPauseButtonInGame() (motor real,
-    // decompiled/.../ghidra/out_ghidra.c linea 409668), que sintetiza SU
-    // PROPIO touch DOWN+UP sobre el icono de pausa real (calculado por el
-    // motor segun Width_Screen/isScreenOriented -- mas confiable que medir a
-    // ojo sobre un screenshot). Como appOnTouch es single-touch, nuestro
-    // touch de aca y el que el motor generaba solo por soltar la tecla
-    // pisaban el mismo unico slot y lo dejaban en un estado inconsistente:
-    // el resto de los botones seguian mandando su touch (se ve en el log),
-    // pero el juego dejaba de reaccionar a cualquiera de ellos. Un solo
-    // camino (el de btn_map, que ya hace exactamente esto y con la
-    // coordenada correcta) alcanza y sobra.
-    // Recuadro morado en el screenshot del usuario = retrato del personaje:
-    // abre la pantalla de personaje (stats/skills/poderes/hadas/inventario).
-    { SCE_CTRL_SELECT,   102,  66, 9, "Character screen (portrait icon, top-left)" },
+    // Cuadro verde en 2026-09-18-191203.jpg: icono de pausa (centro 71, 174)
+    { SCE_CTRL_START,     71, 174, 8, "Pause button (green box, pause icon)" },
+    // Cuadro rosado en 2026-09-18-191203.jpg: retrato del personaje (centro 103, 76)
+    { SCE_CTRL_SELECT,   103,  76, 9, "Character screen (pink box, portrait icon)" },
 };
 #define ACTION_BTN_MAP_COUNT (sizeof(action_btn_map) / sizeof(action_btn_map[0]))
 // Rastrea, por boton, si su DOWN sintetico realmente se mando (ver el loop en
@@ -198,6 +183,74 @@ static int (* HUDControls_hasInstance)(void);
 static void *(* NativeGetPlayerChar)(int idx, int remote);
 static void (* Character_Ctrl_Stop)(void *character);
 
+typedef struct {
+    float m_[4][2]; // [R, G, B, A] x [mult, add]
+} gameswf_cxform;
+
+static const gameswf_cxform s_cxform_1pct = {
+    {
+        { 1.0f, 0.0f },
+        { 1.0f, 0.0f },
+        { 1.0f, 0.0f },
+        { 0.01f, 0.0f } // 1% opacity
+    }
+};
+
+static void (* gameswf_character_set_cxform)(void *this_, const void *cx);
+static void *(* gameswf_character_get_parent)(void *this_);
+static void *(* DebugCachedCharacter_GetChar)(void *this_);
+
+static void hud_apply_bottom_controls_opacity(void *h) {
+    if (!h || !DebugCachedCharacter_GetChar || !gameswf_character_set_cxform) return;
+
+    // Offsets de DebugCachedCharacter para los controles inferiores:
+    // +0x4c: Joystick (contiene stick como hijo)
+    // +0x88: btn_interact (ataque primario)
+    // +0x3b8: btn_spell (rueda dorada)
+    // +0x3e8: btn_skill1
+    // +0x418: btn_skill2
+    // +0x448: btn_skill3
+    // +0x118, +0x148, +0x178: variantes de skill para HUDStyle < 2
+    static const uintptr_t dcc_offsets[] = {
+        0x4c, 0x88, 0x3b8, 0x3e8, 0x418, 0x448, 0x118, 0x148, 0x178
+    };
+
+    void *parents[10];
+    int parent_count = 0;
+
+    for (size_t i = 0; i < sizeof(dcc_offsets) / sizeof(dcc_offsets[0]); i++) {
+        void *dcc = (void *)((char *)h + dcc_offsets[i]);
+        void *ch = DebugCachedCharacter_GetChar(dcc);
+        if (!ch) continue;
+
+        void *parent = gameswf_character_get_parent ? gameswf_character_get_parent(ch) : NULL;
+        if (parent) {
+            int found = 0;
+            for (int j = 0; j < parent_count; j++) {
+                if (parents[j] == parent) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && parent_count < 10) {
+                parents[parent_count++] = parent;
+            }
+        } else {
+            gameswf_character_set_cxform(ch, &s_cxform_1pct);
+        }
+    }
+
+    for (int j = 0; j < parent_count; j++) {
+        gameswf_character_set_cxform(parents[j], &s_cxform_1pct);
+    }
+
+    static int s_logged_opacity = 0;
+    if (!s_logged_opacity && parent_count > 0) {
+        l_info("[hud_opacity] 1%% opacity applied to %d bottom controls container(s)", parent_count);
+        s_logged_opacity = 1;
+    }
+}
+
 #define HUD_OFF_ENGAGED 0xa
 #define HUD_OFF_DIR_X   0x65c
 #define HUD_OFF_DIR_Y   0x660
@@ -211,6 +264,8 @@ static void stick_update(const SceCtrlData *pad) {
     if (!HUDControls_hasInstance()) return;
     void *h = HUDControls_GetInstance();
     if (!h) return;
+
+    hud_apply_bottom_controls_opacity(h);
 
     // Stick de Vita: 0..255 con centro en ~128. sy positivo = ABAJO en
     // pantalla, igual que el resto del motor. Requiere
@@ -407,6 +462,9 @@ int main() {
     SavegameManager_setLanguage = so_sym_or_warn("_ZN15SavegameManager11setLanguageEi");
     SavegameManager_getLanguage = so_sym_or_warn("_ZNK15SavegameManager11getLanguageEv");
     SavegameManager_saveSettings = so_sym_or_warn("_ZN15SavegameManager12saveSettingsEv");
+    gameswf_character_set_cxform = so_sym_or_warn("_ZN7gameswf9character10set_cxformERKNS_6cxformE");
+    gameswf_character_get_parent = so_sym_or_warn("_ZNK7gameswf9character10get_parentEv");
+    DebugCachedCharacter_GetChar = so_sym_or_warn("_ZN20DebugCachedCharacter7GetCharEv");
 
     int (* JNI_OnLoad)(void *jvm) = (void *) so_symbol(&so_mod, "JNI_OnLoad");
     if (!JNI_OnLoad) {

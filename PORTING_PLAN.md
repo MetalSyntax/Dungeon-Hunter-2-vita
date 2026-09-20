@@ -831,6 +831,34 @@ hardware-scaled, visually verified correct) changed combat FPS **not at all** (`
   raising both, the budget does fill (heap 150MB of 268MB) and still rejects 254MB, but FPS did not
   move, so raw I/O volume was not the bottleneck either.
 
+#### Phase 24 — `log_022.log`: 12 FPS gameplay is a build-config regression, not a new bottleneck (2026-09-07)
+
+Gameplay in `log_022` runs 12-17 FPS at 60-82ms CPU-submission with `eglSwapBuffers` still at
+0.25ms (menus: 52-53 FPS at ~18.6ms CPU) — still purely CPU-bound, GPU idle, same signature as
+Phase 23. This is NOT a new engine problem: `log_022` came from a normal **Debug** build with
+**base** vitaGL flags, i.e. without the safe speedhacks that produced Phase 23's 20-25 FPS, plus
+full `DEBUG_SOLOADER` logging (2330 non-metric log lines in the gameplay region alone, every line a
+synchronous `fflush` to `ux0:`). Two verifications before acting:
+- `nm -D --undefined-only` on the real `libDungeonHunter2.so`: **zero fixed-function imports**
+  (no `glMatrix*`/`glVertexPointer`/`glTexEnv`/etc. — 100% GLSL path via `glUseProgram`/`glUniform*`/
+  `glVertexAttribPointer`). Consequences: `HAVE_WVP_ON_GPU=1` evaluated and **discarded** (only moves
+  fixed-function WVP math, which this engine never emits); `MATH_SPEEDHACK`/`NO_TEX_COMBINER` are
+  likewise no-ops here, so the safe set's measured effect comes from `CIRCULAR_POOL_SPEEDHACK`
+  (vertex-data pooling on the draw path, shader-path included). `DISABLE_VSYNC` also a non-issue:
+  swap never blocks today (0.2ms even in menus), nothing is vsync-capped.
+- Release wrappers verified clean: `track_seen_texture()`/`track_render_call()`/`gl_log_render_diag()`
+  bodies are all behind `#ifndef DEBUG_SOLOADER` — a Release build pays one branch + counter per draw.
+- Shipped: **safe set promoted to default base flags** (`CMakeLists.txt` — `MATH`/`CIRCULAR_POOL`/
+  `NO_TEX_COMBINER` now in `VITAGL_BASE_FLAGS`, with the `nm -D` justification recorded in place;
+  `--hack-safe` kept as a compatible no-op variant). Two Release VPKs built the same session, both
+  with `PROFILE_FRAME_TIME=ON` so `[fps]` + `[frame_profile]` survive for measurement:
+  `build/dungeon_hunter_2_hack_safe.vpk` (safe flags — the 18-25 FPS validation build) and
+  `build/dungeon_hunter_2_speedhacks_test.vpk` (**first-ever** hardware test of the aggressive set:
+  `DRAW_SPEEDHACK=1` + `INDICES_DRAW` + `BUFFERS` + `TEXTURE_UPLOADS` — touches the GPU-submission and
+  texture-upload paths, so crashes/glitches are possible; if it misbehaves, fall back to hack_safe).
+  Test order: hack_safe first (expect Phase-23 numbers back: ~20-25 FPS, ~37-50ms CPU); speedhacks_test
+  second (question: does cheapening per-draw submission lift the 12-FPS heavy-combat floor).
+
 #### Correctness fixes found along the way
 
 - **Crash on quitting from inside the game, root-caused and fixed.** The `.psp2dmp` gave prefetch
@@ -876,7 +904,7 @@ The left stick now drives the character. Two routes were investigated; the secon
   `nativeRender()`, so it always loses. Cheapest next experiments: call *after* `nativeRender()`, or
   feed `v2Controller::Cmd_HeadTowards` instead of the `Character` (blocked on getting a live
   `v2Controller*`; it sits at `Character+884` with no public getter).
-- **Synthetic touch on the virtual joystick (shipped).** Same mechanism the action buttons already
+- **Synthetic touch on the virtual joystick (SHIPPED BUT NOT WORKING on hardware — DEFERRED, 2026-09-07).** Same mechanism the action buttons already
   use. The detail that matters: **the DOWN event goes at the pad's centre**, not at the deflected
   position — the Flash clip treats its touch-down point as the origin, so a DOWN already offset would
   yield a null direction — followed by a MOVE every frame while deflected (some GameSWF clips only
@@ -885,6 +913,219 @@ The left stick now drives the character. Two routes were investigated; the secon
   action buttons). Pad geometry lives in three adjustable defines in `main.c`
   (`VJOY_CX/CY/R = 115/450/62`, physical 960x544 coords). **Known limitation: this depends on the
   Flash joystick clip existing, so hiding the HUD will require going back to the native route.**
+- **Hardware verdict on the synthetic-touch route (`log_020.log`, Debug): DOES NOT MOVE.** The
+  synthetic DOWN/MOVE verifiably reach the engine (its own `Toucxhhh` trace echoes our coordinates),
+  the JNI wrapper provably drops `pointerId` (calls `appOnTouch(type,x,y)` without it — so `ptr=6`
+  is exonerated), `Touch_Hack_int=0` and HUD reposition mode `+0x66c=0` are both clear — yet
+  `HUDControls+10` (joystick-engaged flag) stays `0` and the direction vector `+0x660/+0x668` stays
+  `(0.00,0.00)` on every sample: GameSWF's hit-test never accepts the DOWN. The runtime clip-position
+  reader (`vjoy_resolve_center()`, `HUDControls+0x1c` stick clip world matrix) additionally never
+  adopted once (`center=(-1,-1)` on every DOWN, zero `joystick clip runtime pos` lines), so every
+  DOWN went to the capture-measured fallback, which may miss the real clip by ~80px depending on
+  `HUDStyle`/layout. Suspect #1 for the non-adoption is the exact-integer double-match requirement
+  (a 1px idle wobble resets it forever) — since relaxed to adopt-on-first-valid-read with ±3px
+  hysteresis plus throttled failure-reason logging (`source/main.c`). **Crucial positive control from
+  the user: direct finger drag on the visible joystick DOES move the character**, so the engine side
+  (clip, hit-test, `Cmd_HeadTowards`) is fully functional — the defect is purely in *where/how* the
+  synthetic touch is injected. **Deferred by user decision; do not rework without a Debug session
+  comparing `touch_real:` DOWN coordinates (finger positions that demonstrably work) against the
+  synthetic center in the same log** — that single comparison distinguishes "wrong coordinates" from
+  "event rejected for another reason" with no further guessing.
+
+- **Resumed 2026-09-18: `sceCtrlSetSamplingModeExt(ANALOG_WIDE)` was never called, `vjoy_resolve_center()`
+  adoption relaxed, D-pad wired onto the same virtual joystick, single-touch yield added.** Re-reading
+  the deferred verdict above found a real confound: `main()` never once called
+  `sceCtrlSetSamplingMode(Ext)`, so whether `pad.lx/ly` were even reading real deflection during the
+  `log_020` test is unverified (Vita's default sampling mode does return *some* analog data, so the
+  synthetic DOWN/MOVE traces seen back then don't rule this out either way — it's simply an unturned
+  stone, now closed). Also folded in this pass: `stick_update()` now takes a `touch_busy` flag and
+  yields (releases the vjoy DOWN) whenever a real finger or a physical action button is held, since
+  `appOnTouch` is confirmed single-touch and ignores `pointerId` (see the block comment at the top of
+  this section) — three independent synthetic-touch sources fighting over one engine-side touch slot
+  was an obvious way to lose events even before geometry is considered. D-pad now drives the same
+  virtual joystick at full deflection (`nativeKeyDown/Up` confirmed dead code, see above) since it's
+  free once the vjoy plumbing exists. **Status: built (Debug) and deployed to hardware via
+  `psvita-toolkit deploy --eboot`, not yet played by the user.** Next real data point is a Debug session
+  exercising the stick, then reading the `vjoy:` lines: `runtime pos logical=` (did the center ever
+  adopt?) and `hud_flag=`/`vec=` in `vjoy_log_hud_state` (did `HUDControls+10`/`+0x660/+0x668` ever go
+  non-zero this time?). If they're still `0`/`(0.00,0.00)` even with a correctly-adopted center, the
+  defect is not positional and the touch-injection route should be abandoned in favor of the lead below.
+- **Fallback lead if synthetic touch fails again: directly write the engine's own movement-vector
+  fields instead of faking a touch event, following `Sacred-Odyssey-vita`'s pattern.** That port hooks
+  the getter its engine already polls once a frame for stick axis values
+  (`hook_HudMovePad_Get_MovePad_AxisValues`, `source/controls.c` — a getter it already calls, not a
+  trampoline on a hot/hammered function, so it doesn't fall under the hook-on-hot-path ban this project
+  already learned the hard way). DH2 has no equivalent getter (GameSWF computes the vector once, at
+  touch-DRAG time, inside `HUDControls::OnEvent` — see the offsets documented earlier in this section),
+  but the same idea adapts: since `vjoy_log_hud_state()` already *reads* `HUDControls+10` (engaged flag)
+  and `+0x660`/`+0x668` (direction vector, read-only diagnostic today) through an already-resolved
+  `HUDControls::GetInstance()` pointer, the untried step is to *write* them directly from
+  `stick_update()` when the physical stick is deflected and yield to `v2Controller::Cmd_Stop()` (real
+  symbol, confirmed present in `decompiled/.../ghidra/out_ghidra.c` at the `Cmd_Stop()` call inside
+  `HUDControls::OnEvent`'s release branch) on release — bypassing GameSWF's hit-test entirely instead of
+  trying to satisfy it. **Caveat found while checking this in Ghidra's pseudo-C**: the decompilation of
+  `OnEvent` is heavily garbled around the float ops (bogus "subroutine does not return" markers on
+  `__aeabi_fadd`/`__aeabi_fdiv`, a soft-float-ABI artifact Ghidra mishandles) and one read shows `+0x660`
+  sourced from `PlayerManager::GetLocalPlayer()`'s return value, not from `this` (`HUDControls*|`) —
+  i.e. Ghidra's pseudo-C does **not** independently confirm the `+0x660/+0x668` offsets already in
+  `main.c`, which came from reading the real disassembly by hand. Re-verify those two offsets against
+  the raw disassembly (not the pseudo-C) before writing to them — a wrong offset here is a real OOB
+  write, unlike the current read-only diagnostic use.
+
+- **2026-09-19: switched to the direct-write fallback above, and along the way found the `+0x660/+0x668`
+  offset guess from the previous pass was WRONG.** Re-verified everything with `objdump -d` on the real
+  `.so` (`dungeon-hunter-2_extract/lib/armeabi-v7a/libDungeonHunter2.so`) instead of Ghidra's pseudo-C
+  (confirmed garbled around the float ops, as already suspected) — full disassembly of
+  `HUDControls::OnEvent` (`0x418d28`) and `HUDControls::Update` (`0x41a780`):
+  - `HUDControls::Update` only calls `v2Controller::Cmd_HeadTowards` when `HUDControls+0xa != 0` (this
+    part of the old guess was right), reading the direction as **`+0x65c`=x, `+0x660`=y, `+0x664`=z**
+    (a `Point3D<float>`, z always 0) and a separate scalar **`+0x668`=magnitude** that it multiplies in
+    before the call. The old code read `+0x660/+0x668` as `(vx,vy)` — that's the true `y` and the byte
+    right past `z`, i.e. off by one field; it was never going to show a real vector no matter what
+    synthetic touch did.
+  - `Character* = *(*(Application::s_inst+64)->PlayerManager::GetLocalPlayer(0,false)) + 0x660`, and
+    **`v2Controller* = Character* + 0x378`** (used by both `OnEvent`'s release branch and `Update` to
+    call `Cmd_Stop`/read the controller) — corrects the old `Character+884` guess (an approximate thunk
+    offset, not the real member).
+  - The `(x,y)` `OnEvent` writes on a real drag is not the raw screen delta: it rotates a seed vector
+    `(0.7071,-0.7071,0)` by `(90° - atan2f(dy,dx))` around the origin (`Point3D::rotateXYBy`, `0x418c48`,
+    confirmed standard CCW rotation). In closed form for a unit screen-space delta `(nx,ny)`:
+    `x' = (nx+ny)/√2`, `y' = (nx-ny)/√2` — a fixed 45° basis change (this genre's usual isometric
+    screen-to-world control mapping).
+  - Also found and fixed the actual reason `vjoy_resolve_center()`'s "engine origin" source (Source 1,
+    `HUDControls+0x14/+0x18`) never adopted on a real drag: `OnEvent`'s DOWN handler stores
+    `event.x/20.0f` there (twips→pixels) — **already in pixels** — but the old code multiplied by 20
+    again before the screen-range sanity check, so a real touch-down (e.g. pixel 100) became `2000` and
+    always failed the `<1010` bound. Moot now since the whole touch-position-resolution path (this
+    function, `vjoy_read_drag_matrix`, `RenderFX::Find`, the DCC clip lookup, `Touch_Hack_int`) was
+    deleted along with the touch-synthesis approach it supported — none of it is needed once `stick_update()`
+    writes `HUDControls`'s fields directly and lets its own `Update()` call `Cmd_HeadTowards` itself.
+  - **Shipped in `source/main.c`**: `stick_update(pad)` (no longer takes a `touch_busy` yield flag — it
+    doesn't touch `nativeOnTouch` at all anymore, so it can't fight the action buttons or real touch for
+    the engine's single touch slot). On release it calls `Character::Ctrl_Stop()` (`NativeGetPlayerChar(0,false)`
+    + `_ZN9Character9Ctrl_StopEv`, both already-verified symbols) since `Update()` merely stops *calling*
+    `Cmd_HeadTowards` when `+0xa=0`, it does not itself send a stop command. D-pad still shares the same
+    write path at full deflection. Builds clean (`psvita-toolkit build --preset debug`). **Not yet
+    hardware-tested** — the 45°-basis-change sign is a real unknown: if the character moves in a rotated
+    or mirrored direction relative to the stick, that formula's sign is what to flip first; the important
+    unknown this resolves is whether the character moves *at all*, which none of the touch-based attempts
+    ever achieved.
+
+- **2026-09-20: hardware confirms the write mechanism above is correct — D-pad moves the character
+  perfectly (`log_029.log`) — but the analog stick still didn't, and `log_029.log` pinpoints exactly
+  why.** A `stick_diag` line added to `stick_update()` (raw `pad->lx/ly` logged every 20 frames,
+  unconditionally) shows **133/133 samples identically `lx=128 ly=128`** for the whole session, despite
+  `sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE)` returning success (`ret=0x00000000`) in `main()`.
+  Since D-pad and stick share the exact same `HUDControls`-write code path from this point on, the bug is
+  entirely upstream, in reading the stick, not in anything from the previous entry.
+  - **Root cause**: `sceCtrlSetSamplingModeExt()` only affects the sampling mode consumed by the
+    `...Ext`/`...2` family of buffer-read functions — the code was reading with the *basic*
+    `sceCtrlPeekBufferPositive()`, which the Ext sampling mode doesn't govern, so it kept returning the
+    digital-mode placeholder (128,128) forever. Confirmed against sibling ports that actually read the
+    analog stick (not just digital buttons) — `MC2BPegasus-Vita` and `asphalt8-vita`'s `controls.c` both
+    call `sceCtrlPeekBufferPositiveExt2()` as the primary read, falling back to the basic buffer only if
+    Ext2 errors. Every other sibling port in this workspace only reads buttons, so this mismatch was
+    invisible until a port (this one) actually needed `lx/ly`.
+  - **Fix**: `source/main.c`'s main loop now calls `sceCtrlPeekBufferPositiveExt2(0, &pad, 1)` first, with
+    the basic `sceCtrlPeekBufferPositive()` as a fallback if Ext2 returns an error — same pattern as the
+    sibling ports above. Not yet hardware-tested.
+- **Same session: found and fixed a real single-touch state-desync bug while wiring D-pad/START/SELECT
+  extras.** The action-button loop (`main()`) gated synthetic touch **DOWN** behind a 250ms debounce
+  shared across all buttons, but sent the corresponding **UP** unconditionally on release — so a press
+  swallowed by the debounce (e.g. two buttons pressed within 250ms of each other) still produced a bare
+  UP with no matching DOWN. Since `appOnTouch` is confirmed single-touch and ignores `pointerId` (see the
+  block comment above `stick_update()`), that orphan UP desyncs the engine's one touch slot — matches the
+  user's report of the character "freezing" (no button worked) shortly after pressing START. Fixed by
+  tracking per-button whether its DOWN actually fired (`s_action_down_sent[]`) and only sending UP when it
+  did. Also remapped `SQUARE`/`START`(new, alongside `L1`)/`SELECT`(new) to the exact icon positions the
+  user marked with colored boxes on a real screenshot (skill icon, pause "II" icon, character portrait).
+
+- **Same session, next hardware round (`log_030.log`): the debounce fix above did NOT stop the START
+  freeze — real root cause found, and it corrects a standing project assumption.** `log_030.log` showed
+  the `s_action_down_sent[]` fix working (START's touch DOWN/UP paired correctly) and every other action
+  button's synthetic touch still firing fine afterward (echoed by the engine's own `Toucxhhh` trace) — yet
+  the user confirmed nothing but D-pad worked post-START, no pause overlay ever appeared, and (separately
+  confirmed) every action button works fine as long as START is never touched. That isolates the freeze to
+  something START-specific, not the general action-button path.
+  - **`appKeyReleased(keyCode)` (reached via `nativeKeyUp`) is NOT dead code** — this corrects
+    [[dh2-gameplay-reached-lang-buttons-distortion]]'s "appKeyPressed/appKeyReleased ambas vacias"
+    conclusion, which only holds for `appKeyPressed` (confirmed empty, just one `_DEBUG_OUT`,
+    `out_ghidra.c:409243`). `appKeyReleased` (`out_ghidra.c:409722`) has real branches: `keyCode==4`
+    (BACK) drives exit-confirmation/minimize-in-cutscene logic; `keyCode==0x52` (MENU) with
+    `lastOpenMenuID==9` (the normal in-gameplay value) calls `pressPauseButtonInGame()`
+    (`out_ghidra.c:409668`) — which **itself synthesizes its own touch DOWN+UP** on the real pause icon,
+    at a coordinate it computes from `Width_Screen`/`isScreenOriented` (more accurate than any
+    hand-measured screenshot guess). This also retroactively explains why `pressPauseButtonInGame` traces
+    were already present in `log_026.log`, from long before this feature existed in `main.c` — some other
+    code path in the engine independently calls `appKeyReleased` too, unrelated to us.
+  - **The actual bug**: `btn_map` already sent `AKEYCODE_MENU` on START release (present since before this
+    session, believed inert) — so releasing START fired *two independent* touch DOWN+UP sequences through
+    the engine's confirmed-single-touch `appOnTouch`: ours (`action_btn_map`, a hand-measured coordinate)
+    and the engine's own (via `pressPauseButtonInGame`, the correct coordinate). Two unrelated touch
+    streams racing the same single slot left it in a state where subsequent synthetic touches kept being
+    *sent* (hence still appearing in the log) but stopped having any in-game effect.
+  - **Fix**: removed the `action_btn_map` touch entries for `L1`/`START` entirely and instead route both
+    through the already-correct, already-alive `btn_map` → `AKEYCODE_MENU` → `appKeyReleased` →
+    `pressPauseButtonInGame()` path (one mechanism, the engine's own, instead of two racing). Also removed
+    `CIRCLE`→`AKEYCODE_BACK` from `btn_map` pre-emptively, since `CIRCLE` now has its own skill-3 touch
+    mapping and BACK's real exit-confirmation/minimize side effects are exactly the same kind of hazard.
+    Not yet hardware-tested.
+- **Same round: lowered the stick deadzone 0.28 → 0.12.** `log_030.log` (first log with a working
+  `sceCtrlPeekBufferPositiveExt2` read) showed the user's actual test deflection topping out at
+  `mag=0.097` — comfortably under the old 0.28 threshold, so a real, deliberate stick push was still being
+  fully swallowed by the deadzone even though the read itself was finally correct. 0.12 still clears the
+  ~0.02-0.03 idle noise floor seen in the same log.
+
+#### Phase 25 — `log_024.log`: found and fixed a real localization-loading bug; it also explains the worst frame stalls (2026-09-18)
+
+`log_024.log`'s worst single moments are not steady-state slowness but **freezes**: `[fps] 0.1
+frames/sec (2 frames in 18.27s)` immediately followed by `[frame_profile] over 60 frames: avg
+CPU-submission=834.36ms` (line 201), and a second one later (`733.22ms` avg, line 296). Both spikes
+immediately follow a **burst of ~12-18 distinct, never-before-seen `fopen()` misses in the same frame
+window** — each one a real, uncached failed `sceIoOpen()` against the SD card (the existing
+`s_neg_cache` in `source/reimpl/io.c` only helps on the *second* lookup of the same path, so a burst of
+brand-new distinct missing paths pays full cost every time). This is a different failure mode from the
+"raw I/O volume"/fcache-budget angle already tried and ruled out in Phase 23 (bumping the cache didn't
+move FPS because that only helps *repeat reads of files that exist* — it does nothing for first-time
+negative lookups).
+
+- **Root cause, confirmed against the real files (not guessed): every `text/<zone>.spanish` and
+  `text/<zone>.symbols` localization file requested in this log genuinely exists** — verified two ways:
+  (1) all of them are present in the reference app-data dump
+  (`com.gameloft.android.GAND.GloftD2SS/files/data/text/`), and (2) a live FTP listing of the real
+  device (`ux0:data/dungeon-hunter-2/data/text/`, done this session) shows every single failing
+  filename (`menu`/`global`/`gameplaymenus`/`tutorial`/`ingame`/`darkwoods`/`sidequests`/`locations`/
+  `items` × `.spanish`/`.symbols`) sitting right there. **Every `text/*` `fopen()` in this entire log
+  fails — zero exceptions, zero successes** — this isn't a missing-asset problem, localization loading
+  was completely broken. Cause: the engine requests these with a bare relative path (`"text/menu.spanish"`),
+  which resolves against `chdir(DATA_PATH "assets/")` (`main.c`) to `.../assets/text/menu.spanish` — and
+  `assets/` on the real device holds nothing but `data.save`. Unlike `pydata/*` (which the engine itself
+  already retries against an absolute `.../data/pydata/` path — that's what the `[pydata_diag]` success
+  lines after each failed relative attempt are), `text/*` has no such retry anywhere in the real engine.
+- **Fix shipped**: `fopen_soloader()` (`source/reimpl/io.c`) now redirects any failed `text/...` relative
+  open to `DATA_PATH "data/text/..."`, the same targeted-redirect-after-failure pattern already used
+  there for the `pvr2_`-prefixed alpha masks and the missing character textures. Built (Debug) and
+  deployed via `psvita-toolkit deploy --eboot`; not yet re-tested on hardware. Expected effect: the
+  ~12-18-file misses that preceded both mega-stalls in `log_024` become hits, which should remove (or at
+  minimum sharply shrink) those specific freezes; whether it moves the *sustained* combat FPS at all is
+  a separate, still-open question (Phase 23/24's CPU-bound findings stand).
+- **`003_darkwood.mlx` (line 272-273): a related but distinct, NOT fixed, lower-priority case.** The
+  engine tries `ux0:data/dungeon-hunter-2/003_darkwood.mlx` and `.../data/003_darkwood.mlx`, both fail;
+  the real file lives at `.../data/scene/003_darkwood.mlx` (confirmed in the reference dump). Left alone
+  this session — only one file, the game evidently recovers via some other path (not visible in this
+  log window, since level-load has to succeed for the session to reach `darkwoods.spanish` etc. later),
+  and it wasn't part of the mega-stall bursts. Revisit if a future log shows scene-load-specific hitches.
+- **Sibling-port survey (`Asphalt-5/6-Vita`, `Sacred-Odyssey-vita`, others) found no better general
+  answer for the negative-lookup-burst problem** — none of them build a startup file-existence
+  manifest/index to short-circuit a *first-time* missing-file lookup without touching storage; their
+  negative caches are the same "helps on repeat, not on first miss" design DH2 already has. One
+  concretely useful data point: `Sacred-Odyssey-vita`'s `fcache` (same lineage/naming as ours) hit its
+  64MB budget with **zero eviction** and had to add LRU eviction on 2026-09-18 after finding it had only
+  68 bytes of headroom left post-main-menu — DH2's own `fcache_populate()` should be checked for the same
+  gap (96MB budget, no confirmed eviction policy) next time cache-budget tuning comes up, independent of
+  today's fix. Also confirmed as already-correct, not a gap: DH2's `dialog.c` already re-applies
+  `ANALOG_WIDE` after `sceImeDialogTerm()`, matching the identical fix present in every sibling port
+  (`// For some reason analog stick stops working after ime`) — a universal, already-handled gotcha.
 
 #### Build/infrastructure
 

@@ -386,6 +386,29 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
     }
 
     if (!ret) {
+        // Localization ("text/<zone>.<language>" and "text/<zone>.symbols") always
+        // fails: the engine requests these as a plain relative path, which resolves
+        // against our chdir(DATA_PATH "assets/") cwd (main.c) -- i.e. it actually
+        // tries ".../assets/text/menu.spanish", and assets/ only holds data.save.
+        // Confirmed via a live FTP listing of the real device (2026-09-18) that
+        // EVERY one of these files (menu/global/gameplaymenus/tutorial/ingame/
+        // darkwoods/sidequests/locations/items.spanish+.symbols, etc.) genuinely
+        // exists, just under DATA_PATH "data/text/" instead -- unlike pydata/,
+        // which the engine itself already retries against an absolute
+        // ".../data/pydata/" path (see the [pydata_diag] success lines), text/ has
+        // no such retry anywhere, so every localized string table was silently
+        // failing to load. Log evidence this was not just wasted work: bursts of
+        // ~12 distinct first-time failures like this correlate with the worst
+        // single-frame stalls seen (log_024.log: a 12-file text/ burst immediately
+        // precedes a 60-frame average of 834ms/frame) -- each miss is a real,
+        // uncached failed sceIoOpen() against the SD card.
+        if (strncmp(filename, "text/", 5) == 0) {
+            char redirected[512];
+            snprintf(redirected, sizeof(redirected), DATA_PATH "data/%s", filename);
+            ret = fopen_soloader(redirected, mode);
+            if (ret) return ret;
+        }
+
         // Dungeon environment alpha masks (data/3d/textures/env_<theme>_alpha.tga)
         // are shipped on disk under a "pvr2_" prefix for most level themes (e.g.
         // pvr2_env_swamp_alpha.tga -- confirmed by inspecting the real extracted

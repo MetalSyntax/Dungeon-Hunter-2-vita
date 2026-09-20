@@ -134,6 +134,33 @@ static int hook_updateJob_Start2(void *this_) {
     return r;
 }
 
+// Application::Quit -> VoxSoundManager::StopAllSounds(0) corre
+// vox::VoxEngine::StopAllEmitters(mask, 0.0s) en el hilo principal mientras el
+// hilo de audio del motor itera la misma lista en
+// VoxEngineInternal::UpdateSources -> ReleaseDatasource(DataObj*) ->
+// llamada virtual al destructor (log_025 + .psp2dmp: prefetch abort con
+// PC=0x20, LR en ReleaseDatasource+0xa4 = `ldr pc,[r3]` tras leer una vtable
+// ya liberada). Con fade 0 la liberacion es sincronica en el hilo que pide
+// salir y la carrera es determinista.
+//
+// Las transiciones de nivel llaman al mismo StopAllSounds con 500ms y JAMAS
+// crashean ahi: con fade > 0 el motor difiere la liberacion real (la hace el
+// propio hilo de audio de forma ordenada) en vez de soltar todo bajo los
+// pies de UpdateSources. En el camino de Quit el proceso muere por
+// nativeExit -> JNI Exit -> sceKernelExitProcess milisegundos despues, asi
+// que el fade nunca llega a sonar: redirigir 0 -> 500 toma el camino
+// empiricamente seguro sin cambiar nada audible ni tocar las transiciones
+// (que siguen pasando su 500 intacto).
+static so_hook s_hook_stop_all_sounds;
+
+static int hook_VoxSoundManager_StopAllSounds(void *this_, int fade_ms) {
+    if (fade_ms == 0) {
+        l_warn("[audio] VoxSoundManager::StopAllSounds(0) -> 500 (salida segura, evita UAF en UpdateSources)");
+        return SO_CONTINUE(int, s_hook_stop_all_sounds, this_, 500);
+    }
+    return SO_CONTINUE(int, s_hook_stop_all_sounds, this_, fade_ms);
+}
+
 // Engine's own drain-all (the exact call Application::Quit makes). Called
 // from main.c on a timer (only when g_savejobs_pending) and at exit.
 void savejobs_drain(void) {
@@ -355,5 +382,19 @@ void so_patch(void) {
     if (sym_boost_sc_copy2 && sym_boost_sc_copy2 != sym_boost_sc_copy) {
         hook_addr((uintptr_t)sym_boost_sc_copy2, (uintptr_t)&hook_shared_count_copy_ctor);
         l_success("Hooked boost::detail::shared_count C2 copy ctor -> ARMv7 atomic");
+    }
+
+    /**
+     * @brief Route Application::Quit's synchronous mass sound stop through the
+     *        deferred fade path (see hook body above for the crash analysis).
+     */
+    {
+        void *sym = (void *)so_symbol(&so_mod, "_ZN15VoxSoundManager13StopAllSoundsEi");
+        if (sym) {
+            s_hook_stop_all_sounds = hook_addr((uintptr_t)sym, (uintptr_t)&hook_VoxSoundManager_StopAllSounds);
+            l_success("Hooked VoxSoundManager::StopAllSounds (Quit-safe fade)");
+        } else {
+            l_warn("audio: VoxSoundManager::StopAllSounds not found, Quit-time audio race unpatched");
+        }
     }
 }

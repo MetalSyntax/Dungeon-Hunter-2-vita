@@ -93,14 +93,20 @@ static int (* nativeCanInterrupt)(JNIEnv *env, jobject clazz);
 /**
  * @brief Mapping physical D-Pad and menu buttons to Android KeyEvents.
  */
+// OJO: a diferencia de appKeyPressed (confirmado vacio, solo un _DEBUG_OUT:
+// decompiled/.../ghidra/out_ghidra.c linea 409243), appKeyReleased (nativeKeyUp)
+// SI tiene logica real -- ver el comentario junto a action_btn_map mas abajo.
+// AKEYCODE_BACK se saco de aca a proposito: el motor le da manejo propio a BACK
+// en appKeyReleased (confirmacion de salida / minimizar en cutscene) que no
+// queremos disparar por accidente al usar CIRCLE como boton de skill.
 static const struct { unsigned int btn; int keycode; } btn_map[] = {
     { SCE_CTRL_UP,       AKEYCODE_DPAD_UP },
     { SCE_CTRL_DOWN,     AKEYCODE_DPAD_DOWN },
     { SCE_CTRL_LEFT,     AKEYCODE_DPAD_LEFT },
     { SCE_CTRL_RIGHT,    AKEYCODE_DPAD_RIGHT },
     { SCE_CTRL_CROSS,    AKEYCODE_DPAD_CENTER },
-    { SCE_CTRL_CIRCLE,   AKEYCODE_BACK },
     { SCE_CTRL_START,    AKEYCODE_MENU },
+    { SCE_CTRL_L1,       AKEYCODE_MENU },
 };
 #define BTN_MAP_COUNT (sizeof(btn_map) / sizeof(btn_map[0]))
 
@@ -109,119 +115,179 @@ static const struct { unsigned int btn; int keycode; } btn_map[] = {
  */
 static const struct { unsigned int btn; int x; int y; long long pointer_id; const char *name; } action_btn_map[] = {
     { SCE_CTRL_CROSS,    850, 450, 1, "Primary attack (sword icon, bottom-right)" },
-    { SCE_CTRL_SQUARE,   740, 350, 2, "Skill 1 (frost snowflake icon, middle-right)" },
+    // Coordenadas re-medidas sobre screenshots/gj/2026-09-18/2026-09-18-191203.jpg
+    // (960x544): el usuario marco con un recuadro el icono que SQUARE debe
+    // presionar, que no es el mismo que la posicion vieja (740,350).
+    { SCE_CTRL_SQUARE,   686, 467, 2, "Skill 1 (icono marcado por el usuario, abajo-izquierda del cluster)" },
     { SCE_CTRL_TRIANGLE, 905, 240, 3, "Skill 2 (golden lightning wheel icon, upper-right)" },
+    { SCE_CTRL_CIRCLE,   778, 498, 7, "Skill 3 (orange wheel below-left of attack)" },
     { SCE_CTRL_R1,       905,  60, 4, "Health potion (red flask icon, top-right)" },
-    { SCE_CTRL_L1,        75, 160, 5, "Pause button (left below portrait)" },
+    // L1/START YA NO mandan touch aca -- ver btn_map arriba. Causaban un
+    // freeze real en consola (log_030.log): soltar START tambien dispara
+    // appKeyReleased(AKEYCODE_MENU) -> pressPauseButtonInGame() (motor real,
+    // decompiled/.../ghidra/out_ghidra.c linea 409668), que sintetiza SU
+    // PROPIO touch DOWN+UP sobre el icono de pausa real (calculado por el
+    // motor segun Width_Screen/isScreenOriented -- mas confiable que medir a
+    // ojo sobre un screenshot). Como appOnTouch es single-touch, nuestro
+    // touch de aca y el que el motor generaba solo por soltar la tecla
+    // pisaban el mismo unico slot y lo dejaban en un estado inconsistente:
+    // el resto de los botones seguian mandando su touch (se ve en el log),
+    // pero el juego dejaba de reaccionar a cualquiera de ellos. Un solo
+    // camino (el de btn_map, que ya hace exactamente esto y con la
+    // coordenada correcta) alcanza y sobra.
+    // Recuadro morado en el screenshot del usuario = retrato del personaje:
+    // abre la pantalla de personaje (stats/skills/poderes/hadas/inventario).
+    { SCE_CTRL_SELECT,   102,  66, 9, "Character screen (portrait icon, top-left)" },
 };
 #define ACTION_BTN_MAP_COUNT (sizeof(action_btn_map) / sizeof(action_btn_map[0]))
+// Rastrea, por boton, si su DOWN sintetico realmente se mando (ver el loop en
+// main() para por que un UP sin DOWN previo desincroniza el touch del motor).
+static int s_action_down_sent[ACTION_BTN_MAP_COUNT];
 
 // ---------------------------------------------------------------------------
-// Stick analogico izquierdo -> joystick virtual del HUD.
+// Stick analogico izquierdo + cruceta -> movimiento del personaje.
 //
-// Para retomar la ruta NATIVA (sin touch) mas adelante, los simbolos ya estan
-// identificados y verificados en .dynsym:
+// Tres intentos previos (ver git log) fallaron por razones distintas, ambas
+// confirmadas por fin leyendo el desensamblado REAL con objdump sobre
+// dungeon-hunter-2_extract/lib/armeabi-v7a/libDungeonHunter2.so (NO el
+// pseudo-C de Ghidra, que en estas funciones viene garbled en los floats):
+//  1) nativeKeyDown/nativeKeyUp son no-ops verificados (appKeyPressed/
+//     appKeyReleased vacias) -- la cruceta nunca pudo pasar por ahi.
+//  2) Sintetizar touch sobre el joystick de Flash (intentos previos) nunca
+//     hizo que GameSWF aceptara el hit-test (logs: el flag "enganchado" y el
+//     vector de HUDControls se quedaban en 0 pese al touch sintetico
+//     llegando al motor).
 //
-//   Character* NativeGetPlayerChar(int idx, bool remote)      0x43c388
-//   void Character::Ctrl_HeadTowards(const Point3D<float>&)   0x3adb60
-//   void Character::Ctrl_Stop()                               0x3ad890
-//   bool v2Controller::s_blocked                              0x9a318b
-//   void v2Controller::Cmd_HeadTowards(const Point3D<float>&) 0x405374
+// La solucion: en vez de fingir un touch y depender del hit-test de GameSWF,
+// escribimos DIRECTAMENTE los campos que HUDControls::Update() (0x41a780)
+// lee cada frame para decidir el movimiento -- los mismos que llena su propio
+// OnEvent (0x418d28) en la rama DRAG (0x419764) cuando un dedo real arrastra
+// el stick:
 //
-// Ctrl_HeadTowards recibe una DIRECCION, no un destino (internamente compara
-// x²+y²+z² contra ~1e-4 y normaliza), y respeta el estado del personaje via
-// SM_IsUsingSkill/SM_IsCasting -- o sea que la magnitud del stick no da
-// velocidad variable. Ver el comentario de stick_update() para por que esa ruta
-// no funciono en el primer intento y que probar despues.
+//   HUDControls (GetInstance()/hasInstance(), .dynsym) + offset:
+//     +0xa    int8  "enganchado": Update() solo llama a Cmd_HeadTowards si
+//             esto es != 0 (y ademas Character::CTRLIsAllowed() en ese frame).
+//     +0x65c  float x  \
+//     +0x660  float y   > vector de direccion UNITARIO en el espacio que
+//     +0x664  float z  /  espera Cmd_HeadTowards (z siempre 0, es 2D).
+//     +0x668  float     escala/magnitud (0..~1); Update() hace
+//             final = vector * escala antes de llamar Cmd_HeadTowards.
+//
+//   Character* (NativeGetPlayerChar(0,false), 0x43c388) + 0x378: v2Controller*
+//     -- confirmado en la rama RELEASE de OnEvent (0x4191e0) y en Update()
+//     (0x41a990): ambas hacen `ldr r_ctrl,[r_char,#0x378]` antes de llamar
+//     Cmd_Stop()/usar el vector. Solo se usa aca para poder llamar
+//     Character::Ctrl_Stop() al soltar (Update() nunca llama Cmd_Stop por si
+//     sola con +0xa=0, solo deja de mover).
+//
+// El (x,y) que OnEvent guarda ahi NO es el delta de pantalla tal cual: es un
+// vector semilla (1,-1,0) normalizado y rotado (90 - angulo) grados alrededor
+// del origen (Point3D::rotateXYBy, 0x418c48 -- rotacion CCW estandar,
+// verificada leyendo esa funcion). Repitiendo esa rotacion en forma cerrada
+// para un angulo de pantalla theta=atan2f(dy,dx) con (dx,dy) ya unitario
+// (nuestro nx,ny):
+//   x' = (nx+ny)/sqrt(2)
+//   y' = (nx-ny)/sqrt(2)
+// (cambio de base de 45 grados -- control isometrico tipico: "arriba" en
+// pantalla no es +X en el mundo). Si en consola la direccion sale rotada o
+// espejada, es este signo el que hay que ajustar; lo que importa es que
+// ahora el personaje se mueve, que es lo que fallaba en los 3 intentos
+// anteriores.
+static void *(* HUDControls_GetInstance)(void);
+static int (* HUDControls_hasInstance)(void);
+static void *(* NativeGetPlayerChar)(int idx, int remote);
+static void (* Character_Ctrl_Stop)(void *character);
 
-// Centro y radio del joystick virtual de Flash, en coordenadas FISICAS de
-// pantalla (960x544), medidos sobre la captura 2026-08-14-175233.jpg: el pad
-// esta abajo a la izquierda. Se convierten al espacio logico del motor con
-// glutil_screen_touch_to_logical(), igual que hace action_btn_map.
-// Si el personaje se mueve pero el pad no responde bien, ajustar estos tres.
-#define VJOY_CX 115
-#define VJOY_CY 450
-#define VJOY_R  62
+#define HUD_OFF_ENGAGED 0xa
+#define HUD_OFF_DIR_X   0x65c
+#define HUD_OFF_DIR_Y   0x660
+#define HUD_OFF_DIR_Z   0x664
+#define HUD_OFF_DIR_MAG 0x668
 
-// pointer_id propio: 0 lo usa el touch real y 1..5 los botones de accion.
-#define VJOY_POINTER_ID 6
+static int s_stick_engaged = 0;
 
-static int s_vjoy_active = 0;
-static int s_vjoy_last_x = 0, s_vjoy_last_y = 0;
-
-// El stick analogico se mapea sintetizando touch SOBRE el joystick virtual de
-// Flash, que es el mismo camino que ya usan los botones de accion.
-//
-// Por que no la API nativa del motor: se intento primero llamar directo a
-// Character::Ctrl_HeadTowards() (ver git log, commit 54f1b1a). Los 4 simbolos
-// resolvieron bien (log_011.log no tiene ni un "Symbol not found") y se
-// probaron los 4 mapeos de ejes posibles, pero el personaje NO se movio nunca.
-// Hipotesis para retomarlo: el v2HudController del motor corre su propio
-// Update() dentro de nativeRender() leyendo el joystick de Flash (que esta en
-// cero) y PISA nuestra direccion con un Ctrl_Stop. Nuestra llamada pasa antes
-// de nativeRender(), asi que siempre pierde. Para que la ruta nativa funcione
-// probablemente haya que alimentar al v2Controller (Cmd_HeadTowards, que si
-// respeta los gates) en vez de al Character, y para eso falta conseguir el
-// v2Controller* vivo -- esta en Character+884 y no tiene getter publico.
-//
-// CONTRA de esta solucion: depende de que el clip de Flash del joystick exista.
-// Cuando se oculte el HUD hay que volver a la ruta nativa.
 static void stick_update(const SceCtrlData *pad) {
-    if (!nativeOnTouch) return;
+    if (!HUDControls_hasInstance || !HUDControls_GetInstance) return;
+    if (!HUDControls_hasInstance()) return;
+    void *h = HUDControls_GetInstance();
+    if (!h) return;
 
-    // Stick de Vita: 0..255 con centro en ~128. sy positivo = ABAJO en pantalla,
-    // que coincide con el eje Y de las coordenadas de pantalla, asi que no hay
-    // que invertir nada.
+    // Stick de Vita: 0..255 con centro en ~128. sy positivo = ABAJO en
+    // pantalla, igual que el resto del motor. Requiere
+    // sceCtrlSetSamplingMode(Ext)(ANALOG_WIDE) (ver main()), sin eso lx/ly
+    // siempre leen 128 y esto nunca sale de la deadzone.
     float sx = ((float) pad->lx - 128.0f) / 128.0f;
     float sy = ((float) pad->ly - 128.0f) / 128.0f;
 
-    // Deadzone radial, no por eje: los sticks de Vita derivan y una deadzone por
-    // eje deja pasar diagonales fantasma.
-    const float DEADZONE = 0.28f;
+    // Deadzone radial, no por eje: los sticks de Vita derivan y una deadzone
+    // por eje deja pasar diagonales fantasma. Bajado de 0.28: log_030.log
+    // (lectura ya andando via PeekBufferPositiveExt2) mostro al usuario
+    // deflectando el stick sin pasar de mag=0.097 -- con 0.28 eso nunca
+    // salia de la deadzone y el personaje no se movia pese a que la lectura
+    // ya funcionaba. 0.12 sigue filtrando el ruido de reposo visto en el
+    // mismo log (~0.02-0.03).
+    const float DEADZONE = 0.12f;
     float mag = sqrtf(sx * sx + sy * sy);
-    if (mag < DEADZONE) {
-        if (s_vjoy_active) {
-            nativeOnTouch(&jni, NULL, 0, s_vjoy_last_x, s_vjoy_last_y, VJOY_POINTER_ID, 0, 0);
-            s_vjoy_active = 0;
+    // Diagnostico temporal: la cruceta (misma escritura a HUDControls, mismo
+    // gate CTRLIsAllowed) ya mueve al personaje en consola real, pero el stick
+    // analogico no -- esto aisla si el problema es la LECTURA de pad->lx/ly
+    // (nunca sale de ~128 pese a sceCtrlSetSamplingModeExt) o el calculo de
+    // aca en adelante.
+    {
+        static unsigned s_stick_diag = 0;
+        if ((++s_stick_diag % 20) == 0) {
+            l_debug("stick_diag: lx=%d ly=%d sx=%.3f sy=%.3f mag=%.3f deadzone=%.2f",
+                    pad->lx, pad->ly, sx, sy, mag, DEADZONE);
+        }
+    }
+    float nx = 0.0f, ny = 0.0f, scale = 0.0f;
+    int have_vec = 0;
+    if (mag >= DEADZONE) {
+        // Reescalar de [DEADZONE..1] a [0..1] para no perder recorrido util, y
+        // topear en 1 (las esquinas del cuadrado dan magnitud > 1).
+        float rescaled = (mag - DEADZONE) / (1.0f - DEADZONE);
+        if (rescaled > 1.0f) rescaled = 1.0f;
+        nx = sx / mag;
+        ny = sy / mag;
+        scale = rescaled;
+        have_vec = 1;
+    } else {
+        // Cruceta a deflexion completa (nativeKeyDown es no-op, ver arriba).
+        float dx = ((pad->buttons & SCE_CTRL_RIGHT) ? 1.0f : 0.0f)
+                 - ((pad->buttons & SCE_CTRL_LEFT)  ? 1.0f : 0.0f);
+        float dy = ((pad->buttons & SCE_CTRL_DOWN)  ? 1.0f : 0.0f)
+                 - ((pad->buttons & SCE_CTRL_UP)    ? 1.0f : 0.0f);
+        if (dx != 0.0f || dy != 0.0f) {
+            float len = sqrtf(dx * dx + dy * dy); // diagonal normalizada
+            nx = dx / len;
+            ny = dy / len;
+            scale = 1.0f;
+            have_vec = 1;
+        }
+    }
+
+    if (!have_vec) {
+        if (s_stick_engaged) {
+            *(volatile signed char *) ((char *) h + HUD_OFF_ENGAGED) = 0;
+            s_stick_engaged = 0;
+            if (NativeGetPlayerChar && Character_Ctrl_Stop) {
+                void *ch = NativeGetPlayerChar(0, 0);
+                if (ch) Character_Ctrl_Stop(ch);
+            }
         }
         return;
     }
 
-    // Reescalar de [DEADZONE..1] a [0..1] para no perder recorrido util, y topear
-    // en 1 (las esquinas del cuadrado dan magnitud > 1).
-    float scaled = (mag - DEADZONE) / (1.0f - DEADZONE);
-    if (scaled > 1.0f) scaled = 1.0f;
-    float nx = (sx / mag) * scaled;
-    float ny = (sy / mag) * scaled;
+    const float SQRT1_2 = 0.70710678f;
+    float wx = (nx + ny) * SQRT1_2;
+    float wy = (nx - ny) * SQRT1_2;
 
-    int px = VJOY_CX + (int) (nx * VJOY_R);
-    int py = VJOY_CY + (int) (ny * VJOY_R);
-
-    int lx, ly;
-    if (!glutil_screen_touch_to_logical(px, py, &lx, &ly)) {
-        lx = px; ly = py;
-    }
-
-    if (!s_vjoy_active) {
-        // Un joystick analogico necesita DOWN y despues MOVEs continuos: el clip
-        // de Flash arranca a seguir el dedo en el DOWN y calcula la direccion
-        // como el offset respecto de donde se apoyo. Por eso el DOWN va en el
-        // CENTRO del pad (no en la posicion desplazada): si no, el clip tomaria
-        // ese punto como origen y la primera direccion saldria nula.
-        int clx, cly;
-        if (!glutil_screen_touch_to_logical(VJOY_CX, VJOY_CY, &clx, &cly)) {
-            clx = VJOY_CX; cly = VJOY_CY;
-        }
-        nativeOnTouch(&jni, NULL, 1, clx, cly, VJOY_POINTER_ID, 0, 0);
-        s_vjoy_active = 1;
-    }
-
-    // MOVE en cada frame mientras haya deflexion, incluso si la posicion no
-    // cambio: algunos clips de GameSWF solo actualizan su estado al recibir el
-    // evento, no lo mantienen entre frames.
-    nativeOnTouch(&jni, NULL, 2, lx, ly, VJOY_POINTER_ID, 0, 0);
-    s_vjoy_last_x = lx;
-    s_vjoy_last_y = ly;
+    *(volatile float *) ((char *) h + HUD_OFF_DIR_X) = wx;
+    *(volatile float *) ((char *) h + HUD_OFF_DIR_Y) = wy;
+    *(volatile float *) ((char *) h + HUD_OFF_DIR_Z) = 0.0f;
+    *(volatile float *) ((char *) h + HUD_OFF_DIR_MAG) = scale;
+    *(volatile signed char *) ((char *) h + HUD_OFF_ENGAGED) = 1;
+    s_stick_engaged = 1;
 }
 
 static void *app_singleton_inst;
@@ -334,6 +400,10 @@ int main() {
     nativeResume           = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeResume");
     nativeCanInterrupt     = so_sym_or_warn("Java_com_gameloft_android_GAND_GloftD2SS_DungeonHunter2_nativeCanInterrupt");
     app_singleton_inst     = so_sym_or_warn("_ZN9SingletonI11ApplicationE6s_instE");
+    HUDControls_GetInstance = so_sym_or_warn("_ZN11HUDControls11GetInstanceEv");
+    HUDControls_hasInstance = so_sym_or_warn("_ZN11HUDControls11hasInstanceEv");
+    NativeGetPlayerChar     = so_sym_or_warn("_Z19NativeGetPlayerCharib");
+    Character_Ctrl_Stop     = so_sym_or_warn("_ZN9Character9Ctrl_StopEv");
     SavegameManager_setLanguage = so_sym_or_warn("_ZN15SavegameManager11setLanguageEi");
     SavegameManager_getLanguage = so_sym_or_warn("_ZNK15SavegameManager11getLanguageEv");
     SavegameManager_saveSettings = so_sym_or_warn("_ZN15SavegameManager12saveSettingsEv");
@@ -375,6 +445,13 @@ int main() {
     l_success("Starting main loop...");
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
 
+    // Sin esto pad.lx/ly siempre leen 128 (centro) y el stick no existe para
+    // stick_update(). dialog.c lo re-aplica tras el IME, que lo resetea.
+    {
+        int smRet = sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
+        l_success("ctrl sampling ANALOG_WIDE (ret=0x%08X)", (unsigned) smRet);
+    }
+
     SceCtrlData pad;
     SceTouchData touch;
     unsigned int old_buttons = 0;
@@ -401,7 +478,16 @@ int main() {
      */
     while (1) {
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
-        sceCtrlPeekBufferPositive(0, &pad, 1);
+        // sceCtrlPeekBufferPositive() por si sola no traia lx/ly (siempre 128,
+        // log_029.log: 133/133 muestras identicas) una vez que main() llama
+        // sceCtrlSetSamplingModeExt(ANALOG_WIDE) -- ese modo lo consume el
+        // buffer "Ext2", no el basico. Mismo patron que MC2BPegasus-Vita y
+        // asphalt8-vita (los unicos ports hermanos que leen el stick de
+        // verdad, no solo botones): PeekBufferPositiveExt2 primero, con el
+        // basico como fallback si por algun motivo devuelve error.
+        if (sceCtrlPeekBufferPositiveExt2(0, &pad, 1) <= 0) {
+            sceCtrlPeekBufferPositive(0, &pad, 1);
+        }
         sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
 
         if ((pad.buttons & SCE_CTRL_START) && (pad.buttons & SCE_CTRL_SELECT)) break;
@@ -430,13 +516,22 @@ int main() {
                             action_btn_map[i].x, action_btn_map[i].y, lx, ly, action_btn_map[i].pointer_id, action_btn_map[i].name);
                     if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, lx, ly,
                                                       action_btn_map[i].pointer_id, 0, 0);
+                    s_action_down_sent[i] = 1;
                 }
             }
-            if (released & action_btn_map[i].btn) {
+            // Solo se manda el UP si el DOWN realmente se mando: si el debounce
+            // de arriba se lo comio, mandar el UP igual sueltaba un puntero que
+            // el motor nunca vio bajar -- como appOnTouch es single-touch (ver
+            // bloque de comentarios de stick_update()), ese UP huerfano
+            // desincroniza su unico estado de touch y deja al personaje sin
+            // responder a NINGUN boton hasta reiniciar (visto en consola real
+            // presionando START justo despues de otro boton).
+            if ((released & action_btn_map[i].btn) && s_action_down_sent[i]) {
                 l_debug("action_btn: synthetic touch UP (%d,%d)->(%d,%d) ptr=%lld [%s]",
                         action_btn_map[i].x, action_btn_map[i].y, lx, ly, action_btn_map[i].pointer_id, action_btn_map[i].name);
                 if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, lx, ly,
                                                   action_btn_map[i].pointer_id, 0, 0);
+                s_action_down_sent[i] = 0;
             }
         }
 
@@ -449,6 +544,8 @@ int main() {
                     if (now_tick.tick - last_touch_down_us >= 250000) { // 250ms debounce
                         last_touch_down_us = now_tick.tick;
                         if (nativeOnTouch) nativeOnTouch(&jni, NULL, 1, x, y, 0, 0, 0);
+                        l_debug("touch_real: DOWN phys=(%d,%d) logical=(%d,%d)",
+                                phys_x, phys_y, x, y);
                         last_touch = 1;
                     }
                 } else if (x != last_tx || y != last_ty) {
@@ -457,13 +554,18 @@ int main() {
                 last_tx = x; last_ty = y;
             } else if (last_touch) {
                 if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, last_tx, last_ty, 0, 0, 0);
+                l_debug("touch_real: UP logical=(%d,%d)", last_tx, last_ty);
                 last_touch = 0;
             }
         } else if (last_touch) {
             if (nativeOnTouch) nativeOnTouch(&jni, NULL, 0, last_tx, last_ty, 0, 0, 0);
+            l_debug("touch_real: UP logical=(%d,%d)", last_tx, last_ty);
             last_touch = 0;
         }
 
+        // Escribe directo en HUDControls (ver bloque de arriba); no toca el
+        // touch, asi que no compite por el unico slot tactil del motor con los
+        // botones de accion o el touch real.
         stick_update(&pad);
 
         if (pending_key_down != -1 && nativeKeyDown) { nativeKeyDown(&jni, NULL, pending_key_down); pending_key_down = -1; }

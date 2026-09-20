@@ -210,7 +210,19 @@ add_definitions(-DCULLING_MODE=${CULLING_MODE})
 option(VITAGL_EXTRA_SPEEDHACKS "Compilar vitaGL con el set AGRESIVO de speedhacks (puede crashear/glitchear)" OFF)
 option(VITAGL_SAFE_SPEEDHACKS "Compilar vitaGL con el set SEGURO de speedhacks (solo CPU, sin riesgo de colgar la GPU)" OFF)
 
-set(VITAGL_BASE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1")
+set(VITAGL_BASE_FLAGS "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1 MATH_SPEEDHACK=1 CIRCULAR_POOL_SPEEDHACK=1 NO_TEX_COMBINER=1")
+# 2026-09-07: MATH/CIRCULAR_POOL/NO_TEX_COMBINER promovidos de --hack-safe al
+# base default. Motivo: es el win mas grande medido en hardware (Fase 23,
+# 5-6 -> 20-25 FPS) y cumple el criterio seguro (solo CPU, sin tocar camino a
+# GPU ni su memoria). Verificado ademas que DH2 no importa NINGUN entry point
+# de fixed-function (nm -D: cero glMatrix*/glVertexPointer/glTexEnv/etc., 100%
+# ruta GLSL con glUseProgram/glUniform*/glVertexAttribPointer), asi que
+# MATH_SPEEDHACK (matematica FFP interna de vitaGL) y NO_TEX_COMBINER
+# (GL_COMBINE, inexistente en GLES2) son no-ops para este motor y el efecto
+# real viene de CIRCULAR_POOL_SPEEDHACK (pool de datos de vertices para TODOS
+# los draws, tambien shader-path). HAVE_WVP_ON_GPU se evaluo y descarto por la
+# misma razon: solo mueve el WVP del pipeline fijo, que este motor no usa.
+# --hack-safe queda como variante compatible (redundante pero inofensiva).
 
 if (VITAGL_SAFE_SPEEDHACKS)
   # SET SEGURO. Criterio: solo flags cuyo efecto es codigo de CPU mas barato y

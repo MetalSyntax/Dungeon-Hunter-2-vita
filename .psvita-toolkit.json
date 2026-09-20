@@ -14,5 +14,5 @@
   "vita_glsl_dir": "ux0:/data/dungeon-hunter-2/glsl",
   "vita_game_data_dir": "/ux0:/data/dungeon-hunter-2",
   "vita_screenshots_dir": "/ux0:/picture/SCREENSHOT",
-  "main_so": "libnativeinterface.so"
+  "main_so": "libDungeonHunter2.so"
 }
